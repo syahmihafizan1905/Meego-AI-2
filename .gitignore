@@ -1,0 +1,7 @@
+# never commit secrets
+.env
+.env.*
+supabase/.temp/
+node_modules/
+*.log
+public/_test.html
