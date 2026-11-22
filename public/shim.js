@@ -241,7 +241,13 @@
     const res = await fetch(FN + (cfg.AI_FUNCTION || "ai"), { method: "POST", signal: opts.signal, headers: { "Content-Type": "application/json", Authorization: "Bearer " + s.session.access_token, apikey: cfg.SUPABASE_ANON_KEY }, body: JSON.stringify({ prompt, image }) })
       .catch((e) => { throw { code: e && e.name === "AbortError" ? "cancelled" : "upstream_error", message: "Network error" }; });
     let j = {}; try { j = await res.json(); } catch (e) {}
-    if (!res.ok && j.code === "upstream_error" && j.error) throw { code: j.error, message: j.error }; // show the server's reason
+    if (!res.ok && j.code === "upstream_error") {
+      // Admins see what to fix; members see a calm message
+      const admin = profile && (profile.role === "owner" || profile.role === "admin");
+      const fix = /key is invalid|no access/i.test(j.error || "") ? " Replace ANTHROPIC_API_KEY in Supabase → Edge Functions → Secrets."
+        : /credit/i.test(j.error || "") ? " Add credit at console.anthropic.com → Billing." : "";
+      throw { code: "upstream_error", message: j.error, friendly: admin ? "AI setup issue: " + (j.error || "unknown error") + "." + fix : "AI is temporarily unavailable. Please try again later." };
+    }
     if (!res.ok) throw { code: j.code || (res.status === 401 ? "session_expired" : res.status === 403 ? "not_granted" : res.status === 429 ? "rate_limited" : "upstream_error"), message: j.error || "AI error" };
     if (opts.onText) opts.onText({ text: j.text, delta: j.text });
     return { text: j.text, truncated: !!j.truncated, modelTierApplied: "default" };

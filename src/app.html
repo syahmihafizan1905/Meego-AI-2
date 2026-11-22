@@ -995,7 +995,7 @@ function contextJSON(){
     economic_events:S.events.map(e=>({time:e.time,name:e.name,currency:e.cur,impact:["","low","medium","high"][e.impact],actual:e.actual,forecast:e.forecast,previous:e.previous})),
     headlines:S.headlines.map(h=>({headline:h.headline,target:h.target,sentiment:h.dir}))});
 }
-function aiErr(e){const c=e&&e.code;
+function aiErr(e){if(e&&e.friendly)return e.friendly;const c=e&&e.code;
   if(["not_granted","sampling_disabled","capability_disabled","not_declared"].includes(c))return"AI isn't allowed or available in this view.";
   if(c==="rate_limited")return"AI usage limit reached. Try again shortly.";if(c==="invalid_json")return"Couldn't read the AI's answer. Press again.";
   if(c==="cancelled")return"Stopped.";if(c==="refused")return"AI declined this request. Rephrase it.";return"AI couldn't answer ("+(c||"error")+"). Try again."}
