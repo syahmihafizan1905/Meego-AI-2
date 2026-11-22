@@ -80,10 +80,16 @@ Deno.serve(async (req) => {
     if (!text.trim()) return json({ code: "empty_completion", error: "No answer." }, 502);
     return json({ text, truncated: response.stop_reason === "max_tokens" });
   } catch (error) {
+    console.error("AI call failed:", error);
+    const msg = String((error as Error)?.message ?? error).slice(0, 200);
     if (error instanceof Anthropic.RateLimitError) return json({ code: "rate_limited", error: "AI is busy. Try again shortly." }, 429);
-    if (error instanceof Anthropic.AuthenticationError) return json({ code: "upstream_error", error: "Server AI key is missing or invalid." }, 500);
-    if (error instanceof Anthropic.BadRequestError) return json({ code: "invalid_request", error: error.message }, 400);
-    if (error instanceof Anthropic.APIError) return json({ code: "upstream_error", error: `AI error ${error.status}` }, 502);
-    return json({ code: "upstream_error", error: "AI request failed." }, 500);
+    if (error instanceof Anthropic.AuthenticationError) return json({ code: "upstream_error", error: "Anthropic API key is invalid" }, 500);
+    if (error instanceof Anthropic.PermissionDeniedError) return json({ code: "upstream_error", error: "Anthropic key has no access to this model" }, 500);
+    if (error instanceof Anthropic.NotFoundError) return json({ code: "upstream_error", error: "Model not found: " + msg }, 500);
+    if (error instanceof Anthropic.BadRequestError) {
+      return json({ code: "upstream_error", error: /credit/i.test(msg) ? "Anthropic credit balance is too low" : "Bad request: " + msg }, 400);
+    }
+    if (error instanceof Anthropic.APIError) return json({ code: "upstream_error", error: `Anthropic error ${error.status}: ${msg}` }, 502);
+    return json({ code: "upstream_error", error: "Server error: " + msg }, 500);
   }
 });
