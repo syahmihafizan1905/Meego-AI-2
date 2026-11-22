@@ -6,6 +6,8 @@ window.MEEGO_CONFIG = {
   // Edge Function addresses (the last part of each function's URL in Supabase → Edge Functions)
   AI_FUNCTION: "clever-action",
   CANDLES_FUNCTION: "swift-task",
+  // Telegram bot username from @BotFather (without @), e.g. "MeegoAIBot"
+  TELEGRAM_BOT: "",
   // Support contact shown on the sign-in screen (optional)
   SUPPORT_TEXT: "Need an account? Contact the MEEGO admin."
 };

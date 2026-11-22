@@ -1,6 +1,6 @@
 // MEEGO AI service worker: lets the site install as an app and open quickly.
 // Pages and scripts load from the network first, so updates show up right away.
-const CACHE = "meego-v3";
+const CACHE = "meego-v4";
 const SHELL = ["./", "./index.html", "./config.js", "./shim.js", "./gate.css", "./manifest.webmanifest", "./icons/icon-192.png", "./icons/icon-512.png"];
 
 self.addEventListener("install", (e) => {

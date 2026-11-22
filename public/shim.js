@@ -96,7 +96,40 @@
     bar.append(b);
   }
 
+  /* "Connect Telegram": a one-time code links this account to the MEEGO bot */
+  function addTelegramButton() {
+    const bar = document.querySelector(".topbar");
+    if (!bar || !session || document.getElementById("tgBtn")) return;
+    const b = document.createElement("button");
+    b.id = "tgBtn"; b.className = "btn"; b.type = "button"; b.textContent = "Telegram";
+    b.onclick = openTelegram;
+    bar.insertBefore(b, document.getElementById("acctBtn"));
+  }
+  async function openTelegram() {
+    const bot = String(cfg.TELEGRAM_BOT || "").replace(/^@/, "");
+    const box = document.createElement("div"); box.id = "meegoGate";
+    box.innerHTML = `<div class="g-card" role="dialog" aria-modal="true" aria-labelledby="tgTitle">
+      <div class="g-brand"><div class="g-mark">M</div><div><b id="tgTitle">MEEGO <span>Telegram</span></b><small>Signals straight to your phone</small></div></div>
+      <p class="g-foot" id="tgStatus" style="text-align:left">Checking…</p>
+      <a class="g-go" id="tgLink" href="#" target="_blank" rel="noopener" style="text-align:center;text-decoration:none" hidden>Connect Telegram</a>
+      <p class="g-msg" id="tgMsg"></p>
+      <button type="button" class="g-link" id="tgClose">Close</button></div>`;
+    document.body.append(box);
+    const $ = (id) => document.getElementById(id);
+    $("tgClose").onclick = () => box.remove();
+    if (!bot) { $("tgStatus").textContent = "The Telegram bot isn't set up yet."; return; }
+    const { data: linked } = await sb.from("telegram_users").select("username,linked_at").eq("user_id", session.user.id).maybeSingle();
+    $("tgStatus").textContent = linked ? `Connected${linked.username ? " as @" + linked.username : ""}. New signals arrive in Telegram automatically. Connect again to switch to another Telegram account.` : "Get new signals, Hit TP/SL results and announcements in Telegram, and send chart screenshots for AI scans.";
+    const code = Array.from(crypto.getRandomValues(new Uint8Array(12)), (x) => "abcdefghijkmnpqrstuvwxyz23456789"[x % 32]).join("");
+    const { error } = await sb.from("telegram_codes").insert({ code, user_id: session.user.id });
+    if (error) { $("tgMsg").textContent = "Couldn't create a connect link. Try again."; $("tgMsg").className = "g-msg err"; return; }
+    $("tgLink").href = `https://t.me/${bot}?start=${code}`;
+    $("tgLink").hidden = false;
+    $("tgMsg").textContent = "Tap Connect Telegram, then press START in Telegram. The link works for 30 minutes."; $("tgMsg").className = "g-msg ok";
+  }
+
   function webTweaks() {
+    addTelegramButton();
     const live = document.getElementById("srcLive"); if (live) live.hidden = true;
     const demo = document.getElementById("srcDemo"); if (demo) demo.textContent = "Live";
     const pos = document.getElementById("posBody"); if (pos && pos.closest(".card")) pos.closest(".card").hidden = true; // MT5 positions: PC app only
