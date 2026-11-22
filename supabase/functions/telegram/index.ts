@@ -24,7 +24,14 @@ async function tg(method, body) {
   return await r.json().catch(() => ({ ok: false }));
 }
 const MENU = { keyboard: [[{ text: "📈 Signal" }, { text: "⭐ Swing" }], [{ text: "🧭 Direction" }, { text: "📊 History" }], [{ text: "👤 My plan" }, { text: "❓ Help" }]], resize_keyboard: true };
-const send = (chat_id, text, extra = {}) => tg("sendMessage", { chat_id, text, parse_mode: "HTML", disable_web_page_preview: true, reply_markup: MENU, ...extra });
+const ADMIN_MENU = { keyboard: [[{ text: "➕ Add customer" }, { text: "👥 Customers" }], [{ text: "📈 Signal" }, { text: "⭐ Swing" }], [{ text: "📊 History" }, { text: "❓ Help" }]], resize_keyboard: true };
+const send = (chat_id, text, extra = {}) => tg("sendMessage", { chat_id, text, parse_mode: "HTML", disable_web_page_preview: true, ...extra });
+const kb = (a) => ({ reply_markup: a.admin ? ADMIN_MENU : MENU });
+let BOT_NAME = "";
+async function botName() {
+  if (!BOT_NAME) { const me = await tg("getMe", {}); BOT_NAME = me.result?.username ?? ""; }
+  return BOT_NAME;
+}
 async function settings() {
   const { data } = await db.from("app_settings").select("key,value");
   return Object.fromEntries((data ?? []).map((r) => [r.key, r.value]));
@@ -61,6 +68,13 @@ async function account(chatId) {
 }
 const canSee = (a, kind) => a.admin || (!!a.tier && (kind !== "Swing" || a.tier === "Ultimate"));
 const noPlan = (a) => `You don't have an active plan yet.\n\nSend this to the admin to get activated:\n<b>MEEGO ID: <code>${a.chatId}</code></b>`;
+const privateNote = (a) => `🔒 <b>MEEGO AI is a private service.</b>\n\nIf you've bought a plan, send this to the admin:\n<b>MEEGO ID: <code>${a.chatId}</code></b>`;
+// A customer reference: a Telegram username (without @, lowercase) or a MEEGO ID (chat id)
+const keyOf = (ref) => {
+  const k = String(ref || "").trim().replace(/^@/, "").toLowerCase();
+  return /^-?\d{5,}$/.test(k) || /^[a-z][a-z0-9_]{3,31}$/.test(k) ? k : null;
+};
+const showRef = (k) => (/^-?\d+$/.test(k) ? `ID ${k}` : `@${k}`);
 
 /* ---------- signal text ---------- */
 function signalText(s, title) {
@@ -220,25 +234,95 @@ async function findUser(ref) {
     return data;
   }
   const uname = ref.replace(/^@/, "");
-  if (!uname) return null;
-  const { data } = await db.from("telegram_users").select("*").ilike("username", uname).limit(1);
+  if (!/^[A-Za-z0-9_]{4,32}$/.test(uname)) return null;
+  const { data } = await db.from("telegram_users").select("*").ilike("username", uname.replace(/_/g, "\\_")).limit(1);
   return data && data[0];
+}
+// Give (or extend) a plan and tell the customer
+async function grant(u, tier, days) {
+  const base = u.tier === tier && u.plan_end && u.plan_end >= today() ? u.plan_end : today();
+  const end = addDays(base, days);
+  await db.from("telegram_users").update({ tier, plan_end: end }).eq("chat_id", u.chat_id);
+  await send(u.chat_id, `🎉 Your <b>${tier}</b> plan is active until <b>${end}</b>.\n\nYou'll get new signals here automatically. Tap 📈 Signal to see what's running.`, { reply_markup: MENU });
+  return end;
+}
+// Admin picked customer + plan + days. If the customer hasn't pressed START yet, save it and it turns on when they do.
+async function addCustomer(adminId, ref, tier, days) {
+  const u = await findUser(ref);
+  if (u) {
+    const end = await grant(u, tier, days);
+    return send(adminId, `✅ ${esc(nameOf(u))} → <b>${tier}</b> until <b>${end}</b>. They've been notified.`);
+  }
+  await db.from("tg_pending").upsert({ ref, tier, days, created_at: new Date().toISOString() });
+  return send(adminId, `✅ Saved: <b>${esc(showRef(ref))}</b> → <b>${tier}</b>, ${days} days.\n\nSend them this link. When they press START, the plan turns on by itself:\nhttps://t.me/${await botName()}`);
+}
+const tierButtons = (ref) => ({ inline_keyboard: [TIERS.map((t) => ({ text: t, callback_data: `t|${ref}|${t}` }))] });
+const dayButtons = (ref, tier) => ({ inline_keyboard: [[30, 90].map((d) => ({ text: `${d} days`, callback_data: `d|${ref}|${tier}|${d}` })), [180, 365].map((d) => ({ text: `${d} days`, callback_data: `d|${ref}|${tier}|${d}` }))] });
+async function setState(chatId, step) { await db.from("tg_state").upsert({ chat_id: chatId, step, updated_at: new Date().toISOString() }); }
+async function getState(chatId) { const { data } = await db.from("tg_state").select("step,updated_at").eq("chat_id", chatId).maybeSingle(); return data; }
+async function clearState(chatId) { await db.from("tg_state").delete().eq("chat_id", chatId); }
+async function cmdCustomers(chatId) {
+  const { data } = await db.from("telegram_users").select("*").not("tier", "is", null).order("plan_end", { ascending: true });
+  const { data: pend } = await db.from("tg_pending").select("*").order("created_at", { ascending: false });
+  if (!(data ?? []).length && !(pend ?? []).length) return send(chatId, "No customers yet. Tap <b>➕ Add customer</b>.", { reply_markup: ADMIN_MENU });
+  const soon = addDays(today(), 7);
+  const rows = (data ?? []).slice(0, 40).map((u) => {
+    const mark = !planOf(u).tier ? "❌" : u.plan_end && u.plan_end <= soon ? "⏰" : "✅";
+    return [{ text: `${mark} ${nameOf(u)} · ${u.tier} · ${u.plan_end ?? "no end"}`, callback_data: `c|${u.chat_id}` }];
+  });
+  const waiting = (pend ?? []).slice(0, 20).map((p) => [{ text: `⏳ ${showRef(p.ref)} · ${p.tier} · ${p.days}d (cancel)`, callback_data: `q|${p.ref}` }]);
+  return send(chatId, "<b>Customers</b>\n✅ active · ⏰ ends within 7 days · ❌ ended · ⏳ hasn't pressed START yet\n\nTap a customer to renew, change or end their plan.", { reply_markup: { inline_keyboard: [...rows, ...waiting] } });
+}
+async function onCallback(q) {
+  await tg("answerCallbackQuery", { callback_query_id: q.id });
+  const chatId = q.message?.chat?.id, msgId = q.message?.message_id;
+  if (!chatId) return;
+  const a = await account(chatId);
+  if (!a.admin) return;
+  const [kind, x, y, z] = String(q.data || "").split("|");
+  const edit = (text, markup) => tg("editMessageText", { chat_id: chatId, message_id: msgId, text, parse_mode: "HTML", reply_markup: markup ?? { inline_keyboard: [] } });
+  if (kind === "t") return edit(`Customer: <b>${esc(showRef(x))}</b>\nPlan: <b>${esc(y)}</b>\n\nHow long?`, dayButtons(x, y));
+  if (kind === "d") {
+    if (!TIERS.includes(y) || !(Number(z) > 0)) return;
+    await edit(`Customer: <b>${esc(showRef(x))}</b>\nPlan: <b>${esc(y)}</b> · ${z} days`);
+    return addCustomer(chatId, x, y, Number(z));
+  }
+  const u = /^-?\d+$/.test(x || "") ? await findUser(x) : null;
+  if (kind === "c") {
+    if (!u) return send(chatId, "Customer not found.");
+    return send(chatId, `<b>${esc(nameOf(u))}</b>\nPlan: <b>${esc(u.tier ?? "none")}</b>${u.plan_end ? ` until <b>${u.plan_end}</b>` : ""}\nMEEGO ID: <code>${u.chat_id}</code>`, { reply_markup: { inline_keyboard: [
+      [{ text: "+30 days", callback_data: `r|${u.chat_id}|30` }, { text: "+90 days", callback_data: `r|${u.chat_id}|90` }],
+      [{ text: "🔁 Change plan", callback_data: `p|${u.chat_id}` }, { text: "⛔ End plan", callback_data: `x|${u.chat_id}` }],
+    ] } });
+  }
+  if (kind === "r" && u && u.tier) {
+    const end = await grant({ ...u }, u.tier, Number(y) || 30);
+    return edit(`✅ ${esc(nameOf(u))} renewed: <b>${esc(u.tier)}</b> until <b>${end}</b>.`);
+  }
+  if (kind === "p" && u) return edit(`Customer: <b>${esc(nameOf(u))}</b>\n\nWhich plan?`, tierButtons(String(u.chat_id)));
+  if (kind === "x" && u) return edit(`End <b>${esc(nameOf(u))}</b>'s plan now?`, { inline_keyboard: [[{ text: "Yes, end it", callback_data: `xx|${u.chat_id}` }, { text: "No", callback_data: `c|${u.chat_id}` }]] });
+  if (kind === "xx" && u) {
+    await db.from("telegram_users").update({ tier: null, plan_end: null }).eq("chat_id", u.chat_id);
+    return edit(`⛔ ${esc(nameOf(u))}'s plan has been ended.`);
+  }
+  if (kind === "q") {
+    await db.from("tg_pending").delete().eq("ref", x);
+    return edit(`Cancelled the waiting plan for <b>${esc(showRef(x))}</b>.`);
+  }
 }
 async function activeMembers() {
   const { data } = await db.from("telegram_users").select("*");
   return (data ?? []).filter((u) => u.is_admin || planOf(u).tier);
 }
 async function cmdAdmin(chatId, a, text) {
-  if (!a.admin) return send(chatId, "This command is for the admin only.");
+  if (!a.admin) return send(chatId, privateNote(a));
   const parts = text.trim().split(/\s+/);
   const cmd = parts[0].toLowerCase().replace(/@.*/, "");
   if (cmd === "/admin") {
     return send(chatId, [
-      "<b>Customers</b>",
-      "<code>/activate 123456789 Ultimate 30</code> give a plan for 30 days (use the customer's MEEGO ID or @username)",
-      "<code>/renew 123456789 30</code> add 30 days",
-      "<code>/remove 123456789</code> end their plan now",
-      "<code>/customers</code> list everyone with a plan",
+      "<b>Customers</b> (no typing needed)",
+      "Tap <b>➕ Add customer</b> → send their @username → tap the plan → tap how many days. Done.",
+      "Tap <b>👥 Customers</b> to renew, change or end someone's plan.",
       "",
       "<b>Signals</b>",
       "<code>/post BUY XAUUSD 4040 4080 3990</code> intraday signal (entry, TP, SL)",
@@ -248,18 +332,14 @@ async function cmdAdmin(chatId, a, text) {
       "<b>Messages</b>",
       "<code>/announce Your message</code> sends to every active member",
       "<code>/members</code> totals",
-    ].join("\n"));
+    ].join("\n"), { reply_markup: ADMIN_MENU });
   }
   if (cmd === "/activate") {
-    const u = await findUser(parts[1]);
+    const ref = keyOf(parts[1]);
     const tier = TIERS.find((t) => t.toLowerCase() === String(parts[2] || "").toLowerCase());
     const days = Number(parts[3] || 30);
-    if (!u) return send(chatId, "Customer not found. They must press START in this bot first, then send you their MEEGO ID.");
-    if (!tier || !(days > 0)) return send(chatId, "Format: <code>/activate ID Basic|Pro|Ultimate days</code>");
-    const end = addDays(today(), days);
-    await db.from("telegram_users").update({ tier, plan_end: end }).eq("chat_id", u.chat_id);
-    await send(u.chat_id, `🎉 Your <b>${tier}</b> plan is active until <b>${end}</b>.\n\nYou'll get new signals here automatically. Tap 📈 Signal to see what's running.`);
-    return send(chatId, `✅ ${esc(nameOf(u))} → <b>${tier}</b> until <b>${end}</b>.`);
+    if (!ref || !tier || !(days > 0)) return send(chatId, "Format: <code>/activate @username Basic|Pro|Ultimate days</code>\nOr just tap <b>➕ Add customer</b>.");
+    return addCustomer(chatId, ref, tier, days);
   }
   if (cmd === "/renew") {
     const u = await findUser(parts[1]);
@@ -278,17 +358,7 @@ async function cmdAdmin(chatId, a, text) {
     await db.from("telegram_users").update({ tier: null, plan_end: null }).eq("chat_id", u.chat_id);
     return send(chatId, `✅ ${esc(nameOf(u))}'s plan has been ended.`);
   }
-  if (cmd === "/customers") {
-    const { data } = await db.from("telegram_users").select("*").not("tier", "is", null).order("plan_end", { ascending: true });
-    if (!data || !data.length) return send(chatId, "No customers with a plan yet. Use <code>/activate</code>.");
-    const soon = addDays(today(), 7);
-    const rows = data.slice(0, 60).map((u) => {
-      const p = planOf(u);
-      const mark = !p.tier ? "❌" : u.plan_end && u.plan_end <= soon ? "⏰" : "✅";
-      return `${mark} ${esc(nameOf(u))} · ${esc(u.tier)} · ${u.plan_end ?? "no end"} · <code>${u.chat_id}</code>`;
-    });
-    return send(chatId, `<b>Customers</b> (✅ active · ⏰ ends within 7 days · ❌ ended)\n\n${rows.join("\n")}`);
-  }
+  if (cmd === "/customers") return cmdCustomers(chatId);
   if (cmd === "/post") {
     const side = (parts[1] || "").toUpperCase(), sym = (parts[2] || "").toUpperCase();
     const entry = Number(parts[3]), tp = Number(parts[4]), sl = Number(parts[5]);
@@ -376,12 +446,44 @@ async function onMessage(msg) {
     const { count } = await db.from("telegram_users").select("chat_id", { count: "exact", head: true }).eq("is_admin", true);
     if ((count ?? 0) > 0) return send(chatId, a.admin ? "You're already the admin." : "This bot already has an admin.");
     await db.from("telegram_users").update({ is_admin: true }).eq("chat_id", chatId);
-    return send(chatId, "👑 You're now the <b>MEEGO admin</b>. Send /admin to see what you can do.");
+    return send(chatId, "👑 You're now the <b>MEEGO admin</b>. Tap <b>➕ Add customer</b> to give someone a plan.", { reply_markup: ADMIN_MENU });
   }
+
+  // Admin: button flows (no typing commands)
+  if (a.admin) {
+    const st = await getState(chatId);
+    if (t.includes("add customer")) {
+      await setState(chatId, "add");
+      return send(chatId, "Send the customer's Telegram <b>username</b> (for example <code>@ali</code>).\n\nNo username? Ask them to press START in this bot and send you the MEEGO ID it shows, then paste that number here.");
+    }
+    if (t.includes("customers")) { await clearState(chatId); return cmdCustomers(chatId); }
+    if (st?.step === "add" && text && !text.startsWith("/") && Date.now() - new Date(st.updated_at).getTime() < 30 * 60 * 1000) {
+      await clearState(chatId);
+      const ref = keyOf(text);
+      if (!ref) return send(chatId, "That doesn't look like a Telegram username or MEEGO ID. Tap <b>➕ Add customer</b> to try again.");
+      return send(chatId, `Customer: <b>${esc(showRef(ref))}</b>\n\nWhich plan?`, { reply_markup: tierButtons(ref) });
+    }
+    if (st) await clearState(chatId);
+  } else if (!a.tier) {
+    // Not a member: switch on a plan the admin saved for this username/ID, otherwise stay private
+    const keys = [String(chatId)];
+    if (msg.from?.username) keys.push(msg.from.username.toLowerCase());
+    const { data: pend } = await db.from("tg_pending").select("*").in("ref", keys).limit(1);
+    if (pend && pend[0]) {
+      const p = pend[0];
+      const end = await grant({ chat_id: chatId, tier: null, plan_end: null }, p.tier, p.days);
+      await db.from("tg_pending").delete().eq("ref", p.ref);
+      const admins = (await db.from("telegram_users").select("chat_id").eq("is_admin", true)).data ?? [];
+      for (const ad of admins) await send(ad.chat_id, `✅ ${esc(showRef(p.ref))} pressed START. <b>${esc(p.tier)}</b> is now active until <b>${end}</b>.`);
+      return;
+    }
+    if (!a.rawTier) return send(chatId, privateNote(a), { reply_markup: { remove_keyboard: true } });
+  }
+
   if (t.startsWith("/start")) {
-    if (a.admin) return send(chatId, "Welcome back, admin. Send /admin for the admin commands.");
-    if (a.tier) return send(chatId, `Welcome back to <b>MEEGO AI</b>! Your <b>${esc(a.tier)}</b> plan is active${a.end ? ` until <b>${a.end}</b>` : ""}.\n\nUse the buttons below, or send a chart screenshot for an AI scan.`);
-    return send(chatId, `👋 Welcome to <b>MEEGO AI</b>: market signals, Hit TP/SL results and AI chart analysis, right here in Telegram.\n\n${noPlan(a)}`);
+    if (a.admin) return send(chatId, "Welcome back, admin. Tap <b>➕ Add customer</b> to give someone a plan, or send /admin for everything else.", { reply_markup: ADMIN_MENU });
+    if (a.tier) return send(chatId, `Welcome back to <b>MEEGO AI</b>! Your <b>${esc(a.tier)}</b> plan is active${a.end ? ` until <b>${a.end}</b>` : ""}.\n\nUse the buttons below, or send a chart screenshot for an AI scan.`, kb(a));
+    return send(chatId, `Your <b>${esc(a.rawTier)}</b> plan has ended. Contact the admin to renew.\nMEEGO ID: <code>${chatId}</code>`, { reply_markup: { remove_keyboard: true } });
   }
   if (msg.photo && msg.photo.length) return scanPhoto(chatId, a, msg);
   if (/^\/(admin|activate|renew|remove|customers|post|close|announce|members)\b/.test(t)) return cmdAdmin(chatId, a, text);
@@ -398,7 +500,7 @@ async function onMessage(msg) {
     "📊 /history wins and pips",
     "👤 /plan your plan and MEEGO ID",
     "🖼 Send a chart screenshot for an AI scan",
-  ].join("\n"));
+  ].join("\n"), kb(a));
 }
 
 /* ---------- entry point ---------- */
@@ -409,7 +511,7 @@ Deno.serve(async (req) => {
     if (!TOKEN) return new Response("Add the secret TELEGRAM_BOT_TOKEN in Supabase → Edge Functions → Secrets, then reload this page.", { status: 500 });
     if (!cfg.telegram_url || !secret) return new Response("Run supabase/telegram.sql in the SQL Editor first, then reload this page.", { status: 500 });
     const me = await tg("getMe", {});
-    const hook = await tg("setWebhook", { url: cfg.telegram_url, secret_token: secret, allowed_updates: ["message"], drop_pending_updates: true });
+    const hook = await tg("setWebhook", { url: cfg.telegram_url, secret_token: secret, allowed_updates: ["message", "callback_query"], drop_pending_updates: true });
     await tg("setMyCommands", { commands: [
       { command: "signal", description: "Latest intraday signal" },
       { command: "swing", description: "Priority Swing (Ultimate)" },
@@ -430,5 +532,6 @@ Deno.serve(async (req) => {
   if (req.headers.get("x-telegram-bot-api-secret-token") !== secret) return new Response("forbidden", { status: 403 });
   const update = await req.json().catch(() => null);
   if (update?.message) EdgeRuntime.waitUntil(onMessage(update.message).catch((e) => console.error("message failed", e)));
+  if (update?.callback_query) EdgeRuntime.waitUntil(onCallback(update.callback_query).catch((e) => console.error("button failed", e)));
   return new Response("ok");
 });
