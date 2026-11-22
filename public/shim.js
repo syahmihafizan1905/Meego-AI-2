@@ -238,7 +238,7 @@
     let image = null;
     if (opts.images) { const list = opts.images instanceof Blob ? [opts.images] : Array.from(opts.images); if (list[0]) image = await shrinkImage(list[0]); }
     const { data: s } = await sb.auth.getSession();
-    const res = await fetch(FN + "ai", { method: "POST", signal: opts.signal, headers: { "Content-Type": "application/json", Authorization: "Bearer " + s.session.access_token, apikey: cfg.SUPABASE_ANON_KEY }, body: JSON.stringify({ prompt, image }) })
+    const res = await fetch(FN + (cfg.AI_FUNCTION || "ai"), { method: "POST", signal: opts.signal, headers: { "Content-Type": "application/json", Authorization: "Bearer " + s.session.access_token, apikey: cfg.SUPABASE_ANON_KEY }, body: JSON.stringify({ prompt, image }) })
       .catch((e) => { throw { code: e && e.name === "AbortError" ? "cancelled" : "upstream_error", message: "Network error" }; });
     let j = {}; try { j = await res.json(); } catch (e) {}
     if (!res.ok) throw { code: j.code || (res.status === 401 ? "session_expired" : res.status === 403 ? "not_granted" : res.status === 429 ? "rate_limited" : "upstream_error"), message: j.error || "AI error" };
@@ -256,7 +256,7 @@
     if (hit && Date.now() - hit.at < (interval === "15min" ? 120e3 : 600e3)) return hit.data;
     const { data: s } = await sb.auth.getSession();
     const token = s.session ? s.session.access_token : cfg.SUPABASE_ANON_KEY;
-    const res = await fetch(FN + "candles?symbol=" + encodeURIComponent(symbol) + "&interval=" + interval, { headers: { Authorization: "Bearer " + token, apikey: cfg.SUPABASE_ANON_KEY } });
+    const res = await fetch(FN + (cfg.CANDLES_FUNCTION || "candles") + "?symbol=" + encodeURIComponent(symbol) + "&interval=" + interval, { headers: { Authorization: "Bearer " + token, apikey: cfg.SUPABASE_ANON_KEY } });
     const j = await res.json().catch(() => ({}));
     if (!res.ok || !Array.isArray(j.candles) || j.candles.length < 30) throw new Error(j.error || "No market data for " + symbol + ".");
     memo[key] = { at: Date.now(), data: j };
