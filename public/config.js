@@ -7,7 +7,7 @@ window.MEEGO_CONFIG = {
   AI_FUNCTION: "clever-action",
   CANDLES_FUNCTION: "swift-task",
   // Telegram bot username from @BotFather (without @), e.g. "MeegoAIBot"
-  TELEGRAM_BOT: "",
+  TELEGRAM_BOT: "MeegoAISignalBot",
   // Support contact shown on the sign-in screen (optional)
   SUPPORT_TEXT: "Need an account? Contact the MEEGO admin."
 };
