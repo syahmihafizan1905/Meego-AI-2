@@ -23,8 +23,8 @@ async function tg(method, body) {
   const r = await fetch(`https://api.telegram.org/bot${TOKEN}/${method}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
   return await r.json().catch(() => ({ ok: false }));
 }
-const MENU = { keyboard: [[{ text: "⚡ Scalping" }, { text: "📈 Intraday" }, { text: "⭐ Swing" }], [{ text: "🧭 Direction" }, { text: "📊 History" }], [{ text: "👤 My plan" }, { text: "❓ Help" }]], resize_keyboard: true };
-const ADMIN_MENU = { keyboard: [[{ text: "➕ Add customer" }, { text: "👥 Customers" }], [{ text: "⚡ Scalping" }, { text: "📈 Intraday" }, { text: "⭐ Swing" }], [{ text: "🧭 Direction" }, { text: "📊 History" }, { text: "❓ Help" }]], resize_keyboard: true };
+const MENU = { keyboard: [[{ text: "⚡ Scalping" }, { text: "📈 Intraday" }, { text: "⭐ Swing" }], [{ text: "🧭 Direction" }, { text: "🖼 Chart Scanner" }], [{ text: "📊 History" }, { text: "👤 My plan" }, { text: "❓ Help" }]], resize_keyboard: true };
+const ADMIN_MENU = { keyboard: [[{ text: "➕ Add customer" }, { text: "👥 Customers" }], [{ text: "⚡ Scalping" }, { text: "📈 Intraday" }, { text: "⭐ Swing" }], [{ text: "🧭 Direction" }, { text: "🖼 Chart Scanner" }], [{ text: "📊 History" }, { text: "❓ Help" }]], resize_keyboard: true };
 const KIND = {
   Scalping: { title: "⚡ DAILY SIGNAL SCALPING", fresh: "📢 NEW SCALPING SIGNAL", label: "Scalping", none: "No scalping setup running right now. You'll get a message here as soon as one is posted." },
   Intraday: { title: "📈 DAILY SIGNAL INTRADAY", fresh: "📢 NEW DAILY SIGNAL INTRADAY", label: "Daily Intraday", none: "No intraday setup running right now. You'll get a message here as soon as one is posted." },
@@ -599,6 +599,10 @@ async function onMessage(msg) {
   }
   if (msg.photo && msg.photo.length) return scanPhoto(chatId, a, msg);
   if (/^\/(admin|activate|renew|remove|customers|post|close|announce|members)\b/.test(t)) return cmdAdmin(chatId, a, text);
+  if (t.startsWith("/scanner") || t.includes("chart scanner")) {
+    if (!a.admin && !a.tier) return send(chatId, noPlan(a));
+    return send(chatId, "🖼 <b>MEEGO AI · Chart Scanner</b>\n\nSend a <b>screenshot of your chart</b> here (MT4/MT5/TradingView).\n\nTips for the best result:\n• Show the price scale on the right\n• One pair, one timeframe\n• Add the pair in the caption, e.g. <code>XAUUSD M15</code>\n\nMEEGO AI will read it and reply with direction, entry, TP and SL.", kb(a));
+  }
   if (t.startsWith("/scalp") || t.includes("scalp")) return cmdSignal(chatId, a, "Scalping");
   if (t.startsWith("/intraday") || t.startsWith("/signal") || t.includes("intraday") || (t.includes("signal") && !t.includes("swing"))) return cmdSignal(chatId, a, "Intraday");
   if (t.startsWith("/swing") || t.includes("swing")) return cmdSignal(chatId, a, "Swing");
@@ -613,7 +617,7 @@ async function onMessage(msg) {
     "🧭 /direction today's direction",
     "📊 /history wins and pips",
     "👤 /plan your plan and MEEGO ID",
-    "🖼 Send a chart screenshot for an AI scan",
+    "🖼 /scanner send a chart screenshot for an AI scan",
   ].join("\n"), kb(a));
 }
 
@@ -631,6 +635,7 @@ Deno.serve(async (req) => {
       { command: "intraday", description: "Intraday signals" },
       { command: "swing", description: "Priority Swing (Ultimate)" },
       { command: "direction", description: "Today's direction" },
+      { command: "scanner", description: "AI chart scanner" },
       { command: "history", description: "Wins and pips" },
       { command: "plan", description: "Your plan and MEEGO ID" },
     ] });
