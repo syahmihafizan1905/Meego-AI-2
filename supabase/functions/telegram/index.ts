@@ -952,15 +952,37 @@ async function startPayment(chatId, tier) {
 const normName = (v) => String(v || "").toUpperCase().replace(/[^A-Z ]/g, " ").replace(/\s+/g, " ").trim();
 const digitsOf = (v) => String(v || "").replace(/\D/g, "");
 // Compare what the AI read on the receipt with the admin's bank details and the plan price
+// Name and account must match the SAME bank account. Common name words (BIN, MUHAMMAD...) prove nothing, so they don't count.
+const COMMON_NAME = new Set(["BIN", "BINTI", "BT", "BTE", "BNT", "B", "AL", "AP", "MUHAMMAD", "MUHAMAD", "MOHAMMAD", "MOHAMAD", "MOHAMMED", "MOHAMED", "MUHAMMED", "MOHD", "MUHD", "MD", "NUR", "NOR", "SITI", "ABDUL", "ABD", "AHMAD"]);
+function nameMatches(gotRaw, wantRaw) {
+  const got = normName(gotRaw), want = normName(wantRaw);
+  if (!got || !want) return false;
+  if (got === want) return true;
+  const g = got.split(" "), w = want.split(" "), key = w.filter((x) => !COMMON_NAME.has(x));
+  // a receipt may cut a long name short, but it has to be the start of the full name and show the distinctive words
+  if (want.startsWith(got) && g.length >= 2) {
+    const whole = g.filter((x, i) => !COMMON_NAME.has(x) && w[i] === x).length;
+    return whole >= Math.min(2, key.length) && got.length >= 12;
+  }
+  // abbreviations (MUHAMMAD -> MOHD, BIN -> B): every distinctive word must still be there, and nothing distinctive added
+  const gk = g.filter((x) => !COMMON_NAME.has(x));
+  return key.length > 0 && key.length === gk.length && key.every((x, i) => gk[i] === x);
+}
+// "yes" = full number, "part" = only the visible digits of a masked number match, "no"
+function accountMatches(accRaw, acc) {
+  const raw = String(accRaw || ""), d = digitsOf(raw), my = digitsOf(acc);
+  if (!d) return "no";
+  if (d === my) return "yes";
+  if (!/[*xX•]/.test(raw)) return "no";
+  const tail = digitsOf(raw.split(/[*xX•]/).pop()), head = digitsOf(raw.split(/[*xX•]/)[0]);
+  return tail.length >= 4 && my.endsWith(tail) && my.startsWith(head) ? "part" : "no";
+}
 function receiptChecks(r, banks, pay, dup) {
-  const got = normName(r.recipient_name), gt = got.split(" ").filter((w) => w.length > 1);
-  const nameMatch = (name) => {
-    const want = normName(name), wt = want.split(" ").filter((w) => w.length > 1), common = gt.filter((w) => wt.includes(w)).length;
-    return !!got && (want.startsWith(got) && got.length >= 6 || got.startsWith(want) || common >= Math.min(2, wt.length) || common / Math.max(1, wt.length) >= 0.5);
-  };
-  const accRaw = String(r.recipient_account || ""), accD = digitsOf(accRaw), masked = /[*xX•]/.test(accRaw);
-  const accMatch = (acc) => { const my = digitsOf(acc); return !!accD && (accD === my || (masked && accD.length >= 3 && my.endsWith(accD.slice(-4)))); };
-  const nameOk = banks.some((b) => nameMatch(b.name)), accOk = banks.some((b) => accMatch(b.acc));
+  const accRaw = String(r.recipient_account || "");
+  const rows = banks.map((b) => ({ name: nameMatches(r.recipient_name, b.name), acc: accountMatches(accRaw, b.acc) }));
+  const score = (x) => (x.name ? 10 : 0) + (x.acc === "yes" ? 2 : x.acc === "part" ? 1 : 0);
+  const best = rows.sort((x, y) => score(y) - score(x))[0] || { name: false, acc: "no" };
+  const nameOk = best.name, accOk = best.acc !== "no", partial = best.acc === "part";
   const amt = Number(String(r.amount ?? "").replace(/[^0-9.]/g, ""));
   const amtOk = Number.isFinite(amt) && amt + 0.001 >= Number(pay.amount);
   const t = r.date_time ? Date.parse(String(r.date_time).slice(0, 16) + ":00+08:00") : NaN;
@@ -968,10 +990,10 @@ function receiptChecks(r, banks, pay, dup) {
   const dateOk = Number.isFinite(t) && ageH > -1 && ageH < 72;
   return [
     { ok: nameOk, txt: `Name: ${esc(r.recipient_name || "not found")}` },
-    { ok: accOk, txt: `Account: ${esc(accRaw || "not found")}` },
+    { ok: accOk, txt: `Account: ${esc(accRaw || "not found")}${partial ? " (hidden digits, only part could be checked)" : ""}` },
     { ok: amtOk, txt: `Amount: ${Number.isFinite(amt) ? "RM" + amt.toFixed(2) : "not found"} (needs RM${pay.amount})` },
     { ok: dateOk, txt: `Date: ${esc(r.date_time || "not found")}${Number.isFinite(t) && !dateOk ? " (too old)" : ""}` },
-    { ok: r.successful !== false, txt: `Status: ${r.successful === false ? "NOT successful" : "successful"}` },
+    { ok: r.successful === true, txt: `Status: ${r.successful === true ? "successful" : r.successful === false ? "NOT successful" : "not shown"}` },
     { ok: !dup, txt: dup ? "Used before: this receipt was already sent" : "Not used before" },
   ];
 }
@@ -1022,9 +1044,11 @@ recipient = the person/account the money was SENT TO (not the sender). If it is 
     `💳 <b>New payment</b> · ${who} (<code>${chatId}</code>)`,
     `Plan: <b>${esc(pay.tier)}</b> · RM${pay.amount} · ${pay.days} days`,
     "",
-    `🤖 MEEGO AI check: ${allOk ? "<b>ALL OK</b>" : "<b>CHECK CAREFULLY</b>"}`,
+    `🤖 MEEGO AI check: ${allOk ? "<b>details match</b>" : "<b>CHECK CAREFULLY</b>"}`,
     ...checks.map((c) => `${c.ok ? "✅" : "❌"} ${c.txt}`),
     ...(ref ? [`Ref: <code>${esc(ref)}</code>`] : []),
+    "",
+    "⚠️ Receipts can be edited. Check the money is in your bank before you approve.",
   ].join("\n");
   const buttons = { inline_keyboard: [[{ text: "✅ Approve", callback_data: `pa|${pay.id}` }, { text: "❌ Reject", callback_data: `pr|${pay.id}` }]] };
   for (const ad of await adminIds()) {
@@ -1050,7 +1074,12 @@ async function decidePayment(adminId, msgId, id, approve) {
 
 
 /* ---------- MT5 EA: a private text feed of the signals, read by MEEGO_AI_EA.mq5 every ~30 s ---------- */
-const EA_FILE = "https://raw.githubusercontent.com/syahmihafizan1905/Meego-AI-2/main/mt5/MEEGO_AI_EA.ex5";
+// EA files live in the private table ea_files (no public read), not in the public repo
+async function eaFile(name) {
+  const { data } = await db.from("ea_files").select("b64").eq("name", name).maybeSingle();
+  if (!data?.b64) return null;
+  return Uint8Array.from(atob(data.b64.replace(/\s/g, "")), (ch) => ch.charCodeAt(0));
+}
 // One line per signal: S|id|kind|news|sym|dir|order|status|pending|entry|sl|tp1|tp2|tp3|tpHit|slNow|time|expireH|filled
 async function eaFeed(key) {
   const txt = (body, status = 200) => new Response(body, { status, headers: { "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-store" } });
@@ -1099,13 +1128,13 @@ async function cmdEA(chatId, a, text) {
     "⚠️ Test on a <b>DEMO</b> account first. Use a <b>hedging</b> account (3 TPs = 3 positions).",
     "New key: <code>/ea reset</code> (the old key stops working).",
   ].join("\n"), kb(a));
-  const bin = await fetch(EA_FILE).then((r) => (r.ok ? r.arrayBuffer() : null)).catch(() => null);
+  const bin = await eaFile("MEEGO_AI_EA.ex5").catch(() => null);
   if (!bin) return send(chatId, "Couldn't attach the EA file right now. Try /ea again in a minute.");
-  await sendFile(chatId, "MEEGO_AI_EA.ex5", new Uint8Array(bin), "📎 <b>MEEGO_AI_EA.ex5</b> · put it in MQL5 → Experts");
+  await sendFile(chatId, "MEEGO_AI_EA.ex5", bin, "📎 <b>MEEGO_AI_EA.ex5</b> · put it in MQL5 → Experts");
   if (!a.admin) return;
   // Admin only: the editable source code (customers get the compiled .ex5 only)
-  const src = await fetch(EA_FILE.replace(/\.ex5$/, ".mq5")).then((r) => (r.ok ? r.text() : "")).catch(() => "");
-  if (src) return sendFile(chatId, "MEEGO_AI_EA.mq5", new TextEncoder().encode(src), "🛠 <b>Admin only · MEEGO_AI_EA.mq5</b> (source code)\nEdit it in MetaEditor (F4) and press Compile (F7). Customers only ever get the .ex5.");
+  const src = await eaFile("MEEGO_AI_EA.mq5").catch(() => null);
+  if (src) return sendFile(chatId, "MEEGO_AI_EA.mq5", src, "🛠 <b>Admin only · MEEGO_AI_EA.mq5</b> (source code)\nEdit it in MetaEditor (F4) and press Compile (F7). Customers only ever get the .ex5.");
 }
 
 /* ---------- admin: customers and signals ---------- */
