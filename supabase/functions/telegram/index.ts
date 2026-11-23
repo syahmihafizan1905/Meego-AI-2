@@ -85,7 +85,13 @@ const showRef = (k) => (/^-?\d+$/.test(k) ? `ID ${k}` : `@${k}`);
 /* ---------- signal text ---------- */
 // Confluence score (2 to 9) as a grade: 9 = A+, 8 = A, 7 = B+, 6 = B, 5 = C+, 4 = C, 3 = D+, 2 = D
 const grade = (score) => ["D", "D+", "C", "C+", "B", "B+", "A", "A+"][Math.max(0, Math.min(7, Math.round(score) - 2))];
-// live = current price (only when showing a running signal from the buttons)
+const myTime = (t = Date.now()) => new Date(t + 8 * 3600000).toISOString().slice(11, 16); // Malaysia time
+function resultLine(s) {
+  const p = s.status === "tp" ? pipsBetween(s.tp, s.entry, s.sym) : s.status === "sl" ? -pipsBetween(s.entry, s.sl, s.sym) : s.status === "closed" ? Math.round(((Number(s.exit) - s.entry) * s.dir) / pip(s.sym)) : 0;
+  const head = s.status === "tp" ? "✅ <b>HIT TP</b>" : s.status === "sl" ? "❌ <b>HIT SL</b>" : s.status === "closed" ? "⏹ <b>CLOSED</b>" : "➖ <b>BREAKEVEN</b>";
+  return `${head} · <b>${p > 0 ? "+" : ""}${p} pips</b>`;
+}
+// live = current price (shown while the signal is running; the message is refreshed every 5 minutes)
 function signalText(s, title, live) {
   const side = s.dir > 0 ? "🟢 <b>BUY</b>" : "🔴 <b>SELL</b>";
   const lines = [
@@ -100,8 +106,9 @@ function signalText(s, title, live) {
   if (s.score) lines.push(`Rating Setup: <b>${grade(s.score)}</b>`);
   if (Number.isFinite(live)) {
     const p = Math.round(((live - s.entry) * s.dir) / pip(s.sym));
-    lines.push(p >= 0 ? `🟢 Running pips: <b>+${p}</b>` : `🔴 Floating pips: <b>${p}</b>`, `Now: <code>${px(live, s.sym)}</code>`);
+    lines.push(p >= 0 ? `🟢 Running pips: <b>+${p}</b>` : `🔴 Floating pips: <b>${p}</b>`, `Now: <code>${px(live, s.sym)}</code> · updated ${myTime()}`);
   }
+  if (s.status && s.status !== "running") lines.push(resultLine(s));
   if (s.note) lines.push("", `📝 ${esc(s.note)}`);
   lines.push("", DISCLAIMER);
   return lines.join("\n");
@@ -193,9 +200,37 @@ async function cmdSignal(chatId, a, kind) {
   ]);
   if (!list.length) return send(chatId, kindOf(kind).none);
   const prices = {};
-  for (const s of list.slice(0, 3)) {
-    if (!(s.sym in prices)) prices[s.sym] = (await candles(s.sym, "1min").catch(() => [])).slice(-1)[0]?.c;
-    await send(chatId, signalText(s, kindOf(kind).title, prices[s.sym]));
+  for (const s of list.slice(0, 3)) await sendLive(chatId, s, kindOf(kind).title, await priceOf(s.sym, prices));
+}
+/* ---------- live signal messages: pips update every 5 minutes, plus a Refresh button ---------- */
+const LIVE_KB = (id) => ({ inline_keyboard: [[{ text: "🔄 Refresh", callback_data: `lv|${id}` }]] });
+async function priceOf(sym, cache = {}) {
+  if (!(sym in cache)) cache[sym] = (await candles(sym, "1min").catch(() => [])).slice(-1)[0]?.c;
+  return cache[sym];
+}
+async function sendLive(chatId, s, title, price) {
+  const r = await send(chatId, signalText(s, title, price), { reply_markup: LIVE_KB(s.id) });
+  if (r?.ok && s.id) await db.from("tg_live").upsert({ chat_id: chatId, message_id: r.result.message_id, signal_id: s.id, title });
+  return r;
+}
+async function editLive(row, s, cache) {
+  const running = s.status === "running";
+  const r = await tg("editMessageText", { chat_id: row.chat_id, message_id: row.message_id, text: signalText(s, row.title, running ? await priceOf(s.sym, cache) : undefined), parse_mode: "HTML", disable_web_page_preview: true, reply_markup: running ? LIVE_KB(s.id) : { inline_keyboard: [] } });
+  const gone = !r.ok && !/not modified/i.test(String(r.description));
+  if (!running || gone || Date.now() - new Date(row.created_at).getTime() > 7 * 86400000) await db.from("tg_live").delete().eq("chat_id", row.chat_id).eq("message_id", row.message_id);
+}
+async function refreshLive() {
+  const { data: rows } = await db.from("tg_live").select("*").limit(2000);
+  if (!rows?.length) return;
+  const ids = [...new Set(rows.map((r) => r.signal_id))];
+  const { data: sigs } = await db.from("signals").select("id,data").in("id", ids);
+  const byId = Object.fromEntries((sigs ?? []).map((r) => [r.id, { id: r.id, ...r.data }]));
+  const cache = {};
+  for (const row of rows) {
+    const s = byId[row.signal_id];
+    if (!s) { await db.from("tg_live").delete().eq("chat_id", row.chat_id).eq("message_id", row.message_id); continue; }
+    await editLive(row, s, cache);
+    await new Promise((r) => setTimeout(r, 40));
   }
 }
 async function cmdHistory(chatId, a) {
@@ -575,8 +610,18 @@ async function onCallback(q) {
   const chatId = q.message?.chat?.id, msgId = q.message?.message_id;
   if (!chatId) return;
   const a = await account(chatId);
-  if (!a.admin) return;
   const [kind, x, y, z] = String(q.data || "").split("|");
+  if (kind === "lv") {
+    if (!a.admin && !a.tier) return;
+    const [{ data: row }, { data: sig }] = await Promise.all([
+      db.from("tg_live").select("*").eq("chat_id", chatId).eq("message_id", msgId).maybeSingle(),
+      db.from("signals").select("id,data").eq("id", x).maybeSingle(),
+    ]);
+    if (!sig) return;
+    const s = { id: sig.id, ...sig.data };
+    return editLive(row ?? { chat_id: chatId, message_id: msgId, title: kindOf(s.kind).title, created_at: new Date().toISOString() }, s, {});
+  }
+  if (!a.admin) return;
   const edit = (text, markup) => tg("editMessageText", { chat_id: chatId, message_id: msgId, text, parse_mode: "HTML", reply_markup: markup ?? { inline_keyboard: [] } });
   if (kind === "t") return edit(`Customer: <b>${esc(showRef(x))}</b>\nPlan: <b>${esc(y)}</b>\n\nHow long?`, dayButtons(x, y));
   if (kind === "d") {
@@ -721,16 +766,19 @@ async function onDbEvent(ev) {
     if (!s || !s.sym) return;
     const chats = await audience(s.kind);
     if (ev.op === "INSERT" && s.status === "running") {
-      return broadcast(chats, signalText(s, kindOf(s.kind).fresh));
+      const sig = { id: ev.record.id, ...s };
+      for (const c of chats) { await sendLive(c, sig, kindOf(s.kind).fresh); await new Promise((r) => setTimeout(r, 60)); }
+      return;
     }
     if (ev.op === "UPDATE" && old && old.status !== s.status && ["tp", "sl", "be", "closed"].includes(s.status)) {
       const p = s.status === "tp" ? pipsBetween(s.tp, s.entry, s.sym) : s.status === "sl" ? -pipsBetween(s.entry, s.sl, s.sym) : s.status === "closed" ? closedPips(s) : 0;
       const head = s.status === "tp" ? "✅ <b>HIT TP</b>" : s.status === "sl" ? "❌ <b>HIT SL</b>" : s.status === "closed" ? "⏹ <b>CLOSED</b> (time limit)" : "➖ <b>BREAKEVEN</b>";
-      return broadcast(chats, `${head} · ${s.dir > 0 ? "BUY" : "SELL"} <b>${esc(s.sym)}</b>\n${kindOf(s.kind).label} · <b>${p > 0 ? "+" : ""}${p} pips</b>`);
+      await broadcast(chats, `${head} · ${s.dir > 0 ? "BUY" : "SELL"} <b>${esc(s.sym)}</b>\n${kindOf(s.kind).label} · <b>${p > 0 ? "+" : ""}${p} pips</b>`);
+      return refreshLive(); // mark the earlier signal messages as closed
     }
     return;
   }
-  if (ev.event === "scan") return autoScan();
+  if (ev.event === "scan") { await autoScan().catch((e) => console.error("auto scan failed", e)); return refreshLive(); }
   if (ev.event === "daily") {
     const { data } = await db.from("telegram_users").select("*").not("tier", "is", null);
     const soon = addDays(today(), 3), yesterday = addDays(today(), -1);
