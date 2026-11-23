@@ -23,8 +23,8 @@ async function tg(method, body) {
   const r = await fetch(`https://api.telegram.org/bot${TOKEN}/${method}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
   return await r.json().catch(() => ({ ok: false }));
 }
-const MENU = { keyboard: [[{ text: "⚡ Scalping" }, { text: "📈 Intraday" }, { text: "⭐ Swing" }], [{ text: "🧭 Direction" }, { text: "🖼 Chart Scanner" }], [{ text: "📊 History" }, { text: "👤 My plan" }, { text: "❓ Help" }]], resize_keyboard: true };
-const ADMIN_MENU = { keyboard: [[{ text: "➕ Add customer" }, { text: "👥 Customers" }], [{ text: "⚡ Scalping" }, { text: "📈 Intraday" }, { text: "⭐ Swing" }], [{ text: "🧭 Direction" }, { text: "🖼 Chart Scanner" }], [{ text: "📊 History" }, { text: "❓ Help" }]], resize_keyboard: true };
+const MENU = { keyboard: [[{ text: "⚡ Scalping" }, { text: "📈 Intraday" }, { text: "⭐ Swing" }], [{ text: "🧭 Direction" }, { text: "🖼 Chart Scanner" }], [{ text: "📊 History" }, { text: "📰 News" }], [{ text: "👤 My plan" }, { text: "❓ Help" }]], resize_keyboard: true };
+const ADMIN_MENU = { keyboard: [[{ text: "➕ Add customer" }, { text: "👥 Customers" }], [{ text: "⚡ Scalping" }, { text: "📈 Intraday" }, { text: "⭐ Swing" }], [{ text: "🧭 Direction" }, { text: "🖼 Chart Scanner" }], [{ text: "📊 History" }, { text: "📰 News" }, { text: "❓ Help" }]], resize_keyboard: true };
 const KIND = {
   Scalping: { title: "⚡ DAILY SIGNAL SCALPING", fresh: "📢 NEW SCALPING SIGNAL", label: "Scalping", none: "No scalping setup running right now. You'll get a message here as soon as one is posted." },
   Intraday: { title: "📈 DAILY SIGNAL INTRADAY", fresh: "📢 NEW DAILY SIGNAL INTRADAY", label: "Daily Intraday", none: "No intraday setup running right now. You'll get a message here as soon as one is posted." },
@@ -238,6 +238,37 @@ async function refreshLive() {
     await editLive(row, s, cache);
     await new Promise((r) => setTimeout(r, 40));
   }
+}
+/* ---------- economic news (USD events move XAUUSD and BTCUSD) ---------- */
+let newsCache = { t: 0, list: [] };
+async function newsWeek() {
+  if (Date.now() - newsCache.t < 30 * 60000 && newsCache.list.length) return newsCache.list;
+  const r = await fetch("https://nfs.faireconomy.media/ff_calendar_thisweek.json", { headers: { "User-Agent": "Mozilla/5.0" } });
+  if (!r.ok) throw new Error(`news ${r.status}`);
+  const list = (await r.json()).filter((e) => e.country === "USD" && ["High", "Medium"].includes(e.impact)).map((e) => ({ ...e, t: new Date(e.date).getTime() })).filter((e) => Number.isFinite(e.t)).sort((x, y) => x.t - y.t);
+  newsCache = { t: Date.now(), list };
+  return list;
+}
+async function cmdNews(chatId, a) {
+  if (!a.admin && !a.tier) return send(chatId, noPlan(a));
+  let list;
+  try { list = await newsWeek(); } catch (_) { return send(chatId, "📰 The news calendar is not available right now. Please try again in a few minutes."); }
+  const my = (t) => new Date(t + 8 * 3600000);
+  const todayStart = new Date(my(Date.now()).toISOString().slice(0, 10) + "T00:00:00Z").getTime() - 8 * 3600000;
+  const shown = list.filter((e) => e.t >= todayStart);
+  if (!shown.length) return send(chatId, "📰 <b>MEEGO AI · News</b>\n\nNo more important USD news this week. ✅");
+  const lines = ["📰 <b>MEEGO AI · News (USD)</b>", "Malaysia time · 🔴 high impact · 🟠 medium"];
+  const next = shown.find((e) => e.impact === "High" && e.t > Date.now());
+  if (next && next.t - Date.now() < 3 * 3600000) lines.push("", `⚠️ Next 🔴 news: <b>${esc(next.title)}</b> in <b>${Math.max(1, Math.round((next.t - Date.now()) / 60000))} min</b>`);
+  let day = "";
+  for (const e of shown.slice(0, 30)) {
+    const d = my(e.t), dayName = d.toLocaleDateString("en-GB", { weekday: "short", day: "numeric", month: "short", timeZone: "UTC" });
+    if (dayName !== day) { lines.push("", `<b>${dayName}</b>`); day = dayName; }
+    const extra = [e.forecast && `F ${esc(e.forecast)}`, e.previous && `P ${esc(e.previous)}`].filter(Boolean).join(" · ");
+    lines.push(`${e.t < Date.now() ? "✔️" : e.impact === "High" ? "🔴" : "🟠"} ${d.toISOString().slice(11, 16)} ${esc(e.title)}${extra ? ` · ${extra}` : ""}`);
+  }
+  lines.push("", "F = forecast · P = previous", "⚠️ Avoid new entries 30 min before and after 🔴 news.");
+  return send(chatId, lines.join("\n"));
 }
 async function cmdHistory(chatId, a) {
   if (!a.admin && !a.tier) return send(chatId, noPlan(a));
@@ -893,6 +924,7 @@ async function onMessage(msg) {
   if (t.startsWith("/swing") || t.includes("swing")) return cmdSignal(chatId, a, "Swing");
   if (t.startsWith("/direction") || t.includes("direction")) return cmdDirection(chatId, a);
   if (t.startsWith("/history") || t.includes("history")) return cmdHistory(chatId, a);
+  if (t.startsWith("/news") || t.includes("news")) return cmdNews(chatId, a);
   if (t.startsWith("/plan") || t.includes("my plan")) return cmdPlan(chatId, a);
   return send(chatId, [
     "<b>MEEGO AI</b>",
@@ -901,6 +933,7 @@ async function onMessage(msg) {
     "⭐ /swing Priority Swing (Ultimate)",
     "🧭 /direction today's direction",
     "📊 /history wins and pips",
+    "📰 /news this week's important USD news",
     "👤 /plan your plan and MEEGO ID",
     "🖼 /scanner send a chart screenshot for an AI scan",
   ].join("\n"), kb(a));
@@ -922,6 +955,7 @@ Deno.serve(async (req) => {
       { command: "direction", description: "Today's direction" },
       { command: "scanner", description: "AI chart scanner" },
       { command: "history", description: "Wins and pips" },
+      { command: "news", description: "Important USD news this week" },
       { command: "plan", description: "Your plan and MEEGO ID" },
     ] });
     const ok = me.ok && hook.ok;
