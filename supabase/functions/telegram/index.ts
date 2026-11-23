@@ -83,6 +83,8 @@ const keyOf = (ref) => {
 const showRef = (k) => (/^-?\d+$/.test(k) ? `ID ${k}` : `@${k}`);
 
 /* ---------- signal text ---------- */
+// Confluence score (2 to 9) as a grade: 9 = A+, 8 = A, 7 = B+, 6 = B, 5 = C+, 4 = C, 3 = D+, 2 = D
+const grade = (score) => ["D", "D+", "C", "C+", "B", "B+", "A", "A+"][Math.max(0, Math.min(7, Math.round(score) - 2))];
 function signalText(s, title) {
   const side = s.dir > 0 ? "🟢 <b>BUY</b>" : "🔴 <b>SELL</b>";
   const lines = [
@@ -94,6 +96,7 @@ function signalText(s, title) {
     `SL: <code>${px(s.sl, s.sym)}</code>`,
     `Target ${pipsBetween(s.tp, s.entry, s.sym)} pips · Risk ${pipsBetween(s.entry, s.sl, s.sym)} pips`,
   ];
+  if (s.score) lines.push(`Rating Setup: <b>${grade(s.score)}</b>`);
   if (s.note) lines.push("", `📝 ${esc(s.note)}`);
   lines.push("", DISCLAIMER);
   return lines.join("\n");
