@@ -270,31 +270,92 @@ function atr(c, n = 14) {
   const tr = c.slice(-n - 1).map((x, i, a) => (i ? Math.max(x.h - x.l, Math.abs(x.h - a[i - 1].c), Math.abs(x.l - a[i - 1].c)) : 0)).slice(1);
   return tr.length ? tr.reduce((s, v) => s + v, 0) / tr.length : 0;
 }
-// Last closed candle pulled back to the EMA and closed back in the trend direction
-function pullback(c, dir, n, look) {
-  const closes = c.map((x) => x.c), e = ema(closes, n), i = c.length - 1, last = c[i], a = atr(c);
-  if (!a) return false;
+// Each check looks at closed candles c (oldest first) for a trade in direction dir (+1 buy, -1 sell).
+// Pullback to the EMA: touched it in the last few candles and closed back on the trend side
+function emaPullback(c, dir, n, look) {
+  const e = ema(c.map((x) => x.c), n), i = c.length - 1, a = atr(c);
   const touched = c.slice(-look).some((x, k) => (dir > 0 ? x.l <= e[i - look + 1 + k] : x.h >= e[i - look + 1 + k]));
-  const reclaim = dir > 0 ? last.c > e[i] && last.c > last.o && last.c > c[i - 1].c : last.c < e[i] && last.c < last.o && last.c < c[i - 1].c;
-  return touched && reclaim && Math.abs(last.c - e[i]) < a;
+  return touched && (c[i].c - e[i]) * dir > 0 && Math.abs(c[i].c - e[i]) < a;
 }
+// Swing highs and lows (pivots), k candles on each side
+function pivots(c, k = 3) {
+  const hi = [], lo = [];
+  for (let i = k; i < c.length - k; i++) {
+    const w = c.slice(i - k, i + k + 1);
+    if (c[i].h === Math.max(...w.map((x) => x.h))) hi.push({ i, v: c[i].h });
+    if (c[i].l === Math.min(...w.map((x) => x.l))) lo.push({ i, v: c[i].l });
+  }
+  return { hi, lo };
+}
+// Rejected a support (buy) / resistance (sell) zone made by older swing points
+function snrRejection(c, dir, pv, a) {
+  const zone = (dir > 0 ? pv.lo : pv.hi).filter((p) => p.i < c.length - 6).map((p) => p.v);
+  const recent = c.slice(-3), tip = dir > 0 ? Math.min(...recent.map((x) => x.l)) : Math.max(...recent.map((x) => x.h));
+  return zone.some((v) => Math.abs(tip - v) <= 0.3 * a && (c[c.length - 1].c - v) * dir > 0);
+}
+// Broke an old resistance (buy) / support (sell), came back to retest it, and held
+function breakRetest(c, dir, pv, a) {
+  const n = c.length, levels = (dir > 0 ? pv.hi : pv.lo).filter((p) => p.i < n - 8).map((p) => p.v);
+  return levels.some((v) => {
+    const broke = c.slice(-12, -2).some((x) => (x.c - v) * dir > 0.2 * a);
+    const retest = c.slice(-3).some((x) => Math.abs((dir > 0 ? x.l : x.h) - v) <= 0.3 * a);
+    return broke && retest && (c[n - 1].c - v) * dir > 0;
+  });
+}
+// Break of structure: a recent close beyond the last swing high (buy) / low (sell)
+function bos(c, dir, pv) {
+  const last = (dir > 0 ? pv.hi : pv.lo).filter((p) => p.i < c.length - 5).slice(-1)[0];
+  return !!last && c.slice(-5).some((x) => (x.c - last.v) * dir > 0);
+}
+// Liquidity sweep: poked past the recent low (buy) / high (sell) then closed back inside
+function sweep(c, dir) {
+  const base = c.slice(-23, -3), recent = c.slice(-3);
+  if (base.length < 10) return false;
+  if (dir > 0) { const lo = Math.min(...base.map((x) => x.l)); return recent.some((x) => x.l < lo && x.c > lo); }
+  const hi = Math.max(...base.map((x) => x.h)); return recent.some((x) => x.h > hi && x.c < hi);
+}
+// Rejection candle: pin bar or engulfing in the trade direction
+function rejectionCandle(c, dir) {
+  const x = c[c.length - 1], p = c[c.length - 2], body = Math.abs(x.c - x.o), range = x.h - x.l || 1e-9;
+  const wick = dir > 0 ? Math.min(x.o, x.c) - x.l : x.h - Math.max(x.o, x.c);
+  const pin = wick >= 2 * body && wick >= 0.5 * range;
+  const engulf = (x.c - x.o) * dir > 0 && (p.c - p.o) * dir < 0 && Math.abs(x.c - x.o) > Math.abs(p.c - p.o) && (x.c - p.o) * dir > 0;
+  return pin || engulf;
+}
+// trend: higher timeframes that must agree (need) and that add a point when they agree (bonus)
 const AUTO = {
-  Scalping: { tf: "m5", ema: 20, look: 3, swing: 8, buf: 0.2, rr: 1.5, filter: (t, d) => t.m5 === d && t.m15 === d && t.h1 !== -d, note: "M5 pullback in the M15 trend", life: 3, cool: 0.5, max: 4 },
-  Intraday: { tf: "m15", ema: 20, look: 3, swing: 10, buf: 0.2, rr: 2, filter: (t, d) => t.m15 === d && t.h1 === d && t.h4 === d, note: "M15 pullback with H1 and H4 trend", life: 24, cool: 2, max: 2 },
-  Swing: { tf: "h1", ema: 50, look: 4, swing: 20, buf: 0.3, rr: 2.5, filter: (t, d) => t.h1 === d && t.h4 === d, note: "H1 pullback to EMA50 in the H4 trend", life: 24 * 7, cool: 12, max: 1 },
+  Scalping: { tf: "m5", ema: 20, look: 3, need: ["m15"], bonus: ["m5", "h1"], min: 4, buf: 0.2, rr: 1.5, life: 3, cool: 0.5, max: 4 },
+  Intraday: { tf: "m15", ema: 20, look: 3, need: ["h1"], bonus: ["m15", "h4"], min: 5, buf: 0.2, rr: 2, life: 24, cool: 2, max: 2 },
+  Swing: { tf: "h1", ema: 50, look: 4, need: ["h4"], bonus: ["h1", "d1"], min: 6, buf: 0.3, rr: 2.5, life: 24 * 7, cool: 12, max: 1 },
 };
+const TF_NAME = { m5: "M5", m15: "M15", h1: "H1", h4: "H4", d1: "D1" };
+// Confluence score out of 9: 1 for the required trend, up to 2 more trends, and 1 per pattern (6 patterns)
 function findSetup(kind, d, price) {
   const r = AUTO[kind], c = d[r.tf];
   if (!c || c.length < 60) return null;
+  const cc = c.slice(-120), a = atr(c), pv = pivots(cc);
+  if (!a) return null;
+  let best = null;
   for (const dir of [1, -1]) {
-    if (!r.filter(d.trend, dir) || !pullback(c, dir, r.ema, r.look)) continue;
-    const a = atr(c), recent = c.slice(-r.swing);
-    const sl = dir > 0 ? Math.min(...recent.map((x) => x.l)) - r.buf * a : Math.max(...recent.map((x) => x.h)) + r.buf * a;
+    if (!r.need.every((k) => d.trend[k] === dir) || r.bonus.some((k) => d.trend[k] === -dir)) continue;
+    const last = c[c.length - 1];
+    if ((last.c - last.o) * dir <= 0) continue; // the trigger candle must close in the trade direction
+    const why = r.need.concat(r.bonus.filter((k) => d.trend[k] === dir)).map((k) => `${TF_NAME[k]} trend`);
+    if (emaPullback(c, dir, r.ema, r.look)) why.push(`EMA${r.ema} pullback`);
+    if (snrRejection(cc, dir, pv, a)) why.push(dir > 0 ? "support hold" : "resistance hold");
+    if (breakRetest(cc, dir, pv, a)) why.push("SNR break & retest");
+    if (bos(cc, dir, pv)) why.push("BOS");
+    if (sweep(c, dir)) why.push("liquidity sweep");
+    if (rejectionCandle(c, dir)) why.push("rejection candle");
+    if (why.length < r.min) continue;
+    // SL beyond the nearest swing point (or the sweep wick), with a small buffer
+    const near = c.slice(-12);
+    const sl = dir > 0 ? Math.min(...near.map((x) => x.l)) - r.buf * a : Math.max(...near.map((x) => x.h)) + r.buf * a;
     const risk = (price - sl) * dir;
-    if (!(risk >= 0.4 * a && risk <= 2.5 * a)) continue;
-    return { dir, entry: price, sl, tp: price + dir * r.rr * risk, note: `🤖 MEEGO AI auto setup · ${r.note} · RR 1:${r.rr}` };
+    if (!(risk >= 0.4 * a && risk <= 3 * a)) continue;
+    if (!best || why.length > best.score) best = { dir, entry: price, sl, tp: price + dir * r.rr * risk, score: why.length, note: `🤖 MEEGO AI · Confluence ${why.length}/9: ${why.join(" + ")} · RR 1:${r.rr}` };
   }
-  return null;
+  return best;
 }
 // Forex/gold trade Sun 22:00 to Fri 21:00 UTC
 function marketOpen(now, sym) {
@@ -346,8 +407,8 @@ async function autoScan() {
     const m15 = await candles(sym, "15min"), h1 = await candles(sym, "1h");
     const price = m1[m1.length - 1].c;
     const closed = (c) => c.slice(0, -1); // drop the candle that is still forming
-    const d = { m5: closed(group(m1, 5)), m15: closed(m15), h1: closed(h1), h4: closed(group(h1, 240)) };
-    d.trend = { m5: tfTrend(d.m5), m15: tfTrend(d.m15), h1: tfTrend(d.h1), h4: tfTrend(d.h4) };
+    const d = { m5: closed(group(m1, 5)), m15: closed(m15), h1: closed(h1), h4: closed(group(h1, 240)), d1: closed(group(h1, 1440)) };
+    d.trend = { m5: tfTrend(d.m5), m15: tfTrend(d.m15), h1: tfTrend(d.h1), h4: tfTrend(d.h4), d1: tfTrend(d.d1) };
     for (const kind of ["Swing", "Intraday", "Scalping"]) {
       const mine = all.filter((s) => s.kind === kind && s.sym === sym && s.auto);
       if (mine.some((s) => s.status === "running")) continue;
