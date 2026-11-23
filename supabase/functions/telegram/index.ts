@@ -195,13 +195,13 @@ async function cmdHistory(chatId, a) {
     (async () => { for (const k of kinds) all.push(...(await signalsOf(k))); })(),
     playVideo(chatId, "history", "📊 <b>MEEGO AI</b> · loading signal history…", "✅ <b>MEEGO AI</b> · results ready", 3700),
   ]);
-  const closed = all.filter((s) => s.time >= from.getTime() && (s.status === "tp" || s.status === "sl")).sort((x, y) => y.time - x.time);
+  const closed = all.filter((s) => s.time >= from.getTime() && ["tp", "sl", "closed"].includes(s.status)).sort((x, y) => y.time - x.time);
   if (!closed.length) return send(chatId, "No closed signals in the last two months yet.");
-  const pipsOf = (s) => (s.status === "tp" ? pipsBetween(s.tp, s.entry, s.sym) : -pipsBetween(s.entry, s.sl, s.sym));
-  const tp = closed.filter((s) => s.status === "tp").length;
+  const pipsOf = (s) => (s.status === "tp" ? pipsBetween(s.tp, s.entry, s.sym) : s.status === "closed" ? closedPips(s) : -pipsBetween(s.entry, s.sl, s.sym));
+  const tp = closed.filter((s) => pipsOf(s) > 0).length;
   const net = closed.reduce((t, s) => t + pipsOf(s), 0);
-  const rows = closed.slice(0, 10).map((s) => `${s.status === "tp" ? "✅" : "❌"} ${new Date(s.time).toISOString().slice(5, 10)} ${s.dir > 0 ? "BUY" : "SELL"} ${esc(s.sym)} <b>${pipsOf(s) > 0 ? "+" : ""}${pipsOf(s)}</b> pips`);
-  return send(chatId, `📊 <b>Signal history</b> (this month and last)\n\nHit TP: <b>${tp}</b> · Win rate: <b>${Math.round((tp / closed.length) * 100)}%</b> · Net: <b>${net > 0 ? "+" : ""}${net} pips</b>\n\n${rows.join("\n")}`);
+  const rows = closed.slice(0, 10).map((s) => `${pipsOf(s) > 0 ? "✅" : "❌"} ${new Date(s.time).toISOString().slice(5, 10)} ${s.dir > 0 ? "BUY" : "SELL"} ${esc(s.sym)} <b>${pipsOf(s) > 0 ? "+" : ""}${pipsOf(s)}</b> pips`);
+  return send(chatId, `📊 <b>Signal history</b> (this month and last)\n\nWins: <b>${tp}</b> · Win rate: <b>${Math.round((tp / closed.length) * 100)}%</b> · Net: <b>${net > 0 ? "+" : ""}${net} pips</b>\n\n${rows.join("\n")}`);
 }
 async function cmdPlan(chatId, a) {
   if (a.admin) return send(chatId, `👤 Role: <b>ADMIN</b>\nMEEGO ID: <code>${chatId}</code>\n\nSend /admin for the admin commands.`);
@@ -263,6 +263,103 @@ async function cmdDirection(chatId, a) {
     return `${head} <b>${r.p} · ${word}</b>${r.price ? ` · <code>${px(r.price, r.p)}</code>` : ""}\n${tfs.slice(0, 3).join("  ")}\n${tfs.slice(3).join("  ")}`;
   });
   return send(chatId, `🧭 <b>MEEGO AI · Market Direction</b>\n\n${blocks.join("\n\n")}\n\n${DISCLAIMER}`);
+}
+
+/* ---------- MEEGO AI auto setups (runs every 5 minutes from pg_cron "meego-scan") ---------- */
+function atr(c, n = 14) {
+  const tr = c.slice(-n - 1).map((x, i, a) => (i ? Math.max(x.h - x.l, Math.abs(x.h - a[i - 1].c), Math.abs(x.l - a[i - 1].c)) : 0)).slice(1);
+  return tr.length ? tr.reduce((s, v) => s + v, 0) / tr.length : 0;
+}
+// Last closed candle pulled back to the EMA and closed back in the trend direction
+function pullback(c, dir, n, look) {
+  const closes = c.map((x) => x.c), e = ema(closes, n), i = c.length - 1, last = c[i], a = atr(c);
+  if (!a) return false;
+  const touched = c.slice(-look).some((x, k) => (dir > 0 ? x.l <= e[i - look + 1 + k] : x.h >= e[i - look + 1 + k]));
+  const reclaim = dir > 0 ? last.c > e[i] && last.c > last.o && last.c > c[i - 1].c : last.c < e[i] && last.c < last.o && last.c < c[i - 1].c;
+  return touched && reclaim && Math.abs(last.c - e[i]) < a;
+}
+const AUTO = {
+  Scalping: { tf: "m5", ema: 20, look: 3, swing: 8, buf: 0.2, rr: 1.5, filter: (t, d) => t.m5 === d && t.m15 === d && t.h1 !== -d, note: "M5 pullback in the M15 trend", life: 3, cool: 0.5, max: 4 },
+  Intraday: { tf: "m15", ema: 20, look: 3, swing: 10, buf: 0.2, rr: 2, filter: (t, d) => t.m15 === d && t.h1 === d && t.h4 === d, note: "M15 pullback with H1 and H4 trend", life: 24, cool: 2, max: 2 },
+  Swing: { tf: "h1", ema: 50, look: 4, swing: 20, buf: 0.3, rr: 2.5, filter: (t, d) => t.h1 === d && t.h4 === d, note: "H1 pullback to EMA50 in the H4 trend", life: 24 * 7, cool: 12, max: 1 },
+};
+function findSetup(kind, d, price) {
+  const r = AUTO[kind], c = d[r.tf];
+  if (!c || c.length < 60) return null;
+  for (const dir of [1, -1]) {
+    if (!r.filter(d.trend, dir) || !pullback(c, dir, r.ema, r.look)) continue;
+    const a = atr(c), recent = c.slice(-r.swing);
+    const sl = dir > 0 ? Math.min(...recent.map((x) => x.l)) - r.buf * a : Math.max(...recent.map((x) => x.h)) + r.buf * a;
+    const risk = (price - sl) * dir;
+    if (!(risk >= 0.4 * a && risk <= 2.5 * a)) continue;
+    return { dir, entry: price, sl, tp: price + dir * r.rr * risk, note: `🤖 MEEGO AI auto setup · ${r.note} · RR 1:${r.rr}` };
+  }
+  return null;
+}
+// Forex/gold trade Sun 22:00 to Fri 21:00 UTC
+function marketOpen(now, sym) {
+  if (/BTC|ETH/.test(sym)) return true;
+  const day = now.getUTCDay(), h = now.getUTCHours();
+  return !(day === 6 || (day === 0 && h < 22) || (day === 5 && h >= 21));
+}
+const closedPips = (s) => Math.round(((Number(s.exit) - s.entry) * s.dir) / pip(s.sym));
+async function setStatus(s, status, exit) {
+  const { id, ...data } = s;
+  await db.from("signals").update({ data: { ...data, status, exit: exit ?? null, closedAt: Date.now() }, updated_at: new Date().toISOString() }).eq("id", id);
+}
+// Hit TP / Hit SL / time out for running auto signals
+async function watchSignals(list) {
+  const bySym = {};
+  for (const s of list) (bySym[s.sym] ??= []).push(s);
+  for (const [sym, sigs] of Object.entries(bySym)) {
+    const m1 = await candles(sym, "1min");
+    if (!m1.length) continue;
+    let m15 = null;
+    for (const s of sigs) {
+      let path = m1.filter((x) => x.t >= s.time);
+      if (m1[0].t > s.time) path = (m15 ??= await candles(sym, "15min")).filter((x) => x.t >= s.time);
+      let hit = null;
+      for (const x of path) {
+        const slHit = s.dir > 0 ? x.l <= s.sl : x.h >= s.sl, tpHit = s.dir > 0 ? x.h >= s.tp : x.l <= s.tp;
+        if (slHit) { hit = "sl"; break; }
+        if (tpHit) { hit = "tp"; break; }
+      }
+      if (hit) await setStatus(s, hit);
+      else if (Date.now() - s.time > AUTO[s.kind].life * 3600000) await setStatus(s, "closed", m1[m1.length - 1].c);
+    }
+  }
+}
+async function autoScan() {
+  const cfg = await settings();
+  if (cfg.auto_scan === "off") return;
+  const { data } = await db.from("signals").select("id,data").order("updated_at", { ascending: false }).limit(300);
+  const all = (data ?? []).map((r) => ({ id: r.id, ...r.data })).filter((s) => s && s.sym);
+  const running = all.filter((s) => s.status === "running" && s.auto);
+  if (running.length) await watchSignals(running);
+  const now = new Date();
+  if (now.getUTCMinutes() % 15 >= 5) return; // look for new setups every 15 minutes
+  const pairs = String(cfg.scan_pairs || "XAUUSD").split(",").map((p) => p.trim().toUpperCase()).filter(Boolean);
+  for (const sym of pairs) {
+    if (!marketOpen(now, sym)) continue;
+    const m1 = await candles(sym, "1min");
+    if (!m1.length || Date.now() - m1[m1.length - 1].t > 20 * 60000) continue; // no fresh prices (holiday)
+    const m15 = await candles(sym, "15min"), h1 = await candles(sym, "1h");
+    const price = m1[m1.length - 1].c;
+    const closed = (c) => c.slice(0, -1); // drop the candle that is still forming
+    const d = { m5: closed(group(m1, 5)), m15: closed(m15), h1: closed(h1), h4: closed(group(h1, 240)) };
+    d.trend = { m5: tfTrend(d.m5), m15: tfTrend(d.m15), h1: tfTrend(d.h1), h4: tfTrend(d.h4) };
+    for (const kind of ["Swing", "Intraday", "Scalping"]) {
+      const mine = all.filter((s) => s.kind === kind && s.sym === sym && s.auto);
+      if (mine.some((s) => s.status === "running")) continue;
+      const lastEnd = Math.max(0, ...mine.map((s) => s.closedAt || s.time));
+      if (Date.now() - lastEnd < AUTO[kind].cool * 3600000) continue;
+      if (mine.filter((s) => s.time >= Date.now() - 86400000).length >= AUTO[kind].max) continue;
+      const s = findSetup(kind, d, price);
+      if (!s) continue;
+      for (const k of ["entry", "sl", "tp"]) s[k] = Number(s[k].toFixed(digits(sym)));
+      await db.from("signals").insert({ id: crypto.randomUUID(), data: { kind, sym, ...s, status: "running", auto: true, time: Date.now(), closedAt: null } });
+    }
+  }
 }
 
 /* ---------- AI chart scan from a photo ---------- */
@@ -437,6 +534,8 @@ async function cmdAdmin(chatId, a, text) {
       "Tap <b>👥 Customers</b> to renew, change or end someone's plan.",
       "",
       "<b>Signals</b>",
+      "MEEGO AI finds and posts setups by itself, and closes them at TP/SL. <code>/autoscan</code> to switch it on/off or change pairs.",
+      "Post your own too:",
       "<code>/post BUY XAUUSD 4040 4080 3990</code> intraday signal (entry, TP, SL)",
       "<code>/post BUY XAUUSD 4040 4048 4034 scalp</code> scalping signal",
       "<code>/post SELL XAUUSD 4129 4119 4140 swing Sell area, wait for price</code> swing (Ultimate only) with a note",
@@ -472,6 +571,16 @@ async function cmdAdmin(chatId, a, text) {
     return send(chatId, `✅ ${esc(nameOf(u))}'s plan has been ended.`);
   }
   if (cmd === "/customers") return cmdCustomers(chatId);
+  if (cmd === "/autoscan") {
+    const opt = (parts[1] || "").toLowerCase();
+    if (opt === "on" || opt === "off") await db.from("app_settings").upsert({ key: "auto_scan", value: opt });
+    if (opt === "pairs" && parts[2]) {
+      const list = parts.slice(2).join(",").toUpperCase().split(",").map((p) => p.trim()).filter((p) => /^[A-Z0-9]{3,10}$/.test(p));
+      if (list.length) await db.from("app_settings").upsert({ key: "scan_pairs", value: list.join(",") });
+    }
+    const cfg = await settings();
+    return send(chatId, `🤖 <b>MEEGO AI auto setups</b>: <b>${cfg.auto_scan === "off" ? "OFF" : "ON"}</b>\nPairs: <b>${esc(cfg.scan_pairs || "XAUUSD")}</b>\n\n<code>/autoscan on</code> · <code>/autoscan off</code>\n<code>/autoscan pairs XAUUSD,BTCUSD</code>`);
+  }
   if (cmd === "/post") {
     const side = (parts[1] || "").toUpperCase(), sym = (parts[2] || "").toUpperCase();
     const entry = Number(parts[3]), tp = Number(parts[4]), sl = Number(parts[5]);
@@ -526,13 +635,14 @@ async function onDbEvent(ev) {
     if (ev.op === "INSERT" && s.status === "running") {
       return broadcast(chats, signalText(s, kindOf(s.kind).fresh));
     }
-    if (ev.op === "UPDATE" && old && old.status !== s.status && ["tp", "sl", "be"].includes(s.status)) {
-      const p = s.status === "tp" ? pipsBetween(s.tp, s.entry, s.sym) : s.status === "sl" ? -pipsBetween(s.entry, s.sl, s.sym) : 0;
-      const head = s.status === "tp" ? "✅ <b>HIT TP</b>" : s.status === "sl" ? "❌ <b>HIT SL</b>" : "➖ <b>BREAKEVEN</b>";
+    if (ev.op === "UPDATE" && old && old.status !== s.status && ["tp", "sl", "be", "closed"].includes(s.status)) {
+      const p = s.status === "tp" ? pipsBetween(s.tp, s.entry, s.sym) : s.status === "sl" ? -pipsBetween(s.entry, s.sl, s.sym) : s.status === "closed" ? closedPips(s) : 0;
+      const head = s.status === "tp" ? "✅ <b>HIT TP</b>" : s.status === "sl" ? "❌ <b>HIT SL</b>" : s.status === "closed" ? "⏹ <b>CLOSED</b> (time limit)" : "➖ <b>BREAKEVEN</b>";
       return broadcast(chats, `${head} · ${s.dir > 0 ? "BUY" : "SELL"} <b>${esc(s.sym)}</b>\n${kindOf(s.kind).label} · <b>${p > 0 ? "+" : ""}${p} pips</b>`);
     }
     return;
   }
+  if (ev.event === "scan") return autoScan();
   if (ev.event === "daily") {
     const { data } = await db.from("telegram_users").select("*").not("tier", "is", null);
     const soon = addDays(today(), 3), yesterday = addDays(today(), -1);
@@ -600,7 +710,7 @@ async function onMessage(msg) {
     return send(chatId, `Your <b>${esc(a.rawTier)}</b> plan has ended. Contact the admin to renew.\nMEEGO ID: <code>${chatId}</code>`, { reply_markup: { remove_keyboard: true } });
   }
   if (msg.photo && msg.photo.length) return scanPhoto(chatId, a, msg);
-  if (/^\/(admin|activate|renew|remove|customers|post|close|announce|members)\b/.test(t)) return cmdAdmin(chatId, a, text);
+  if (/^\/(admin|activate|renew|remove|customers|post|close|announce|members|autoscan)\b/.test(t)) return cmdAdmin(chatId, a, text);
   if (t.startsWith("/scanner") || t.includes("chart scanner")) {
     if (!a.admin && !a.tier) return send(chatId, noPlan(a));
     return send(chatId, "🖼 <b>MEEGO AI · Chart Scanner</b>\n\nSend a <b>screenshot of your chart</b> here (MT4/MT5/TradingView).\n\nTips for the best result:\n• Show the price scale on the right\n• One pair, one timeframe\n• Add the pair in the caption, e.g. <code>XAUUSD M15</code>\n\nMEEGO AI will read it and reply with direction, entry, TP and SL.", kb(a));
