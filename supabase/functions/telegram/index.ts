@@ -370,8 +370,8 @@ async function cmdHistory(chatId, a) {
 }
 async function cmdPlan(chatId, a) {
   if (a.admin) return send(chatId, `👤 Role: <b>ADMIN</b>\nMEEGO ID: <code>${chatId}</code>\n\nSend /admin for the admin commands.`);
-  if (!a.rawTier) return send(chatId, noPlan(a));
-  return send(chatId, `👤 Plan: <b>${esc(a.rawTier)}</b>${a.end ? `\nEnds: <b>${esc(a.end)}</b>` : ""}\nMEEGO ID: <code>${chatId}</code>${a.tier ? "" : "\n\n⚠️ This plan has ended. Contact the admin to renew."}`);
+  if (!a.rawTier) return showPlans(chatId);
+  return send(chatId, `👤 Plan: <b>${esc(a.rawTier)}</b>${a.end ? `\nEnds: <b>${esc(a.end)}</b>` : ""}\nMEEGO ID: <code>${chatId}</code>${a.tier ? "" : "\n\n⚠️ This plan has ended."}`, { reply_markup: { inline_keyboard: [[{ text: "💳 Renew / upgrade", callback_data: "plans" }]] } });
 }
 function ema(arr, n) { const k = 2 / (n + 1); let e = arr[0]; return arr.map((v, i) => (e = i ? v * k + e * (1 - k) : v)); }
 function trend(closes) {
@@ -826,6 +826,155 @@ If the image is not a price chart, reply {"pair":null,"direction":"WAIT","confid
   return send(chatId, lines.join("\n"));
 }
 
+
+/* ---------- payments: pick a plan → bank transfer → receipt checked by MEEGO AI → admin taps Approve ---------- */
+const PRICES = { Basic: { rm: 20, days: 30 }, Pro: { rm: 35, days: 30 }, Ultimate: { rm: 50, days: 30 } };
+async function prices() {
+  const cfg = await settings();
+  let p = {};
+  try { p = cfg.plan_prices ? JSON.parse(cfg.plan_prices) : {}; } catch (_) { p = {}; }
+  return Object.fromEntries(TIERS.map((t) => [t, { ...PRICES[t], ...(p[t] || {}) }]));
+}
+async function bankInfo() {
+  const cfg = await settings();
+  try { const b = cfg.pay_bank ? JSON.parse(cfg.pay_bank) : null; return b && b.bank && b.name && b.acc ? b : null; } catch (_) { return null; }
+}
+async function adminIds() { return ((await db.from("telegram_users").select("chat_id").eq("is_admin", true)).data ?? []).map((r) => r.chat_id); }
+async function showPlans(chatId, intro) {
+  const pr = await prices();
+  const lines = [
+    intro || "💳 <b>MEEGO AI plans</b>",
+    "",
+    ...TIERS.map((t) => `${t === "Ultimate" ? "⭐" : "•"} <b>${t}</b> · RM${pr[t].rm} for ${pr[t].days} days`),
+    "",
+    "All plans: ⚡ Scalping, 📈 Intraday, 📰 News signals, 🧭 Direction, 🖼 Chart Scanner, 📊 History.",
+    "⭐ <b>Priority Swing</b> signals are for <b>Ultimate</b> only.",
+    "",
+    "Tap a plan to pay by bank transfer:",
+  ];
+  return send(chatId, lines.join("\n"), { reply_markup: { inline_keyboard: [TIERS.map((t) => ({ text: `${t} · RM${pr[t].rm}`, callback_data: `buy|${t}` }))] } });
+}
+async function startPayment(chatId, tier) {
+  if (!TIERS.includes(tier)) return;
+  const bank = await bankInfo();
+  if (!bank) {
+    for (const ad of await adminIds()) await send(ad, "⚠️ A customer tried to pay but the bank details aren't set. Send:\n<code>/setbank Bank name | Account holder name | Account number</code>");
+    return send(chatId, "Online payment isn't ready yet. Please contact the admin.");
+  }
+  const pr = (await prices())[tier];
+  const { data, error } = await db.from("tg_payments").insert({ chat_id: chatId, tier, amount: pr.rm, days: pr.days, status: "waiting" }).select("id").single();
+  if (error || !data) return send(chatId, "Something went wrong. Please try again in a minute.");
+  await setState(chatId, `pay|${data.id}`);
+  return send(chatId, [
+    `💳 <b>MEEGO AI · ${tier}</b> · RM${pr.rm} for ${pr.days} days`,
+    "",
+    "Transfer to:",
+    `🏦 Bank: <b>${esc(bank.bank)}</b>`,
+    `👤 Name: <b>${esc(bank.name)}</b>`,
+    `🔢 Account: <code>${esc(bank.acc)}</code>`,
+    "",
+    `Transfer exactly <b>RM${pr.rm}</b>, then send the <b>receipt screenshot</b> (or PDF) here.`,
+    "MEEGO AI checks it and your plan turns on as soon as it's confirmed.",
+  ].join("\n"));
+}
+const normName = (v) => String(v || "").toUpperCase().replace(/[^A-Z ]/g, " ").replace(/\s+/g, " ").trim();
+const digitsOf = (v) => String(v || "").replace(/\D/g, "");
+// Compare what the AI read on the receipt with the admin's bank details and the plan price
+function receiptChecks(r, bank, pay, dup) {
+  const want = normName(bank.name), got = normName(r.recipient_name);
+  const wt = want.split(" ").filter((w) => w.length > 1), gt = got.split(" ").filter((w) => w.length > 1);
+  const common = gt.filter((w) => wt.includes(w)).length;
+  const nameOk = !!got && (want.startsWith(got) && got.length >= 6 || got.startsWith(want) || common >= Math.min(2, wt.length) || common / Math.max(1, wt.length) >= 0.5);
+  const accRaw = String(r.recipient_account || ""), accD = digitsOf(accRaw), myAcc = digitsOf(bank.acc);
+  const masked = /[*xX•]/.test(accRaw);
+  const accOk = !!accD && (accD === myAcc || (masked && accD.length >= 3 && myAcc.endsWith(accD.slice(-4))));
+  const amt = Number(String(r.amount ?? "").replace(/[^0-9.]/g, ""));
+  const amtOk = Number.isFinite(amt) && amt + 0.001 >= Number(pay.amount);
+  const t = r.date_time ? Date.parse(String(r.date_time).slice(0, 16) + ":00+08:00") : NaN;
+  const ageH = (Date.now() - t) / 3600000;
+  const dateOk = Number.isFinite(t) && ageH > -1 && ageH < 72;
+  return [
+    { ok: nameOk, txt: `Name: ${esc(r.recipient_name || "not found")}` },
+    { ok: accOk, txt: `Account: ${esc(accRaw || "not found")}` },
+    { ok: amtOk, txt: `Amount: ${Number.isFinite(amt) ? "RM" + amt.toFixed(2) : "not found"} (needs RM${pay.amount})` },
+    { ok: dateOk, txt: `Date: ${esc(r.date_time || "not found")}${Number.isFinite(t) && !dateOk ? " (too old)" : ""}` },
+    { ok: r.successful !== false, txt: `Status: ${r.successful === false ? "NOT successful" : "successful"}` },
+    { ok: !dup, txt: dup ? "Used before: this receipt was already sent" : "Not used before" },
+  ];
+}
+async function handleReceipt(chatId, a, msg, payId) {
+  const { data: pay } = await db.from("tg_payments").select("*").eq("id", payId).maybeSingle();
+  if (!pay || pay.status !== "waiting") { await clearState(chatId); return send(chatId, "That payment is already being handled. Tap /start to choose a plan again."); }
+  let fileId, uniq, media, kind;
+  if (msg.photo?.length) { const ph = msg.photo[msg.photo.length - 1]; fileId = ph.file_id; uniq = ph.file_unique_id; media = "image/jpeg"; kind = "photo"; }
+  else if (msg.document) {
+    const m = String(msg.document.mime_type || "");
+    if (!/^image\/(jpeg|png|webp)$|^application\/pdf$/.test(m)) return send(chatId, "Please send the receipt as a screenshot (photo) or a PDF.");
+    if ((msg.document.file_size || 0) > 10 * 1024 * 1024) return send(chatId, "That file is too big. Please send a screenshot of the receipt.");
+    fileId = msg.document.file_id; uniq = msg.document.file_unique_id; media = m; kind = "document";
+  } else return;
+  const bank = await bankInfo();
+  if (!bank) return send(chatId, "Online payment isn't ready yet. Please contact the admin.");
+  await send(chatId, "🔍 MEEGO AI is checking your receipt…");
+  const f = await tg("getFile", { file_id: fileId });
+  if (!f.ok) return send(chatId, "Couldn't download that file. Please send it again.");
+  const bytes = new Uint8Array(await (await fetch(`https://api.telegram.org/file/bot${TOKEN}/${f.result.file_path}`)).arrayBuffer());
+  const block = media === "application/pdf"
+    ? { type: "document", source: { type: "base64", media_type: "application/pdf", data: toBase64(bytes) } }
+    : { type: "image", source: { type: "base64", media_type: media, data: toBase64(bytes) } };
+  const prompt = `This should be a Malaysian bank transfer / DuitNow receipt. Read it carefully and reply with ONLY one JSON object:
+{"is_receipt":true|false,"successful":true|false|null,"recipient_name":"text or null","recipient_account":"exactly as shown, keep any * masking, or null","amount":number|null,"date_time":"YYYY-MM-DDTHH:MM in the receipt's local time, or null","reference":"transaction/reference ID or null","bank":"text or null"}
+recipient = the person/account the money was SENT TO (not the sender). If it is not a payment receipt, set is_receipt false.`;
+  let r = null;
+  try {
+    const content = [block, { type: "text", text: prompt }];
+    const opusLike = /^claude-(opus-5|fable|sonnet-5-5)/.test(MODEL);
+    const res = opusLike
+      ? await anthropic.beta.messages.create({ model: MODEL, max_tokens: 4000, betas: ["server-side-fallback-2026-07-01"], fallbacks: "default", output_config: { effort: "low" }, messages: [{ role: "user", content }] })
+      : await anthropic.messages.create({ model: MODEL, max_tokens: 4000, messages: [{ role: "user", content }] });
+    r = parseJSON(res.content.filter((b) => b.type === "text").map((b) => b.text).join(""));
+  } catch (e) { console.error("receipt check failed", e); }
+  if (r && r.is_receipt === false) return send(chatId, "This doesn't look like a bank transfer receipt. Please send a clear screenshot of the receipt.");
+  const ref = r?.reference ? String(r.reference).replace(/[^A-Za-z0-9_-]/g, "").slice(0, 80) || null : null;
+  const { data: used } = await db.from("tg_payments").select("id").neq("id", pay.id).in("status", ["review", "approved"]).or(ref ? `file_unique_id.eq.${uniq},ref.eq.${ref.replace(/[^A-Za-z0-9_-]/g, "")}` : `file_unique_id.eq.${uniq}`).limit(1);
+  const checks = r ? receiptChecks(r, bank, pay, !!(used && used.length)) : [{ ok: false, txt: "MEEGO AI couldn't read the receipt" }];
+  const allOk = checks.every((c) => c.ok);
+  await db.from("tg_payments").update({ status: "review", file_id: fileId, file_unique_id: uniq, file_kind: kind, ref, ai: r, checks, updated_at: new Date().toISOString() }).eq("id", pay.id);
+  await clearState(chatId);
+  await send(chatId, allOk
+    ? "✅ Receipt received and it looks correct. The admin will confirm shortly; you'll get a message here when your plan is on."
+    : `⚠️ Receipt received, but some details don't match:\n${checks.filter((c) => !c.ok).map((c) => `❌ ${c.txt}`).join("\n")}\n\nThe admin will check it. If you sent the wrong receipt, tap /start and pay again.`);
+  const who = msg.from?.username ? `@${esc(msg.from.username)}` : esc(msg.from?.first_name || String(chatId));
+  const caption = [
+    `💳 <b>New payment</b> · ${who} (<code>${chatId}</code>)`,
+    `Plan: <b>${esc(pay.tier)}</b> · RM${pay.amount} · ${pay.days} days`,
+    "",
+    `🤖 MEEGO AI check: ${allOk ? "<b>ALL OK</b>" : "<b>CHECK CAREFULLY</b>"}`,
+    ...checks.map((c) => `${c.ok ? "✅" : "❌"} ${c.txt}`),
+    ...(ref ? [`Ref: <code>${esc(ref)}</code>`] : []),
+  ].join("\n");
+  const buttons = { inline_keyboard: [[{ text: "✅ Approve", callback_data: `pa|${pay.id}` }, { text: "❌ Reject", callback_data: `pr|${pay.id}` }]] };
+  for (const ad of await adminIds()) {
+    const sent = await tg(kind === "photo" ? "sendPhoto" : "sendDocument", { chat_id: ad, [kind === "photo" ? "photo" : "document"]: fileId, caption, parse_mode: "HTML", reply_markup: buttons });
+    if (!sent.ok) await send(ad, caption, { reply_markup: buttons });
+  }
+}
+async function decidePayment(adminId, msgId, id, approve) {
+  const { data: pay } = await db.from("tg_payments").select("*").eq("id", id).maybeSingle();
+  await tg("editMessageReplyMarkup", { chat_id: adminId, message_id: msgId, reply_markup: { inline_keyboard: [] } });
+  if (!pay) return send(adminId, "Payment not found.");
+  if (pay.status !== "review" && pay.status !== "waiting") return send(adminId, `This payment was already ${esc(pay.status)}.`);
+  const { data: upd } = await db.from("tg_payments").update({ status: approve ? "approved" : "rejected", updated_at: new Date().toISOString() }).eq("id", id).eq("status", pay.status).select("id");
+  if (!upd || !upd.length) return send(adminId, "This payment was already handled.");
+  const u = (await findUser(String(pay.chat_id))) || { chat_id: pay.chat_id, tier: null, plan_end: null };
+  if (approve) {
+    const end = await grant(u, pay.tier, pay.days);
+    return send(adminId, `✅ Approved: ${esc(nameOf(u))} → <b>${esc(pay.tier)}</b> until <b>${end}</b>. They've been notified.`);
+  }
+  await send(pay.chat_id, `❌ Your payment for <b>${esc(pay.tier)}</b> couldn't be confirmed.\nIf you've paid, please contact the admin with your receipt, or tap below to try again.`, { reply_markup: { inline_keyboard: [[{ text: "💳 Choose a plan", callback_data: "plans" }]] } });
+  return send(adminId, `❌ Rejected: ${esc(nameOf(u))} · ${esc(pay.tier)}. They've been told.`);
+}
+
 /* ---------- admin: customers and signals ---------- */
 async function findUser(ref) {
   ref = String(ref || "").trim();
@@ -889,7 +1038,10 @@ async function onCallback(q) {
     const s = { id: sig.id, ...sig.data };
     return editLive(row ?? { chat_id: chatId, message_id: msgId, title: kindOf(s.kind).title, created_at: new Date().toISOString() }, s, {});
   }
+  if (kind === "plans") return showPlans(chatId);
+  if (kind === "buy") return startPayment(chatId, x);
   if (!a.admin) return;
+  if (kind === "pa" || kind === "pr") return decidePayment(chatId, msgId, x, kind === "pa");
   const edit = (text, markup) => tg("editMessageText", { chat_id: chatId, message_id: msgId, text, parse_mode: "HTML", reply_markup: markup ?? { inline_keyboard: [] } });
   if (kind === "t") return edit(`Customer: <b>${esc(showRef(x))}</b>\nPlan: <b>${esc(y)}</b>\n\nHow long?`, dayButtons(x, y));
   if (kind === "d") {
@@ -928,6 +1080,32 @@ async function cmdAdmin(chatId, a, text) {
   if (!a.admin) return send(chatId, privateNote(a));
   const parts = text.trim().split(/\s+/);
   const cmd = parts[0].toLowerCase().replace(/@.*/, "");
+  if (cmd === "/setbank") {
+    const body = text.replace(/^\/setbank(@\S+)?\s*/i, "");
+    const [bank, name, acc] = body.split("|").map((x) => x.trim());
+    if (!bank || !name || !acc || digitsOf(acc).length < 6) return send(chatId, "Format: <code>/setbank Bank name | Account holder name | Account number</code>\nExample: <code>/setbank Maybank | YOUR FULL NAME | 1234 5678 9012</code>");
+    await db.from("app_settings").upsert({ key: "pay_bank", value: JSON.stringify({ bank, name, acc }) });
+    return send(chatId, `✅ Bank details saved. Customers will see:\n🏦 <b>${esc(bank)}</b>\n👤 <b>${esc(name)}</b>\n🔢 <code>${esc(acc)}</code>\n\nMEEGO AI checks every receipt against this name and account number.`);
+  }
+  if (cmd === "/setprice") {
+    const tier = TIERS.find((x) => x.toLowerCase() === String(parts[1] || "").toLowerCase()), rm = Number(parts[2]), days = Number(parts[3] || 30);
+    if (!tier || !(rm > 0) || !(days > 0)) return send(chatId, "Format: <code>/setprice Pro 35 30</code> (plan, RM, days)");
+    const cfg = await settings();
+    let p = {}; try { p = cfg.plan_prices ? JSON.parse(cfg.plan_prices) : {}; } catch (_) { p = {}; }
+    p[tier] = { rm, days };
+    await db.from("app_settings").upsert({ key: "plan_prices", value: JSON.stringify(p) });
+    const pr = await prices();
+    return send(chatId, `✅ Prices now:\n${TIERS.map((x) => `• ${x} · RM${pr[x].rm} / ${pr[x].days} days`).join("\n")}`);
+  }
+  if (cmd === "/payments") {
+    const { data } = await db.from("tg_payments").select("*").order("created_at", { ascending: false }).limit(15);
+    const mark = { waiting: "⏳", review: "🔎", approved: "✅", rejected: "❌" };
+    const bank = await bankInfo();
+    return send(chatId, [`<b>Payments</b> (latest 15)`, `Bank: ${bank ? `<b>${esc(bank.bank)}</b> · ${esc(bank.name)} · <code>${esc(bank.acc)}</code>` : "⚠️ not set (/setbank)"}`, "",
+      ...((data ?? []).map((x) => `${mark[x.status] || "•"} ${new Date(new Date(x.created_at).getTime() + 8 * 3600000).toISOString().slice(5, 16).replace("T", " ")} · <code>${x.chat_id}</code> · ${esc(x.tier)} RM${x.amount} · ${esc(x.status)}`)),
+      ...((data ?? []).length ? [] : ["No payments yet."]),
+      "", "⏳ waiting for receipt · 🔎 waiting for your Approve · ✅ approved · ❌ rejected"].join("\n"));
+  }
   if (cmd === "/admin") {
     return send(chatId, [
       "<b>Customers</b> (no typing needed)",
@@ -941,6 +1119,11 @@ async function cmdAdmin(chatId, a, text) {
       "<code>/post BUY XAUUSD 4040 4048 4034 scalp</code> scalping signal",
       "<code>/post SELL XAUUSD 4129 4119 4140 swing Sell area, wait for price</code> swing (Ultimate only) with a note",
       "<code>/close tp</code> · <code>/close sl</code> · <code>/close be</code> closes the latest running signal (add a pair to choose: <code>/close tp XAUUSD</code>)",
+      "",
+      "<b>Payments</b>",
+      "<code>/setbank Bank | Account holder name | Account number</code> where customers transfer",
+      "<code>/setprice Pro 35 30</code> change a plan's price (RM) and days",
+      "<code>/payments</code> latest payments. New receipts come to you with ✅ Approve / ❌ Reject.",
       "",
       "<b>Messages</b>",
       "<code>/announce Your message</code> sends to every active member",
@@ -1079,8 +1262,9 @@ async function onDbEvent(ev) {
     const admins = (await db.from("telegram_users").select("chat_id").eq("is_admin", true)).data ?? [];
     const expiring = [];
     for (const u of data ?? []) {
-      if (u.plan_end === soon) { await send(u.chat_id, `⏰ Your <b>${esc(u.tier)}</b> plan ends on <b>${u.plan_end}</b>. Contact the admin to renew and keep receiving signals.`); expiring.push(u); }
-      if (u.plan_end === yesterday) await send(u.chat_id, `Your <b>${esc(u.tier)}</b> plan has ended. Contact the admin to renew.\nMEEGO ID: <code>${u.chat_id}</code>`);
+      const renew = { reply_markup: { inline_keyboard: [[{ text: "💳 Renew now", callback_data: "plans" }]] } };
+      if (u.plan_end === soon) { await send(u.chat_id, `⏰ Your <b>${esc(u.tier)}</b> plan ends on <b>${u.plan_end}</b>. Renew to keep receiving signals.`, renew); expiring.push(u); }
+      if (u.plan_end === yesterday) await send(u.chat_id, `Your <b>${esc(u.tier)}</b> plan has ended. Tap below to renew.`, renew);
     }
     if (expiring.length) for (const ad of admins) await send(ad.chat_id, `⏰ Plans ending in 3 days:\n${expiring.map((u) => `${esc(nameOf(u))} · ${esc(u.tier)} · <code>${u.chat_id}</code>`).join("\n")}`);
   }
@@ -1094,6 +1278,13 @@ async function onMessage(msg) {
   await db.from("telegram_users").upsert({ chat_id: chatId, username: msg.from?.username ?? null, first_name: msg.from?.first_name ?? null }, { onConflict: "chat_id" });
   let a = await account(chatId);
   const t = text.toLowerCase();
+  if (!a.admin && !t.startsWith("/start")) {
+    const st = await getState(chatId);
+    if (st?.step?.startsWith("pay|") && Date.now() - new Date(st.updated_at).getTime() < 24 * 3600000) {
+      if (msg.photo?.length || msg.document) return handleReceipt(chatId, a, msg, st.step.slice(4));
+      if (!a.tier) return send(chatId, "Send the <b>receipt screenshot</b> of your transfer here, or tap /start to choose another plan.");
+    }
+  }
 
   // One-time: the first person to send /claimadmin becomes the admin (only while there is no admin)
   if (t.startsWith("/claimadmin")) {
@@ -1131,16 +1322,16 @@ async function onMessage(msg) {
       for (const ad of admins) await send(ad.chat_id, `✅ ${esc(showRef(p.ref))} pressed START. <b>${esc(p.tier)}</b> is now active until <b>${end}</b>.`);
       return;
     }
-    if (!a.rawTier) return send(chatId, privateNote(a), { reply_markup: { remove_keyboard: true } });
+    if (!a.rawTier) return showPlans(chatId, "🤖 <b>Welcome to MEEGO AI</b>\nAI gold signals, delivered here on Telegram.\n\n💳 <b>Choose a plan</b>");
   }
 
   if (t.startsWith("/start")) {
     if (a.admin) return welcome(chatId, "👑 Welcome back, admin. Tap <b>➕ Add customer</b> to give someone a plan, or send /admin for everything else.", { reply_markup: ADMIN_MENU });
     if (a.tier) return welcome(chatId, `Welcome back to <b>MEEGO AI</b>! Your <b>${esc(a.tier)}</b> plan is active${a.end ? ` until <b>${a.end}</b>` : ""}.\n\nUse the buttons below, or send a chart screenshot for an AI scan.`, kb(a));
-    return send(chatId, `Your <b>${esc(a.rawTier)}</b> plan has ended. Contact the admin to renew.\nMEEGO ID: <code>${chatId}</code>`, { reply_markup: { remove_keyboard: true } });
+    return showPlans(chatId, `Your <b>${esc(a.rawTier)}</b> plan has ended.\n\n💳 <b>Renew your plan</b>`);
   }
   if (msg.photo && msg.photo.length) return scanPhoto(chatId, a, msg);
-  if (/^\/(admin|activate|renew|remove|customers|post|close|announce|members|autoscan)\b/.test(t)) return cmdAdmin(chatId, a, text);
+  if (/^\/(admin|activate|renew|remove|customers|post|close|announce|members|autoscan|setbank|setprice|payments)\b/.test(t)) return cmdAdmin(chatId, a, text);
   if (t.startsWith("/scanner") || t.includes("chart scanner")) {
     if (!a.admin && !a.tier) return send(chatId, noPlan(a));
     return send(chatId, "🖼 <b>MEEGO AI · Chart Scanner</b>\n\nSend a <b>screenshot of your chart</b> here (MT4/MT5/TradingView).\n\nTips for the best result:\n• Show the price scale on the right\n• One pair, one timeframe\n• Add the pair in the caption, e.g. <code>XAUUSD M15</code>\n\nMEEGO AI will read it and reply with direction, entry, TP and SL.", kb(a));
