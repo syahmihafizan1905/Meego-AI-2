@@ -23,8 +23,8 @@ async function tg(method, body) {
   const r = await fetch(`https://api.telegram.org/bot${TOKEN}/${method}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
   return await r.json().catch(() => ({ ok: false }));
 }
-const MENU = { keyboard: [[{ text: "⚡ Scalping" }, { text: "📈 Intraday" }, { text: "⭐ Swing" }], [{ text: "🧭 Direction" }, { text: "🖼 Chart Scanner" }], [{ text: "📊 History" }, { text: "📰 News" }], [{ text: "👤 My plan" }, { text: "❓ Help" }]], resize_keyboard: true };
-const ADMIN_MENU = { keyboard: [[{ text: "➕ Add customer" }, { text: "👥 Customers" }], [{ text: "⚡ Scalping" }, { text: "📈 Intraday" }, { text: "⭐ Swing" }], [{ text: "🧭 Direction" }, { text: "🖼 Chart Scanner" }], [{ text: "📊 History" }, { text: "📰 News" }, { text: "❓ Help" }]], resize_keyboard: true };
+const MENU = { keyboard: [[{ text: "⚡ Scalping" }, { text: "📈 Intraday" }, { text: "⭐ Swing" }], [{ text: "🧭 Direction" }, { text: "🖼 Chart Scanner" }], [{ text: "📊 History" }, { text: "📰 News" }], [{ text: "👤 My plan" }, { text: "🤖 MT5 EA" }, { text: "❓ Help" }]], resize_keyboard: true };
+const ADMIN_MENU = { keyboard: [[{ text: "➕ Add customer" }, { text: "👥 Customers" }], [{ text: "⚡ Scalping" }, { text: "📈 Intraday" }, { text: "⭐ Swing" }], [{ text: "🧭 Direction" }, { text: "🖼 Chart Scanner" }], [{ text: "📊 History" }, { text: "📰 News" }], [{ text: "🤖 MT5 EA" }, { text: "❓ Help" }]], resize_keyboard: true };
 const KIND = {
   Scalping: { title: "⚡ DAILY SIGNAL SCALPING", fresh: "📢 NEW SCALPING SIGNAL", label: "Scalping", none: "No scalping setup running right now. You'll get a message here as soon as one is posted." },
   Intraday: { title: "📈 DAILY SIGNAL INTRADAY", fresh: "📢 NEW DAILY SIGNAL INTRADAY", label: "Daily Intraday", none: "No intraday setup running right now. You'll get a message here as soon as one is posted." },
@@ -979,6 +979,62 @@ async function decidePayment(adminId, msgId, id, approve) {
   return send(adminId, `❌ Rejected: ${esc(nameOf(u))} · ${esc(pay.tier)}. They've been told.`);
 }
 
+
+/* ---------- MT5 EA: a private text feed of the signals, read by MEEGO_AI_EA.mq5 every ~30 s ---------- */
+const EA_FILE = "https://raw.githubusercontent.com/syahmihafizan1905/Meego-AI-2/main/mt5/MEEGO_AI_EA.ex5";
+// One line per signal: S|id|kind|news|sym|dir|order|status|pending|entry|sl|tp1|tp2|tp3|tpHit|slNow|time|expireH|filled
+async function eaFeed(key) {
+  const txt = (body, status = 200) => new Response(body, { status, headers: { "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-store" } });
+  if (!/^[a-f0-9]{32}$/.test(String(key || ""))) return txt("ERR|bad key", 403);
+  const { data: u } = await db.from("telegram_users").select("*").eq("ea_key", key).maybeSingle();
+  if (!u) return txt("ERR|unknown key (send /ea in the bot)", 403);
+  const a = { ...u, admin: !!u.is_admin, ...planOf(u) };
+  if (!a.admin && !a.tier) return txt("ERR|plan ended (renew in the bot)", 403);
+  const { data } = await db.from("signals").select("id,data").order("updated_at", { ascending: false }).limit(150);
+  const since = Date.now() - 72 * 3600000;
+  const n = (v) => (Number.isFinite(Number(v)) ? String(Number(v)) : "0");
+  const rows = (data ?? []).map((r) => ({ id: r.id, ...r.data })).filter((x) => x && x.sym && (x.status === "running" || (x.closedAt || x.time) >= since) && canSee(a, x.kind));
+  const lines = rows.map((x) => ["S", x.id, x.kind, x.news || "", x.sym, x.dir, x.order || "instant", x.status, x.pending ? 1 : 0, n(x.entry), n(x.sl0 ?? x.sl),
+    ...(x.tps ? x.tps.map(n) : [n(x.tp), "0", "0"]), x.tpHit || 0, n(x.sl), Math.round(x.time || 0), x.expire ?? LIMIT.expire, Math.round(x.filled || 0)].join("|"));
+  return txt([`OK|${Date.now()}|${a.admin ? "ADMIN" : a.tier}`, ...lines].join("\n"));
+}
+async function sendFile(chatId, name, content, caption) {
+  const fd = new FormData();
+  fd.append("chat_id", String(chatId));
+  if (caption) { fd.append("caption", caption); fd.append("parse_mode", "HTML"); }
+  fd.append("document", new Blob([content], { type: "application/octet-stream" }), name);
+  const r = await fetch(`https://api.telegram.org/bot${TOKEN}/sendDocument`, { method: "POST", body: fd });
+  return await r.json().catch(() => ({ ok: false }));
+}
+async function cmdEA(chatId, a, text) {
+  if (!a.admin && !a.tier) return showPlans(chatId);
+  let key = a.ea_key;
+  if (!key || /reset/i.test(text)) {
+    key = [...crypto.getRandomValues(new Uint8Array(16))].map((b) => b.toString(16).padStart(2, "0")).join("");
+    await db.from("telegram_users").update({ ea_key: key }).eq("chat_id", chatId);
+  }
+  const host = new URL(SB_URL).origin;
+  await send(chatId, [
+    "🤖 <b>MEEGO AI · MT5 EA</b>",
+    "The EA copies MEEGO AI signals into your MT5 by itself: entry (or BUY/SELL LIMIT), SL, TP1/TP2/TP3, SL to entry after TP1, and lot size from your risk %.",
+    "",
+    `🔑 Your EA key (keep it private):\n<code>${key}</code>`,
+    "",
+    "<b>Setup (once)</b>",
+    "1. Save the file below. In MT5: <b>File → Open Data Folder → MQL5 → Experts</b>, put the file there.",
+    "2. In MT5 <b>Navigator</b>, right-click <b>Expert Advisors → Refresh</b>.",
+    `3. MT5: <b>Tools → Options → Expert Advisors</b> → tick <b>Allow WebRequest for listed URL</b> → add:\n<code>${host}</code>`,
+    "4. Drag <b>MEEGO_AI_EA</b> onto any chart → <b>Inputs</b>: paste your key, set your broker's gold symbol (XAUUSD / XAUUSDm / GOLD) and risk % → OK.",
+    "5. Turn on <b>Algo Trading</b>. Keep MT5 running (a VPS is best).",
+    "",
+    "⚠️ Test on a <b>DEMO</b> account first. Use a <b>hedging</b> account (3 TPs = 3 positions).",
+    "New key: <code>/ea reset</code> (the old key stops working).",
+  ].join("\n"), kb(a));
+  const bin = await fetch(EA_FILE).then((r) => (r.ok ? r.arrayBuffer() : null)).catch(() => null);
+  if (!bin) return send(chatId, "Couldn't attach the EA file right now. Try /ea again in a minute.");
+  return sendFile(chatId, "MEEGO_AI_EA.ex5", new Uint8Array(bin), "📎 <b>MEEGO_AI_EA.ex5</b> · put it in MQL5 → Experts");
+}
+
 /* ---------- admin: customers and signals ---------- */
 async function findUser(ref) {
   ref = String(ref || "").trim();
@@ -1340,6 +1396,7 @@ async function onMessage(msg) {
   }
   if (msg.photo && msg.photo.length) return scanPhoto(chatId, a, msg);
   if (/^\/(admin|activate|renew|remove|customers|post|close|announce|members|autoscan|setbank|addbank|setprice|payments)\b/.test(t)) return cmdAdmin(chatId, a, text);
+  if (t === "/ea" || t.startsWith("/ea ") || t.startsWith("/ea@") || t.includes("mt5")) return cmdEA(chatId, a, t);
   if (t.startsWith("/scanner") || t.includes("chart scanner")) {
     if (!a.admin && !a.tier) return send(chatId, noPlan(a));
     return send(chatId, "🖼 <b>MEEGO AI · Chart Scanner</b>\n\nSend a <b>screenshot of your chart</b> here (MT4/MT5/TradingView).\n\nTips for the best result:\n• Show the price scale on the right\n• One pair, one timeframe\n• Add the pair in the caption, e.g. <code>XAUUSD M15</code>\n\nMEEGO AI will read it and reply with direction, entry, TP and SL.", kb(a));
@@ -1361,11 +1418,16 @@ async function onMessage(msg) {
     "📰 /news this week's important USD news",
     "👤 /plan your plan and MEEGO ID",
     "🖼 /scanner send a chart screenshot for an AI scan",
+    "🤖 /ea MT5 EA that copies the signals into MT5",
   ].join("\n"), kb(a));
 }
 
 /* ---------- entry point ---------- */
 Deno.serve(async (req) => {
+  if (req.method === "GET") {
+    const ea = new URL(req.url).searchParams.get("ea");
+    if (ea !== null) return eaFeed(ea).catch((e) => { console.error("ea feed failed", e); return new Response("ERR|server", { status: 500 }); });
+  }
   const cfg = await settings();
   const secret = cfg.telegram_secret || "";
   if (req.method === "GET") {
@@ -1382,6 +1444,7 @@ Deno.serve(async (req) => {
       { command: "history", description: "Wins and pips" },
       { command: "news", description: "Important USD news this week" },
       { command: "plan", description: "Your plan and MEEGO ID" },
+      { command: "ea", description: "MT5 EA (auto-copy signals)" },
     ] });
     const ok = me.ok && hook.ok;
     return new Response(ok ? `MEEGO bot connected: @${me.result.username}. You can close this page.` : `Couldn't connect the bot: ${JSON.stringify(me.ok ? hook : me)}`, { status: ok ? 200 : 500, headers: { "Content-Type": "text/plain; charset=utf-8" } });
