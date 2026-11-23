@@ -106,7 +106,35 @@ async function signalsOf(kind) {
 /* ---------- member commands ---------- */
 // "MEEGO AI is scanning" progress message, edited in place (about 3 seconds)
 const bar = (n) => "▰".repeat(n) + "▱".repeat(10 - n);
+// Scan video (made by tools/make_scan_video.py). Uploaded to Telegram once, then re-sent by file_id.
+const SCAN_VIDEO = "https://raw.githubusercontent.com/syahmihafizan1905/Meego-AI-2/main/public/media/meego-scan.mp4";
+const SCAN_VIDEO_KEY = "scan_video_v1";
+async function sendScanVideo(chatId, caption) {
+  const { data: row } = await db.from("app_settings").select("value").eq("key", SCAN_VIDEO_KEY).maybeSingle();
+  if (row?.value) {
+    const r = await tg("sendAnimation", { chat_id: chatId, animation: row.value, caption, parse_mode: "HTML" });
+    if (r.ok) return r;
+  }
+  const res = await fetch(SCAN_VIDEO);
+  if (!res.ok) return { ok: false };
+  const fd = new FormData();
+  fd.append("chat_id", String(chatId));
+  fd.append("caption", caption);
+  fd.append("parse_mode", "HTML");
+  fd.append("animation", new File([await res.blob()], "meego-scan.mp4", { type: "video/mp4" }));
+  const r = await (await fetch(`https://api.telegram.org/bot${TOKEN}/sendAnimation`, { method: "POST", body: fd })).json().catch(() => ({ ok: false }));
+  const fid = r.result?.animation?.file_id ?? r.result?.document?.file_id ?? r.result?.video?.file_id;
+  if (r.ok && fid) await db.from("app_settings").upsert({ key: SCAN_VIDEO_KEY, value: fid });
+  return r;
+}
 async function scanAnimation(chatId, kind) {
+  const label = kindOf(kind).label;
+  const v = await sendScanVideo(chatId, `🤖 <b>MEEGO AI</b> · scanning for ${esc(label.toLowerCase())} setups…`).catch(() => ({ ok: false }));
+  if (!v.ok) return textScan(chatId, kind);
+  await new Promise((r) => setTimeout(r, 4200));
+  await tg("editMessageCaption", { chat_id: chatId, message_id: v.result.message_id, caption: `✅ <b>MEEGO AI</b> · ${esc(label)} scan complete`, parse_mode: "HTML" });
+}
+async function textScan(chatId, kind) {
   const head = `🤖 <b>MEEGO AI</b> · ${kindOf(kind).label} scan`;
   const frames = [
     `🔍 Connecting to live market data…
