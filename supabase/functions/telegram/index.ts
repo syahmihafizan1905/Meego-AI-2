@@ -168,7 +168,7 @@ async function textScan(chatId, kind) {
   const frames = [
     `🔍 Connecting to live market data…
 <code>${bar(1)}</code> 10%`,
-    `📊 Reading XAUUSD · EURUSD · GBPUSD · USDJPY…
+    `📊 Reading XAUUSD · BTCUSD…
 <code>${bar(4)}</code> 40%`,
     `🧠 Checking trend, structure and momentum…
 <code>${bar(7)}</code> 70%`,
@@ -299,7 +299,7 @@ async function pairDirection(p) {
 async function cmdDirection(chatId, a) {
   if (!a.admin && !a.tier) return send(chatId, noPlan(a));
   const video = playVideo(chatId, "direction", "🧭 <b>MEEGO AI</b> · reading today's direction…", "✅ <b>MEEGO AI</b> · direction ready");
-  const pairs = ["XAUUSD", "EURUSD", "GBPUSD", "USDJPY", "BTCUSD"];
+  const pairs = ["XAUUSD", "BTCUSD"];
   const rows = [];
   for (const p of pairs) rows.push(await pairDirection(p).catch(() => ({ p, tf: {}, bias: null, price: null })));
   await video;
@@ -458,7 +458,7 @@ async function autoScan() {
   if (running.length) await watchSignals(running);
   const now = new Date();
   if (now.getUTCMinutes() % 15 >= 5) return; // look for new setups every 15 minutes
-  const pairs = String(cfg.scan_pairs || "XAUUSD").split(",").map((p) => p.trim().toUpperCase()).filter(Boolean);
+  const pairs = String(cfg.scan_pairs || "XAUUSD,BTCUSD").split(",").map((p) => p.trim().toUpperCase()).filter(Boolean);
   for (const sym of pairs) {
     if (!marketOpen(now, sym)) continue;
     const m1 = await candles(sym, "1min");
@@ -712,7 +712,7 @@ async function cmdAdmin(chatId, a, text) {
       if (list.length) await db.from("app_settings").upsert({ key: "scan_pairs", value: list.join(",") });
     }
     const cfg = await settings();
-    return send(chatId, `🤖 <b>MEEGO AI auto setups</b>: <b>${cfg.auto_scan === "off" ? "OFF" : "ON"}</b>\nPairs: <b>${esc(cfg.scan_pairs || "XAUUSD")}</b>\n\n<code>/autoscan on</code> · <code>/autoscan off</code>\n<code>/autoscan pairs XAUUSD,BTCUSD</code>`);
+    return send(chatId, `🤖 <b>MEEGO AI auto setups</b>: <b>${cfg.auto_scan === "off" ? "OFF" : "ON"}</b>\nPairs: <b>${esc(cfg.scan_pairs || "XAUUSD,BTCUSD")}</b>\n\n<code>/autoscan on</code> · <code>/autoscan off</code>\n<code>/autoscan pairs XAUUSD,BTCUSD</code>`);
   }
   if (cmd === "/post") {
     const side = (parts[1] || "").toUpperCase(), sym = (parts[2] || "").toUpperCase();
