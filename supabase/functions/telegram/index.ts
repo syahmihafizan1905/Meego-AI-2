@@ -893,7 +893,11 @@ async function cmdAdmin(chatId, a, text) {
     const body = text.replace(/^\/announce(@\S+)?\s*/i, "").trim();
     if (!body) return send(chatId, "Format: <code>/announce Your message</code>");
     const list = await activeMembers();
-    await broadcast(list.map((u) => u.chat_id), `📣 <b>Announcement</b>\n\n${esc(body)}`);
+    // also refreshes everyone's button menu (so new buttons like 📰 News appear)
+    for (const u of list) {
+      await send(u.chat_id, `📣 <b>Announcement</b>\n\n${esc(body)}`, { reply_markup: u.is_admin ? ADMIN_MENU : MENU });
+      await new Promise((r) => setTimeout(r, 60));
+    }
     return send(chatId, `✅ Sent to ${list.length} people.`);
   }
   if (cmd === "/members") {
