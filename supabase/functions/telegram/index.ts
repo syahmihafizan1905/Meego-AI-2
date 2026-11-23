@@ -100,6 +100,14 @@ function entryZone(s) {
   const [lo, hi] = [Math.min(s.entry, far), Math.max(s.entry, far)];
   return `Entry zone: <code>${px(lo, s.sym)}</code> – <code>${px(hi, s.sym)}</code> (${pipsBetween(hi, lo, s.sym)} pips)`;
 }
+// Lot size so one SL loses about 1% of the balance (gold: 0.01 lot = $0.10 per pip of 0.10)
+function lotGuide(s) {
+  if (!/^XAU/.test(s.sym)) return null;
+  const riskPips = pipsBetween(s.entry, s.sl, s.sym);
+  if (!riskPips) return null;
+  const lot = (bal) => { const l = Math.floor((bal * 0.01) / (riskPips * 10) * 100) / 100; return l >= 0.01 ? l.toFixed(2) : "skip"; };
+  return `💰 Lot for 1% risk: $500 → <b>${lot(500)}</b> · $1k → <b>${lot(1000)}</b> · $5k → <b>${lot(5000)}</b> · $10k → <b>${lot(10000)}</b>`;
+}
 // live = current price (shown while the signal is running; the message is refreshed every 5 minutes)
 function signalText(s, title, live) {
   const word = s.dir > 0 ? "BUY" : "SELL", dot = s.dir > 0 ? "🟢" : "🔴";
@@ -114,6 +122,8 @@ function signalText(s, title, live) {
     `SL: <code>${px(s.sl, s.sym)}</code>`,
     `Target ${pipsBetween(s.tp, s.entry, s.sym)} pips · Risk ${pipsBetween(s.entry, s.sl, s.sym)} pips`,
   ];
+  const lg = lotGuide(s);
+  if (lg) lines.push(lg);
   if (s.score) lines.push(`Rating Setup: <b>${grade(s.score)}</b>`);
   if (s.order === "limit" && s.status === "running") {
     lines.push(s.pending ? `⏳ Pending · waiting for price to reach entry (cancelled after ${s.expire ?? LIMIT.expire}h)` : `⚡ Entry triggered${s.filled ? ` at ${myTime(s.filled)}` : ""}`);
@@ -441,6 +451,8 @@ const AUTO = {
 };
 // Limit entry: placed k of the way from price to the SL; cancelled if not reached within `expire` hours
 const LIMIT = { pips: 100, k: 0.6, expire: 8 };
+// Never post a setup scoring below this (grade C+), however quiet the day has been
+const MIN_SCORE = 5;
 const TF_NAME = { m5: "M5", m15: "M15", h1: "H1", h4: "H4", d1: "D1" };
 const relaxDrop = (kind, hoursQuiet) => Math.max(0, Math.min(AUTO[kind].min - AUTO[kind].floor, Math.floor(hoursQuiet / AUTO[kind].step)));
 // Confluence score out of 9: 1 for the required trend, up to 2 more trends, and 1 per pattern (6 patterns).
@@ -465,7 +477,7 @@ function findSetup(kind, d, price, drop = 0) {
     if (bos(cc, dir, pv)) why.push("BOS");
     if (sweep(c, dir)) why.push("liquidity sweep");
     if (rejectionCandle(c, dir)) why.push("rejection candle");
-    if (why.length < r.min - drop || why.length === trends) continue; // always at least one price pattern
+    if (why.length < Math.max(MIN_SCORE, r.min - drop) || why.length === trends) continue; // always at least one price pattern
     // SL beyond the nearest swing point (or the sweep wick), with a small buffer
     // Try the last 12, 6 then 3 candles, so the SL is as close as structure allows (gold scalps: within maxPips)
     const sym = d.sym || "XAUUSD";
@@ -642,7 +654,7 @@ async function autoScan() {
   if (running.length) await watchSignals(running);
   const now = new Date();
   if (now.getUTCMinutes() % 15 >= 5) return; // look for new setups every 15 minutes
-  const pairs = String(cfg.scan_pairs || "XAUUSD,BTCUSD").split(",").map((p) => p.trim().toUpperCase()).filter(Boolean);
+  const pairs = String(cfg.scan_pairs || "XAUUSD").split(",").map((p) => p.trim().toUpperCase()).filter(Boolean);
   for (const sym of pairs) {
     if (!marketOpen(now, sym)) continue;
     const m1 = await candles(sym, "1min");
@@ -903,7 +915,7 @@ async function cmdAdmin(chatId, a, text) {
       if (list.length) await db.from("app_settings").upsert({ key: "scan_pairs", value: list.join(",") });
     }
     const cfg = await settings();
-    return send(chatId, `🤖 <b>MEEGO AI auto setups</b>: <b>${cfg.auto_scan === "off" ? "OFF" : "ON"}</b>\nPairs: <b>${esc(cfg.scan_pairs || "XAUUSD,BTCUSD")}</b>\n\n<code>/autoscan on</code> · <code>/autoscan off</code>\n<code>/autoscan pairs XAUUSD,BTCUSD</code>`);
+    return send(chatId, `🤖 <b>MEEGO AI auto setups</b>: <b>${cfg.auto_scan === "off" ? "OFF" : "ON"}</b>\nPairs: <b>${esc(cfg.scan_pairs || "XAUUSD")}</b>\n\n<code>/autoscan on</code> · <code>/autoscan off</code>\n<code>/autoscan pairs XAUUSD,BTCUSD</code>`);
   }
   if (cmd === "/post") {
     const side = (parts[1] || "").toUpperCase(), sym = (parts[2] || "").toUpperCase();
