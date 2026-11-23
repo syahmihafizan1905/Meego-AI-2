@@ -106,33 +106,47 @@ async function signalsOf(kind) {
 /* ---------- member commands ---------- */
 // "MEEGO AI is scanning" progress message, edited in place (about 3 seconds)
 const bar = (n) => "▰".repeat(n) + "▱".repeat(10 - n);
-// Scan video (made by tools/make_scan_video.py). Uploaded to Telegram once, then re-sent by file_id.
-const SCAN_VIDEO = "https://raw.githubusercontent.com/syahmihafizan1905/Meego-AI-2/main/public/media/meego-scan.mp4";
-const SCAN_VIDEO_KEY = "scan_video_v1";
-async function sendScanVideo(chatId, caption) {
-  const { data: row } = await db.from("app_settings").select("value").eq("key", SCAN_VIDEO_KEY).maybeSingle();
+// MEEGO videos (made by tools/make_scan_video.py). Each is uploaded to Telegram once, then re-sent by file_id.
+const MEDIA = "https://raw.githubusercontent.com/syahmihafizan1905/Meego-AI-2/main/public/media/";
+const VIDEO_VERSION = "v2";
+async function sendVideo(chatId, name, caption, extra = {}) {
+  const key = `video_${VIDEO_VERSION}_${name}`;
+  const { data: row } = await db.from("app_settings").select("value").eq("key", key).maybeSingle();
   if (row?.value) {
-    const r = await tg("sendAnimation", { chat_id: chatId, animation: row.value, caption, parse_mode: "HTML" });
+    const r = await tg("sendAnimation", { chat_id: chatId, animation: row.value, caption, parse_mode: "HTML", ...extra });
     if (r.ok) return r;
   }
-  const res = await fetch(SCAN_VIDEO);
+  const res = await fetch(`${MEDIA}meego-${name}.mp4`);
   if (!res.ok) return { ok: false };
   const fd = new FormData();
   fd.append("chat_id", String(chatId));
   fd.append("caption", caption);
   fd.append("parse_mode", "HTML");
-  fd.append("animation", new File([await res.blob()], "meego-scan.mp4", { type: "video/mp4" }));
+  for (const [k, v] of Object.entries(extra)) fd.append(k, typeof v === "string" ? v : JSON.stringify(v));
+  fd.append("animation", new File([await res.blob()], `meego-${name}.mp4`, { type: "video/mp4" }));
   const r = await (await fetch(`https://api.telegram.org/bot${TOKEN}/sendAnimation`, { method: "POST", body: fd })).json().catch(() => ({ ok: false }));
   const fid = r.result?.animation?.file_id ?? r.result?.document?.file_id ?? r.result?.video?.file_id;
-  if (r.ok && fid) await db.from("app_settings").upsert({ key: SCAN_VIDEO_KEY, value: fid });
+  if (r.ok && fid) await db.from("app_settings").upsert({ key, value: fid });
   return r;
+}
+// Play a video, wait for it to finish, then change its caption to the "done" text. Returns false if no video could be sent.
+async function playVideo(chatId, name, caption, doneCaption, ms = 4200) {
+  const v = await sendVideo(chatId, name, caption).catch(() => ({ ok: false }));
+  if (!v.ok) return false;
+  await new Promise((r) => setTimeout(r, ms));
+  if (doneCaption) await tg("editMessageCaption", { chat_id: chatId, message_id: v.result.message_id, caption: doneCaption, parse_mode: "HTML" });
+  return true;
 }
 async function scanAnimation(chatId, kind) {
   const label = kindOf(kind).label;
-  const v = await sendScanVideo(chatId, `🤖 <b>MEEGO AI</b> · scanning for ${esc(label.toLowerCase())} setups…`).catch(() => ({ ok: false }));
-  if (!v.ok) return textScan(chatId, kind);
-  await new Promise((r) => setTimeout(r, 4200));
-  await tg("editMessageCaption", { chat_id: chatId, message_id: v.result.message_id, caption: `✅ <b>MEEGO AI</b> · ${esc(label)} scan complete`, parse_mode: "HTML" });
+  const ok = await playVideo(chatId, `scan-${kind.toLowerCase()}`, `🤖 <b>MEEGO AI</b> · scanning for ${esc(label.toLowerCase())} setups…`, `✅ <b>MEEGO AI</b> · ${esc(label)} scan complete`);
+  if (!ok) return textScan(chatId, kind);
+}
+// Welcome video with the message as its caption; falls back to a plain message
+async function welcome(chatId, text, extra) {
+  const r = await sendVideo(chatId, "welcome", text, extra).catch(() => ({ ok: false }));
+  if (!r.ok) return send(chatId, text, extra);
+  return r;
 }
 async function textScan(chatId, kind) {
   const head = `🤖 <b>MEEGO AI</b> · ${kindOf(kind).label} scan`;
@@ -177,7 +191,10 @@ async function cmdHistory(chatId, a) {
   const from = new Date(); from.setUTCDate(1); from.setUTCMonth(from.getUTCMonth() - 1);
   const kinds = canSee(a, "Swing") ? ["Swing", "Intraday", "Scalping"] : ["Intraday", "Scalping"];
   const all = [];
-  for (const k of kinds) all.push(...(await signalsOf(k)));
+  await Promise.all([
+    (async () => { for (const k of kinds) all.push(...(await signalsOf(k))); })(),
+    playVideo(chatId, "history", "📊 <b>MEEGO AI</b> · loading signal history…", "✅ <b>MEEGO AI</b> · results ready", 3700),
+  ]);
   const closed = all.filter((s) => s.time >= from.getTime() && (s.status === "tp" || s.status === "sl")).sort((x, y) => y.time - x.time);
   if (!closed.length) return send(chatId, "No closed signals in the last two months yet.");
   const pipsOf = (s) => (s.status === "tp" ? pipsBetween(s.tp, s.entry, s.sym) : -pipsBetween(s.entry, s.sl, s.sym));
@@ -208,8 +225,12 @@ async function candles(sym) {
 async function cmdDirection(chatId, a) {
   if (!a.admin && !a.tier) return send(chatId, noPlan(a));
   const out = [];
-  for (const p of ["XAUUSD", "EURUSD", "GBPUSD", "USDJPY", "BTCUSD"]) {
-    const c = await candles(p);
+  const video = playVideo(chatId, "direction", "🧭 <b>MEEGO AI</b> · reading today's direction…", "✅ <b>MEEGO AI</b> · direction ready");
+  const pairs = ["XAUUSD", "EURUSD", "GBPUSD", "USDJPY", "BTCUSD"];
+  const data = await Promise.all(pairs.map((p) => candles(p).catch(() => [])));
+  await video;
+  for (const [idx, p] of pairs.entries()) {
+    const c = data[idx];
     if (c.length < 120) { out.push(`${p}: no data`); continue; }
     const h1 = c.map((x) => x.c);
     const h4 = [];
@@ -308,7 +329,7 @@ async function grant(u, tier, days) {
   const base = u.tier === tier && u.plan_end && u.plan_end >= today() ? u.plan_end : today();
   const end = addDays(base, days);
   await db.from("telegram_users").update({ tier, plan_end: end }).eq("chat_id", u.chat_id);
-  await send(u.chat_id, `🎉 Your <b>${tier}</b> plan is active until <b>${end}</b>.\n\nYou'll get new signals here automatically. Tap ⚡ Scalping, 📈 Intraday or ⭐ Swing to see what's running.`, { reply_markup: MENU });
+  await welcome(u.chat_id, `🎉 Welcome to <b>MEEGO AI</b>! Your <b>${tier}</b> plan is active until <b>${end}</b>.\n\nYou'll get new signals here automatically. Tap ⚡ Scalping, 📈 Intraday or ⭐ Swing to see what's running.`, { reply_markup: MENU });
   return end;
 }
 // Admin picked customer + plan + days. If the customer hasn't pressed START yet, save it and it turns on when they do.
@@ -548,8 +569,8 @@ async function onMessage(msg) {
   }
 
   if (t.startsWith("/start")) {
-    if (a.admin) return send(chatId, "Welcome back, admin. Tap <b>➕ Add customer</b> to give someone a plan, or send /admin for everything else.", { reply_markup: ADMIN_MENU });
-    if (a.tier) return send(chatId, `Welcome back to <b>MEEGO AI</b>! Your <b>${esc(a.tier)}</b> plan is active${a.end ? ` until <b>${a.end}</b>` : ""}.\n\nUse the buttons below, or send a chart screenshot for an AI scan.`, kb(a));
+    if (a.admin) return welcome(chatId, "👑 Welcome back, admin. Tap <b>➕ Add customer</b> to give someone a plan, or send /admin for everything else.", { reply_markup: ADMIN_MENU });
+    if (a.tier) return welcome(chatId, `Welcome back to <b>MEEGO AI</b>! Your <b>${esc(a.tier)}</b> plan is active${a.end ? ` until <b>${a.end}</b>` : ""}.\n\nUse the buttons below, or send a chart screenshot for an AI scan.`, kb(a));
     return send(chatId, `Your <b>${esc(a.rawTier)}</b> plan has ended. Contact the admin to renew.\nMEEGO ID: <code>${chatId}</code>`, { reply_markup: { remove_keyboard: true } });
   }
   if (msg.photo && msg.photo.length) return scanPhoto(chatId, a, msg);
