@@ -323,31 +323,37 @@ function rejectionCandle(c, dir) {
   return pin || engulf;
 }
 // trend: higher timeframes that must agree (need) and that add a point when they agree (bonus)
+// min: score needed. step: every `step` hours without a signal of this kind, the score needed drops by 1 (down to floor),
+// so there is at least one signal a day. open: how many may run at once. cool: hours to wait after the last one.
 const AUTO = {
-  Scalping: { tf: "m5", ema: 20, look: 3, need: ["m15"], bonus: ["m5", "h1"], min: 4, buf: 0.2, rr: 1.5, life: 3, cool: 0.5, max: 4 },
-  Intraday: { tf: "m15", ema: 20, look: 3, need: ["h1"], bonus: ["m15", "h4"], min: 5, buf: 0.2, rr: 2, life: 24, cool: 2, max: 2 },
-  Swing: { tf: "h1", ema: 50, look: 4, need: ["h4"], bonus: ["h1", "d1"], min: 6, buf: 0.3, rr: 2.5, life: 24 * 7, cool: 12, max: 1 },
+  Scalping: { tf: "m5", ema: 20, look: 3, need: ["m15"], bonus: ["m5", "h1"], min: 4, floor: 2, step: 2, buf: 0.2, rr: 1.5, life: 3, cool: 0.5, max: 5, open: 1 },
+  Intraday: { tf: "m15", ema: 20, look: 3, need: ["h1"], bonus: ["m15", "h4"], min: 5, floor: 2, step: 3, buf: 0.2, rr: 2, life: 24, cool: 1, max: 3, open: 2 },
+  Swing: { tf: "h1", ema: 50, look: 4, need: ["h4"], bonus: ["h1", "d1"], min: 6, floor: 2, step: 4, buf: 0.3, rr: 2, life: 72, cool: 4, max: 2, open: 2 },
 };
 const TF_NAME = { m5: "M5", m15: "M15", h1: "H1", h4: "H4", d1: "D1" };
-// Confluence score out of 9: 1 for the required trend, up to 2 more trends, and 1 per pattern (6 patterns)
-function findSetup(kind, d, price) {
+const relaxDrop = (kind, hoursQuiet) => Math.max(0, Math.min(AUTO[kind].min - AUTO[kind].floor, Math.floor(hoursQuiet / AUTO[kind].step)));
+// Confluence score out of 9: 1 for the required trend, up to 2 more trends, and 1 per pattern (6 patterns).
+// drop lowers the score needed; at drop 2+ the main trend may be sideways (never against the trade) and other trends are ignored.
+function findSetup(kind, d, price, drop = 0) {
   const r = AUTO[kind], c = d[r.tf];
   if (!c || c.length < 60) return null;
   const cc = c.slice(-120), a = atr(c), pv = pivots(cc);
   if (!a) return null;
   let best = null;
   for (const dir of [1, -1]) {
-    if (!r.need.every((k) => d.trend[k] === dir) || r.bonus.some((k) => d.trend[k] === -dir)) continue;
+    const needOk = drop >= 2 ? r.need.every((k) => d.trend[k] !== -dir) : r.need.every((k) => d.trend[k] === dir);
+    if (!needOk || (drop < 2 && r.bonus.some((k) => d.trend[k] === -dir))) continue;
     const last = c[c.length - 1];
     if ((last.c - last.o) * dir <= 0) continue; // the trigger candle must close in the trade direction
-    const why = r.need.concat(r.bonus.filter((k) => d.trend[k] === dir)).map((k) => `${TF_NAME[k]} trend`);
+    const why = r.need.filter((k) => d.trend[k] === dir).concat(r.bonus.filter((k) => d.trend[k] === dir)).map((k) => `${TF_NAME[k]} trend`);
+    const trends = why.length;
     if (emaPullback(c, dir, r.ema, r.look)) why.push(`EMA${r.ema} pullback`);
     if (snrRejection(cc, dir, pv, a)) why.push(dir > 0 ? "support hold" : "resistance hold");
     if (breakRetest(cc, dir, pv, a)) why.push("SNR break & retest");
     if (bos(cc, dir, pv)) why.push("BOS");
     if (sweep(c, dir)) why.push("liquidity sweep");
     if (rejectionCandle(c, dir)) why.push("rejection candle");
-    if (why.length < r.min) continue;
+    if (why.length < r.min - drop || why.length === trends) continue; // always at least one price pattern
     // SL beyond the nearest swing point (or the sweep wick), with a small buffer
     const near = c.slice(-12);
     const sl = dir > 0 ? Math.min(...near.map((x) => x.l)) - r.buf * a : Math.max(...near.map((x) => x.h)) + r.buf * a;
@@ -411,11 +417,14 @@ async function autoScan() {
     d.trend = { m5: tfTrend(d.m5), m15: tfTrend(d.m15), h1: tfTrend(d.h1), h4: tfTrend(d.h4), d1: tfTrend(d.d1) };
     for (const kind of ["Swing", "Intraday", "Scalping"]) {
       const mine = all.filter((s) => s.kind === kind && s.sym === sym && s.auto);
-      if (mine.some((s) => s.status === "running")) continue;
+      if (mine.filter((s) => s.status === "running").length >= AUTO[kind].open) continue;
       const lastEnd = Math.max(0, ...mine.map((s) => s.closedAt || s.time));
       if (Date.now() - lastEnd < AUTO[kind].cool * 3600000) continue;
       if (mine.filter((s) => s.time >= Date.now() - 86400000).length >= AUTO[kind].max) continue;
-      const s = findSetup(kind, d, price);
+      // The longer it's been quiet today, the lower the score needed (so there's at least one a day)
+      const dayStart = new Date(now).setUTCHours(0, 0, 0, 0);
+      const quiet = (Date.now() - Math.max(dayStart, ...mine.map((s) => s.time))) / 3600000;
+      const s = findSetup(kind, d, price, relaxDrop(kind, quiet));
       if (!s) continue;
       for (const k of ["entry", "sl", "tp"]) s[k] = Number(s[k].toFixed(digits(sym)));
       await db.from("signals").insert({ id: crypto.randomUUID(), data: { kind, sym, ...s, status: "running", auto: true, time: Date.now(), closedAt: null } });
