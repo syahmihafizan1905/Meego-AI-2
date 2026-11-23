@@ -89,9 +89,11 @@ const myTime = (t = Date.now()) => new Date(t + 8 * 3600000).toISOString().slice
 // 3 take-profits, a third of the lot each: TP1 0.7x risk (50-100 pips), TP2 2x risk (100-200), TP3 3x risk (200-500).
 // After TP1 the SL moves to entry, after TP2 to TP1. Backtest: win rate (TP1 hit) 75% daily Swing, 69% news.
 const TP_PLAN = [[0.7, 50, 100], [2, 100, 200], [3, 200, 500]];
-function tpPlan(sym, dir, entry, sl) {
+// Swing targets follow the stop: TP1 1.5x the risk (at least 100 pips), TP2 2x, TP3 3x
+const SWING_TP = [[1.5, 100, Infinity], [2, 100, Infinity], [3, 100, Infinity]];
+function tpPlan(sym, dir, entry, sl, plan = TP_PLAN) {
   const rp = Math.abs(entry - sl) / pip(sym), gold = /^XAU/.test(sym), d = digits(sym);
-  const tps = TP_PLAN.map(([k, lo, hi]) => Number((entry + dir * (gold ? Math.min(hi, Math.max(lo, k * rp)) : k * rp) * pip(sym)).toFixed(d)));
+  const tps = plan.map(([k, lo, hi]) => Number((entry + dir * (gold ? Math.min(hi, Math.max(lo, k * rp)) : k * rp) * pip(sym)).toFixed(d)));
   return { tps, tp: tps[2], sl0: sl, tpHit: 0 };
 }
 // Result in pips, averaged over the three thirds of the lot (old single-TP signals: as before)
@@ -385,7 +387,14 @@ function trend(closes) {
 async function candles(sym, interval = "1h") {
   const r = await fetch(`${SB_URL}/functions/v1/${CANDLES_FN}?symbol=${sym}&interval=${interval}`, { headers: { Authorization: `Bearer ${SB_SERVICE}`, apikey: SB_SERVICE } });
   const j = await r.json().catch(() => ({}));
-  return Array.isArray(j.candles) ? j.candles : [];
+  const list = Array.isArray(j.candles) ? j.candles : [];
+  return /^XAU/.test(sym) && interval !== "1min" ? list.filter((x) => goldOpen(x.t)) : list; // drop weekend / daily-break candles
+}
+// Gold trades Sunday 18:00 to Friday 17:00 New York time, with a break 17:00-18:00 every day
+function goldOpen(t) {
+  const y = new Date(t).getUTCFullYear(), sun = (mo, n) => { const d = new Date(Date.UTC(y, mo, 1)); return Date.UTC(y, mo, 1 + ((7 - d.getUTCDay()) % 7) + 7 * (n - 1)); };
+  const summer = t >= sun(2, 2) + 7 * 3600000 && t < sun(10, 1) + 6 * 3600000, d = new Date(t - (summer ? 4 : 5) * 3600000), w = d.getUTCDay(), h = d.getUTCHours();
+  return !(w === 6 || h === 17 || (w === 5 && h > 17) || (w === 0 && h < 17));
 }
 // Merge candles into a bigger timeframe (e.g. 1min -> 5min, 1h -> 4h), aligned to clock time
 function group(c, minutes) {
@@ -704,6 +713,98 @@ function intradaySetup(d, price, used) {
   }
   return null;
 }
+/* ---------- Swing: the admin's two setups (gold) ---------- */
+// 19 clean months of hourly gold, 4 pips spread: 31 trades, 56% win, +15.7R with targets 1.5R / 2R / 3R and a 5-day limit (random entries +3.8R). On trial.
+// ---- Swing setup 1: reversal at a major level · setup 2: trend continuation (the admin's own rules) ----
+const SX = { near: 0.5, brk: 18, retest: 0.4, touch: 8, slBuf: 0.25, imp: 1.3, base: 0.7, minPips: 60, maxPips: 600, revDays: 8, life: 120 };
+// days start 22:00 UTC (the gold session), so Sunday evening belongs to Monday
+const groupShift = (c, min, shift) => group(c.map((x) => ({ ...x, t: x.t + shift })), min).map((x) => ({ ...x, t: x.t - shift }));
+const dayBars = (h1) => groupShift(h1, 1440, 2 * 3600000);
+const weekBars = (d1) => { const out = []; for (const x of d1) { const k = Math.floor((x.t + 2 * 3600000 + 3 * 86400000) / 604800000), l = out[out.length - 1]; if (l && l.k === k) { l.h = Math.max(l.h, x.h); l.l = Math.min(l.l, x.l); l.c = x.c; } else out.push({ k, t: x.t, o: x.o, h: x.h, l: x.l, c: x.c }); } return out; };
+// supply / demand zones: small base candle, then a strong move away in 1-2 candles; not closed through since
+function sndZones(c, dir, a, age) {
+  const out = [], n = c.length;
+  for (let i = n - 3; i >= Math.max(1, n - age); i--) {
+    const b = c[i], m1 = c[i + 1], m2 = c[i + 2];
+    if (Math.abs(b.c - b.o) > SX.base * a || Math.max((m1.c - m1.o) * dir, (m2.c - m1.o) * dir) < SX.imp * a) continue;
+    const top = dir > 0 ? Math.max(b.o, b.c) : b.h, bot = dir > 0 ? b.l : Math.min(b.o, b.c);
+    if (top - bot < 0.1 * a || top - bot > 2 * a) continue;
+    if (c.slice(i + 3).some((x) => (dir > 0 ? x.c < bot : x.c > top))) continue;
+    out.push({ top, bot, t: b.t, i });
+  }
+  return out;
+}
+const hhhl = (c, k) => { const p = pivots(c, k), H = p.hi.slice(-2), L = p.lo.slice(-2); if (H.length < 2 || L.length < 2) return 0; const e = c[c.length - 1].c; return H[1].v > H[0].v && L[1].v > L[0].v && e > L[1].v ? 1 : H[1].v < H[0].v && L[1].v < L[0].v && e < H[1].v ? -1 : 0; };
+const pinEng = (c, dir) => c.length > 2 && rejectionCandle(c, dir);
+// setup 1: reversal from a major daily/weekly level
+function swingReversal(d) {
+  const { d1, w1, h4, h1 } = d, aD = atr(d1), a4 = atr(h4), L = h1[h1.length - 1];
+  if (d1.length < 25 || h4.length < 60) return null;
+  for (const dir of [1, -1]) {
+    if ((L.c - L.o) * dir <= 0 || !confirmCandle(h1, dir, atr(h1))) continue; // 6) H1 confirmation
+    // the reversal extreme: lowest low (highest high) of the last days
+    const rec = d1.slice(-SX.revDays), ext = dir > 0 ? Math.min(...rec.map((x) => x.l)) : Math.max(...rec.map((x) => x.h)), er = rec.findIndex((x) => (dir > 0 ? x.l : x.h) === ext);
+    const before = d1.slice(0, d1.length - SX.revDays), pv = pivots(before, 2);
+    const levels = (dir > 0 ? pv.lo : pv.hi).map((x) => x.v).concat(w1.slice(0, -1).slice(-8).map((x) => (dir > 0 ? x.l : x.h)).filter((v) => before.some((x) => (dir > 0 ? x.l : x.h) === v)));
+    const zones = sndZones(before, dir, aD, 60);
+    const atLevel = levels.find((v) => Math.abs(ext - v) <= SX.near * aD), atZone = zones.find((z) => (dir > 0 ? ext <= z.top + 0.1 * aD && ext >= z.bot - SX.near * aD : ext >= z.bot - 0.1 * aD && ext <= z.top + SX.near * aD));
+    if (atLevel === undefined && !atZone) continue; // 1) major level
+    const base = d1.length - SX.revDays;
+    const rej = rec.some((x, k) => k >= er && pinEng(d1.slice(0, base + k + 1), dir)), swp = atLevel !== undefined && rec.some((x) => (dir > 0 ? x.l < atLevel && x.c > atLevel : x.h > atLevel && x.c < atLevel));
+    if (!rej && !swp) continue; // 2) daily rejection or sweep
+    // 3+4) H4 closes through the last lower high (higher low for a sell) before the extreme
+    const k0 = h4.findLastIndex((x) => (dir > 0 ? x.l : x.h) === ext);
+    if (k0 < 12) continue;
+    const pre = h4.slice(Math.max(0, k0 - 40), k0 + 3), p4 = pivots(pre, 2), sw = (dir > 0 ? p4.hi : p4.lo).filter((x) => x.i < pre.length - 3).slice(-1)[0];
+    if (!sw) continue;
+    let b = -1; for (let i = k0 + 1; i < h4.length; i++) if ((h4[i].c - sw.v) * dir > 0) { b = i; break; }
+    if (b < 0 || h4.length - 1 - b > SX.brk || b - k0 > 30) continue;
+    const post = h4.slice(b + 1);
+    if (post.some((x) => (x.c - sw.v) * dir < -0.5 * a4)) continue;
+    // 5) retest of the broken level or of the H4 zone that launched the move
+    const legZone = sndZones(h4.slice(Math.max(0, k0 - 3), b + 1), dir, a4, 40)[0];
+    const t0 = h4[b].t + 4 * 3600000, rt = h1.filter((x) => x.t >= t0).slice(-SX.touch), hitL = rt.some((x) => (dir > 0 ? x.l : x.h) && ((dir > 0 ? x.l : x.h) - sw.v) * dir <= SX.retest * a4 && (dir > 0 ? x.l : x.h) !== undefined && ((dir > 0 ? x.l : x.h) - sw.v) * dir > -1.2 * a4), hitZ = legZone && rt.some((x) => (dir > 0 ? x.l <= legZone.top && x.c > legZone.bot : x.h >= legZone.bot && x.c < legZone.top));
+    if (!rt.length || (!hitL && !hitZ)) continue;
+    return { dir, key: "R" + Math.round(sw.v * 10) + dir, sl: ext - dir * SX.slBuf * a4, why: `${atLevel !== undefined ? "major " + (dir > 0 ? "support" : "resistance") : "daily " + (dir > 0 ? "demand" : "supply")} · daily ${rej ? "rejection" : "sweep"} · H4 CHoCH (closed through the last ${dir > 0 ? "lower high" : "higher low"}) · retest · H1 confirmation` };
+  }
+  return null;
+}
+// setup 2: trend continuation from an H4 zone
+function swingContinuation(d) {
+  const { d1, w1, h4, h1 } = d, a4 = atr(h4), aD = atr(d1), L = h1[h1.length - 1];
+  if (d1.length < 25 || h4.length < 60 || w1.length < 6) return null;
+  const wc = w1.map((x) => x.c), we = ema(wc, 5), last = wc.length - 1, wk = wc[last] > we[last] && wc[last] > wc[last - 3] ? 1 : wc[last] < we[last] && wc[last] < wc[last - 3] ? -1 : 0;
+  const dir = wk; // 1) weekly direction
+  if (!dir || hhhl(d1.slice(-40), 2) !== dir) return null; // 2) daily HH+HL / LH+LL
+  if ((L.c - L.o) * dir <= 0) return null;
+  const dz = sndZones(d1, dir, aD, 40).find((z) => (dir > 0 ? z.bot < L.c : z.top > L.c)); // 3) an unbroken daily zone
+  if (!dz) return null;
+  const p = pivots(h1.slice(-24), 2), s = (dir > 0 ? p.lo : p.hi).slice(-2), hl = s.length === 2 && (s[1].v - s[0].v) * dir > 0;
+  if (!pinEng(h1, dir) && !(hl && (L.c - h1[h1.length - 2].c) * dir > 0)) return null; // 6) H1 engulfing / rejection or higher low
+  for (const z of sndZones(h4, dir, a4, 90)) {
+    const after = h4.slice(z.i + 3), inZ = (x) => (dir > 0 ? x.l <= z.top : x.h >= z.bot), f = after.findIndex(inZ);
+    if (f < 0 || f < after.length - 6) continue; // 4) first return to the H4 zone, recent
+    const rej = after.slice(f).some((x) => { const k = h4.indexOf(x); return pinEng(h4.slice(0, k + 1), dir); });
+    const sw = pivots(h4.slice(-18), 1), sp = (dir > 0 ? sw.hi : sw.lo).filter((x) => x.i < 16).slice(-1)[0], ch = !!sp && (h4[h4.length - 1].c - sp.v) * dir > 0;
+    if (!rej && !ch) continue; // 5) H4 rejection or CHoCH
+    const e = dir > 0 ? Math.min(z.bot, ...after.slice(f).map((x) => x.l), L.l) : Math.max(z.top, ...after.slice(f).map((x) => x.h), L.h);
+    return { dir, key: "C" + z.t, sl: e - dir * SX.slBuf * a4, why: `weekly ${dir > 0 ? "bullish" : "bearish"} · daily ${dir > 0 ? "HH+HL" : "LH+LL"} · H4 ${dir > 0 ? "demand" : "supply"} · H4 ${rej ? "rejection" : "CHoCH"} · H1 confirmation` };
+  }
+  return null;
+}
+// Weekly, daily, H4 and H1 bars of finished candles only. now = start of the H1 candle still forming
+function swingSetup(h1, now, price, used) {
+  const days = dayBars(h1), d = { h1, h4: group(h1, 240).filter((x) => x.t + 14400000 <= now), d1: days.slice(0, -1), w1: weekBars(days).slice(0, -1) };
+  if (h1.length < 400 || price <= 0) return null;
+  for (const [fn, name] of [[swingReversal, "Setup 1 · Reversal"], [swingContinuation, "Setup 2 · Trend continuation"]]) {
+    const s = fn(d);
+    if (!s || used.has(s.key)) continue;
+    const pips = ((price - s.sl) * s.dir) / pip("XAUUSD");
+    if (pips < SX.minPips || pips > SX.maxPips) continue;
+    return { dir: s.dir, entry: price, sl: s.sl, zkey: s.key, order: "instant", life: SX.life, note: `🤖 MEEGO AI · Swing ${name}: ${s.why}` };
+  }
+  return null;
+}
 // Forex/gold trade Sun 22:00 to Fri 21:00 UTC
 function marketOpen(now, sym) {
   if (/BTC|ETH/.test(sym)) return true;
@@ -939,7 +1040,7 @@ async function autoScan() {
     d.trend = { m5: tfTrend(d.m5), m15: tfTrend(d.m15), h1: tfTrend(d.h1), h4: tfTrend(d.h4), d1: tfTrend(d.d1) };
     // finished candles only, for the Intraday setups: m1 is cached for up to 3 minutes, so "finished" is judged by its last candle
     const upTo = m1[m1.length - 1].t, up15 = m15.length ? m15[m15.length - 1].t : 0;
-    const ix = { m5: group(m1, 5).filter((x) => x.t + 300000 <= upTo), m15: m15.filter((x) => x.t < up15), m30: group(m15.filter((x) => x.t < up15), 30).filter((x) => x.t + 1800000 <= up15), h1: d.h1 };
+    const ix = { m5: group(m1.filter((x) => !/^XAU/.test(sym) || goldOpen(x.t)), 5).filter((x) => x.t + 300000 <= upTo), m15: m15.filter((x) => x.t < up15), m30: group(m15.filter((x) => x.t < up15), 30).filter((x) => x.t + 1800000 <= up15), h1: d.h1 };
     for (const kind of ["Swing", "Intraday", "Scalping"]) {
       const mine = all.filter((s) => s.kind === kind && s.sym === sym && s.auto && !s.nine);
       if (mine.filter((s) => s.status === "running").length >= AUTO[kind].open) continue;
@@ -949,8 +1050,8 @@ async function autoScan() {
       // The longer it's been quiet today, the lower the score needed (so there's at least one a day)
       const dayStart = new Date(now).setUTCHours(0, 0, 0, 0);
       const quiet = (Date.now() - Math.max(dayStart, ...mine.map((s) => s.time))) / 3600000;
-      const own = kind === "Intraday" && /^XAU/.test(sym);
-      const s = own ? intradaySetup(ix, price, new Set(mine.map((x) => x.zkey).filter(Boolean))) : findSetup(kind, d, price, relaxDrop(kind, quiet));
+      const own = kind !== "Scalping" && /^XAU/.test(sym), used = new Set(mine.map((x) => x.zkey).filter(Boolean));
+      const s = !own ? findSetup(kind, d, price, relaxDrop(kind, quiet)) : kind === "Intraday" ? intradaySetup(ix, price, used) : swingSetup(d.h1, h1.length ? h1[h1.length - 1].t : 0, price, used);
       if (!s) continue;
       // Sharp entry: when the stop is far (gold Intraday/Swing over LIMIT.pips), wait for a pullback with a limit order
       const risk = Math.abs(s.entry - s.sl);
@@ -960,7 +1061,7 @@ async function autoScan() {
         Object.assign(s, { order: "limit", pending: true });
       } else s.order = "instant";
       for (const k of ["entry", "sl"]) s[k] = Number(s[k].toFixed(digits(sym)));
-      Object.assign(s, tpPlan(sym, s.dir, s.entry, s.sl));
+      Object.assign(s, tpPlan(sym, s.dir, s.entry, s.sl, own && kind === "Swing" ? SWING_TP : TP_PLAN));
       await db.from("signals").insert({ id: crypto.randomUUID(), data: { kind, sym, ...s, status: "running", auto: true, time: Date.now(), closedAt: null } });
     }
   }
