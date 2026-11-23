@@ -295,7 +295,8 @@ async function scanPhoto(chatId, a, msg) {
 Read the price axis carefully to get real price levels. Identify the pair and timeframe if visible, the trend, structure, key support and resistance, and momentum.
 Give ONE trade idea only if risk-to-reward is at least 1.5, otherwise direction "WAIT".
 Reply with ONLY one JSON object:
-{"pair":"text or null","direction":"BUY|SELL|WAIT","confidence":0-100,"timeframe":"text or null","entry":number|null,"sl":number|null,"tp":number|null,"reason":"2-4 sentences in English","invalidation":"text"}
+"pair" must be ONLY the short ticker read from the chart itself, e.g. "XAUUSD", "BTCUSD", "EURUSD" (no spaces, no explanation). If the user's caption names a different pair than the chart shows, use the chart's ticker and mention the mismatch in "reason".
+{"pair":"TICKER or null","direction":"BUY|SELL|WAIT","confidence":0-100,"timeframe":"text or null","entry":number|null,"sl":number|null,"tp":number|null,"reason":"2-4 sentences in English","invalidation":"text"}
 If the image is not a price chart, reply {"pair":null,"direction":"WAIT","confidence":0,"timeframe":null,"entry":null,"sl":null,"tp":null,"reason":"This doesn't look like a price chart.","invalidation":""}`;
   const content = [
     { type: "image", source: { type: "base64", media_type: "image/jpeg", data: toBase64(img) } },
@@ -319,7 +320,8 @@ If the image is not a price chart, reply {"pair":null,"direction":"WAIT","confid
   const r = parseJSON(text);
   if (!r) return send(chatId, "AI couldn't read the chart this time. Please try again.");
   const d = String(r.direction || "WAIT").toUpperCase();
-  const sym = String(r.pair || pairHint || "PAIR").toUpperCase().replace(/[^A-Z0-9]/g, "") || "PAIR";
+  const first = String(r.pair || "").toUpperCase().split(/[\s(,;:·|-]+/).map((w) => w.replace(/[^A-Z0-9]/g, "")).find((w) => w.length >= 3) || "";
+  const sym = (first && first.length <= 10 ? first : pairHint) || "PAIR";
   const ok = (d === "BUY" || d === "SELL") && [r.entry, r.sl, r.tp].every((v) => Number.isFinite(Number(v))) &&
     (d === "BUY" ? r.tp > r.entry && r.sl < r.entry : r.tp < r.entry && r.sl > r.entry);
   const lines = [`🤖 <b>AI CHART SCAN</b>${r.timeframe ? ` · ${esc(r.timeframe)}` : ""}`];
