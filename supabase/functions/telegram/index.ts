@@ -837,7 +837,12 @@ async function prices() {
 }
 async function bankInfo() {
   const cfg = await settings();
-  try { const b = cfg.pay_bank ? JSON.parse(cfg.pay_bank) : null; return b && b.bank && b.name && b.acc ? b : null; } catch (_) { return null; }
+  // one or more accounts: [{bank, name, acc}]
+  try {
+    const b = cfg.pay_bank ? JSON.parse(cfg.pay_bank) : null;
+    const list = (Array.isArray(b) ? b : b ? [b] : []).filter((x) => x && x.bank && x.name && x.acc);
+    return list.length ? list : null;
+  } catch (_) { return null; }
 }
 async function adminIds() { return ((await db.from("telegram_users").select("chat_id").eq("is_admin", true)).data ?? []).map((r) => r.chat_id); }
 async function showPlans(chatId, intro) {
@@ -868,10 +873,8 @@ async function startPayment(chatId, tier) {
   return send(chatId, [
     `💳 <b>MEEGO AI · ${tier}</b> · RM${pr.rm} for ${pr.days} days`,
     "",
-    "Transfer to:",
-    `🏦 Bank: <b>${esc(bank.bank)}</b>`,
-    `👤 Name: <b>${esc(bank.name)}</b>`,
-    `🔢 Account: <code>${esc(bank.acc)}</code>`,
+    bank.length > 1 ? "Transfer to <b>any one</b> of these accounts:" : "Transfer to:",
+    ...bank.flatMap((b, i) => ["", `🏦 ${bank.length > 1 ? `${i + 1}. ` : ""}<b>${esc(b.bank)}</b>`, `👤 ${esc(b.name)}`, `🔢 <code>${esc(b.acc)}</code>`]),
     "",
     `Transfer exactly <b>RM${pr.rm}</b>, then send the <b>receipt screenshot</b> (or PDF) here.`,
     "MEEGO AI checks it and your plan turns on as soon as it's confirmed.",
@@ -880,14 +883,15 @@ async function startPayment(chatId, tier) {
 const normName = (v) => String(v || "").toUpperCase().replace(/[^A-Z ]/g, " ").replace(/\s+/g, " ").trim();
 const digitsOf = (v) => String(v || "").replace(/\D/g, "");
 // Compare what the AI read on the receipt with the admin's bank details and the plan price
-function receiptChecks(r, bank, pay, dup) {
-  const want = normName(bank.name), got = normName(r.recipient_name);
-  const wt = want.split(" ").filter((w) => w.length > 1), gt = got.split(" ").filter((w) => w.length > 1);
-  const common = gt.filter((w) => wt.includes(w)).length;
-  const nameOk = !!got && (want.startsWith(got) && got.length >= 6 || got.startsWith(want) || common >= Math.min(2, wt.length) || common / Math.max(1, wt.length) >= 0.5);
-  const accRaw = String(r.recipient_account || ""), accD = digitsOf(accRaw), myAcc = digitsOf(bank.acc);
-  const masked = /[*xX•]/.test(accRaw);
-  const accOk = !!accD && (accD === myAcc || (masked && accD.length >= 3 && myAcc.endsWith(accD.slice(-4))));
+function receiptChecks(r, banks, pay, dup) {
+  const got = normName(r.recipient_name), gt = got.split(" ").filter((w) => w.length > 1);
+  const nameMatch = (name) => {
+    const want = normName(name), wt = want.split(" ").filter((w) => w.length > 1), common = gt.filter((w) => wt.includes(w)).length;
+    return !!got && (want.startsWith(got) && got.length >= 6 || got.startsWith(want) || common >= Math.min(2, wt.length) || common / Math.max(1, wt.length) >= 0.5);
+  };
+  const accRaw = String(r.recipient_account || ""), accD = digitsOf(accRaw), masked = /[*xX•]/.test(accRaw);
+  const accMatch = (acc) => { const my = digitsOf(acc); return !!accD && (accD === my || (masked && accD.length >= 3 && my.endsWith(accD.slice(-4)))); };
+  const nameOk = banks.some((b) => nameMatch(b.name)), accOk = banks.some((b) => accMatch(b.acc));
   const amt = Number(String(r.amount ?? "").replace(/[^0-9.]/g, ""));
   const amtOk = Number.isFinite(amt) && amt + 0.001 >= Number(pay.amount);
   const t = r.date_time ? Date.parse(String(r.date_time).slice(0, 16) + ":00+08:00") : NaN;
@@ -1080,12 +1084,13 @@ async function cmdAdmin(chatId, a, text) {
   if (!a.admin) return send(chatId, privateNote(a));
   const parts = text.trim().split(/\s+/);
   const cmd = parts[0].toLowerCase().replace(/@.*/, "");
-  if (cmd === "/setbank") {
-    const body = text.replace(/^\/setbank(@\S+)?\s*/i, "");
+  if (cmd === "/setbank" || cmd === "/addbank") {
+    const body = text.replace(/^\/(setbank|addbank)(@\S+)?\s*/i, "");
     const [bank, name, acc] = body.split("|").map((x) => x.trim());
-    if (!bank || !name || !acc || digitsOf(acc).length < 6) return send(chatId, "Format: <code>/setbank Bank name | Account holder name | Account number</code>\nExample: <code>/setbank Maybank | YOUR FULL NAME | 1234 5678 9012</code>");
-    await db.from("app_settings").upsert({ key: "pay_bank", value: JSON.stringify({ bank, name, acc }) });
-    return send(chatId, `✅ Bank details saved. Customers will see:\n🏦 <b>${esc(bank)}</b>\n👤 <b>${esc(name)}</b>\n🔢 <code>${esc(acc)}</code>\n\nMEEGO AI checks every receipt against this name and account number.`);
+    if (!bank || !name || !acc || digitsOf(acc).length < 6) return send(chatId, `Format: <code>${cmd} Bank name | Account holder name | Account number</code>\nExample: <code>${cmd} Maybank | YOUR FULL NAME | 1234 5678 9012</code>\n\n/setbank replaces all accounts · /addbank adds another one`);
+    const list = cmd === "/addbank" ? [...((await bankInfo()) ?? []).filter((b) => digitsOf(b.acc) !== digitsOf(acc)), { bank, name, acc }] : [{ bank, name, acc }];
+    await db.from("app_settings").upsert({ key: "pay_bank", value: JSON.stringify(list) });
+    return send(chatId, `✅ Saved. Customers will see ${list.length > 1 ? `${list.length} accounts` : "this account"}:\n${list.map((b, i) => `\n🏦 ${list.length > 1 ? `${i + 1}. ` : ""}<b>${esc(b.bank)}</b>\n👤 ${esc(b.name)}\n🔢 <code>${esc(b.acc)}</code>`).join("\n")}\n\nMEEGO AI checks every receipt against these names and account numbers.`);
   }
   if (cmd === "/setprice") {
     const tier = TIERS.find((x) => x.toLowerCase() === String(parts[1] || "").toLowerCase()), rm = Number(parts[2]), days = Number(parts[3] || 30);
@@ -1101,7 +1106,7 @@ async function cmdAdmin(chatId, a, text) {
     const { data } = await db.from("tg_payments").select("*").order("created_at", { ascending: false }).limit(15);
     const mark = { waiting: "⏳", review: "🔎", approved: "✅", rejected: "❌" };
     const bank = await bankInfo();
-    return send(chatId, [`<b>Payments</b> (latest 15)`, `Bank: ${bank ? `<b>${esc(bank.bank)}</b> · ${esc(bank.name)} · <code>${esc(bank.acc)}</code>` : "⚠️ not set (/setbank)"}`, "",
+    return send(chatId, [`<b>Payments</b> (latest 15)`, ...(bank ? bank.map((b) => `🏦 <b>${esc(b.bank)}</b> · ${esc(b.name)} · <code>${esc(b.acc)}</code>`) : ["⚠️ Bank not set (/setbank)"]), "",
       ...((data ?? []).map((x) => `${mark[x.status] || "•"} ${new Date(new Date(x.created_at).getTime() + 8 * 3600000).toISOString().slice(5, 16).replace("T", " ")} · <code>${x.chat_id}</code> · ${esc(x.tier)} RM${x.amount} · ${esc(x.status)}`)),
       ...((data ?? []).length ? [] : ["No payments yet."]),
       "", "⏳ waiting for receipt · 🔎 waiting for your Approve · ✅ approved · ❌ rejected"].join("\n"));
@@ -1121,7 +1126,8 @@ async function cmdAdmin(chatId, a, text) {
       "<code>/close tp</code> · <code>/close sl</code> · <code>/close be</code> closes the latest running signal (add a pair to choose: <code>/close tp XAUUSD</code>)",
       "",
       "<b>Payments</b>",
-      "<code>/setbank Bank | Account holder name | Account number</code> where customers transfer",
+      "<code>/setbank Bank | Account holder name | Account number</code> where customers transfer (replaces all)",
+      "<code>/addbank Bank | Account holder name | Account number</code> add another account",
       "<code>/setprice Pro 35 30</code> change a plan's price (RM) and days",
       "<code>/payments</code> latest payments. New receipts come to you with ✅ Approve / ❌ Reject.",
       "",
@@ -1331,7 +1337,7 @@ async function onMessage(msg) {
     return showPlans(chatId, `Your <b>${esc(a.rawTier)}</b> plan has ended.\n\n💳 <b>Renew your plan</b>`);
   }
   if (msg.photo && msg.photo.length) return scanPhoto(chatId, a, msg);
-  if (/^\/(admin|activate|renew|remove|customers|post|close|announce|members|autoscan|setbank|setprice|payments)\b/.test(t)) return cmdAdmin(chatId, a, text);
+  if (/^\/(admin|activate|renew|remove|customers|post|close|announce|members|autoscan|setbank|addbank|setprice|payments)\b/.test(t)) return cmdAdmin(chatId, a, text);
   if (t.startsWith("/scanner") || t.includes("chart scanner")) {
     if (!a.admin && !a.tier) return send(chatId, noPlan(a));
     return send(chatId, "🖼 <b>MEEGO AI · Chart Scanner</b>\n\nSend a <b>screenshot of your chart</b> here (MT4/MT5/TradingView).\n\nTips for the best result:\n• Show the price scale on the right\n• One pair, one timeframe\n• Add the pair in the caption, e.g. <code>XAUUSD M15</code>\n\nMEEGO AI will read it and reply with direction, entry, TP and SL.", kb(a));
