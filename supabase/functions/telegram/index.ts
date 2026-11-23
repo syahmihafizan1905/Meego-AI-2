@@ -92,6 +92,14 @@ function resultLine(s) {
   const head = s.status === "tp" ? "✅ <b>HIT TP</b>" : s.status === "sl" ? "❌ <b>HIT SL</b>" : s.status === "closed" ? "⏹ <b>CLOSED</b>" : "➖ <b>BREAKEVEN</b>";
   return `${head} · <b>${p > 0 ? "+" : ""}${p} pips</b>`;
 }
+// Entry zone: from the entry toward the SL (a better price), at most 40 pips and never more than 30% of the risk
+const ZONE_PIPS = 40;
+function entryZone(s) {
+  const w = Math.min(ZONE_PIPS * pip(s.sym), 0.3 * Math.abs(s.entry - s.sl));
+  const far = s.entry - s.dir * w;
+  const [lo, hi] = [Math.min(s.entry, far), Math.max(s.entry, far)];
+  return `Entry zone: <code>${px(lo, s.sym)}</code> – <code>${px(hi, s.sym)}</code> (${pipsBetween(hi, lo, s.sym)} pips)`;
+}
 // live = current price (shown while the signal is running; the message is refreshed every 5 minutes)
 function signalText(s, title, live) {
   const word = s.dir > 0 ? "BUY" : "SELL", dot = s.dir > 0 ? "🟢" : "🔴";
@@ -101,6 +109,7 @@ function signalText(s, title, live) {
     side,
     "",
     `Entry: <code>${px(s.entry, s.sym)}</code>`,
+    entryZone(s),
     `TP: <code>${px(s.tp, s.sym)}</code>`,
     `SL: <code>${px(s.sl, s.sym)}</code>`,
     `Target ${pipsBetween(s.tp, s.entry, s.sym)} pips · Risk ${pipsBetween(s.entry, s.sl, s.sym)} pips`,
