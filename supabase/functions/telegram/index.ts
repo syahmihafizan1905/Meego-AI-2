@@ -1032,7 +1032,11 @@ async function cmdEA(chatId, a, text) {
   ].join("\n"), kb(a));
   const bin = await fetch(EA_FILE).then((r) => (r.ok ? r.arrayBuffer() : null)).catch(() => null);
   if (!bin) return send(chatId, "Couldn't attach the EA file right now. Try /ea again in a minute.");
-  return sendFile(chatId, "MEEGO_AI_EA.ex5", new Uint8Array(bin), "📎 <b>MEEGO_AI_EA.ex5</b> · put it in MQL5 → Experts");
+  await sendFile(chatId, "MEEGO_AI_EA.ex5", new Uint8Array(bin), "📎 <b>MEEGO_AI_EA.ex5</b> · put it in MQL5 → Experts");
+  if (!a.admin) return;
+  // Admin only: the editable source code (customers get the compiled .ex5 only)
+  const src = await fetch(EA_FILE.replace(/\.ex5$/, ".mq5")).then((r) => (r.ok ? r.text() : "")).catch(() => "");
+  if (src) return sendFile(chatId, "MEEGO_AI_EA.mq5", new TextEncoder().encode(src), "🛠 <b>Admin only · MEEGO_AI_EA.mq5</b> (source code)\nEdit it in MetaEditor (F4) and press Compile (F7). Customers only ever get the .ex5.");
 }
 
 /* ---------- admin: customers and signals ---------- */
