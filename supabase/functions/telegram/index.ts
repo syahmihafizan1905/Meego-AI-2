@@ -86,16 +86,34 @@ const showRef = (k) => (/^-?\d+$/.test(k) ? `ID ${k}` : `@${k}`);
 // Confluence score (2 to 9) as a grade: 9 = A+, 8 = A, 7 = B+, 6 = B, 5 = C+, 4 = C, 3 = D+, 2 = D
 const grade = (score) => ["D", "D+", "C", "C+", "B", "B+", "A", "A+"][Math.max(0, Math.min(7, Math.round(score) - 2))];
 const myTime = (t = Date.now()) => new Date(t + 8 * 3600000).toISOString().slice(11, 16); // Malaysia time
+// 3 take-profits, a third of the lot each: TP1 0.7x risk (50-100 pips), TP2 2x risk (100-200), TP3 3x risk (200-500).
+// After TP1 the SL moves to entry, after TP2 to TP1. Backtest: win rate (TP1 hit) 75% daily Swing, 69% news.
+const TP_PLAN = [[0.7, 50, 100], [2, 100, 200], [3, 200, 500]];
+function tpPlan(sym, dir, entry, sl) {
+  const rp = Math.abs(entry - sl) / pip(sym), gold = /^XAU/.test(sym), d = digits(sym);
+  const tps = TP_PLAN.map(([k, lo, hi]) => Number((entry + dir * (gold ? Math.min(hi, Math.max(lo, k * rp)) : k * rp) * pip(sym)).toFixed(d)));
+  return { tps, tp: tps[2], sl0: sl, tpHit: 0 };
+}
+// Result in pips, averaged over the three thirds of the lot (old single-TP signals: as before)
+function sigPips(s) {
+  if (!s.tps) return s.status === "tp" ? pipsBetween(s.tp, s.entry, s.sym) : s.status === "sl" ? -pipsBetween(s.entry, s.sl, s.sym) : s.status === "closed" ? Math.round(((Number(s.exit) - s.entry) * s.dir) / pip(s.sym)) : 0;
+  const n = s.tpHit || 0, won = s.tps.slice(0, n).reduce((t, x) => t + (x - s.entry) * s.dir, 0);
+  const exit = s.status === "closed" ? Number(s.exit) : s.sl;
+  return Math.round((won + (n < 3 ? (exit - s.entry) * s.dir * (3 - n) : 0)) / 3 / pip(s.sym));
+}
+const isWin = (s) => (s.tps ? (s.tpHit || 0) >= 1 : sigPips(s) > 0);
 function resultLine(s) {
   if (s.status === "cancelled") return "🚫 <b>CANCELLED</b> · entry price not reached";
-  const p = s.status === "tp" ? pipsBetween(s.tp, s.entry, s.sym) : s.status === "sl" ? -pipsBetween(s.entry, s.sl, s.sym) : s.status === "closed" ? Math.round(((Number(s.exit) - s.entry) * s.dir) / pip(s.sym)) : 0;
-  const head = s.status === "tp" ? "✅ <b>HIT TP</b>" : s.status === "sl" ? "❌ <b>HIT SL</b>" : s.status === "closed" ? "⏹ <b>CLOSED</b>" : "➖ <b>BREAKEVEN</b>";
-  return `${head} · <b>${p > 0 ? "+" : ""}${p} pips</b>`;
+  const p = sigPips(s), n = s.tpHit || 0;
+  const head = s.tps && s.status !== "closed"
+    ? (n >= 3 ? "🏆 <b>ALL TP HIT</b>" : n === 2 ? "✅ <b>TP2 HIT</b> · rest closed at TP1" : n === 1 ? "✅ <b>TP1 HIT</b> · rest closed at entry" : "❌ <b>HIT SL</b>")
+    : s.status === "tp" ? "✅ <b>HIT TP</b>" : s.status === "sl" ? "❌ <b>HIT SL</b>" : s.status === "closed" ? "⏹ <b>CLOSED</b>" : "➖ <b>BREAKEVEN</b>";
+  return `${head} · <b>${p > 0 ? "+" : ""}${p} pips</b>${s.tps ? " (avg of 3 TPs)" : ""}`;
 }
 // Entry zone: from the entry toward the SL (a better price), at most 40 pips and never more than 30% of the risk
 const ZONE_PIPS = 40;
 function entryZone(s) {
-  const w = Math.min(ZONE_PIPS * pip(s.sym), 0.3 * Math.abs(s.entry - s.sl));
+  const w = Math.min(ZONE_PIPS * pip(s.sym), 0.3 * Math.abs(s.entry - (s.sl0 ?? s.sl)));
   const far = s.entry - s.dir * w;
   const [lo, hi] = [Math.min(s.entry, far), Math.max(s.entry, far)];
   return `Entry zone: <code>${px(lo, s.sym)}</code> – <code>${px(hi, s.sym)}</code> (${pipsBetween(hi, lo, s.sym)} pips)`;
@@ -103,7 +121,7 @@ function entryZone(s) {
 // Lot size so one SL loses about 1% of the balance (gold: 0.01 lot = $0.10 per pip of 0.10)
 function lotGuide(s) {
   if (!/^XAU/.test(s.sym)) return null;
-  const riskPips = pipsBetween(s.entry, s.sl, s.sym);
+  const riskPips = pipsBetween(s.entry, s.sl0 ?? s.sl, s.sym);
   if (!riskPips) return null;
   const lot = (bal) => { const l = Math.floor((bal * 0.01) / (riskPips * 10) * 100) / 100; return l >= 0.01 ? l.toFixed(2) : "skip"; };
   return `💰 Lot for 1% risk: $500 → <b>${lot(500)}</b> · $1k → <b>${lot(1000)}</b> · $5k → <b>${lot(5000)}</b> · $10k → <b>${lot(10000)}</b>`;
@@ -118,9 +136,11 @@ function signalText(s, title, live) {
     "",
     `Entry: <code>${px(s.entry, s.sym)}</code>`,
     entryZone(s),
-    `TP: <code>${px(s.tp, s.sym)}</code>`,
-    `SL: <code>${px(s.sl, s.sym)}</code>`,
-    `Target ${pipsBetween(s.tp, s.entry, s.sym)} pips · Risk ${pipsBetween(s.entry, s.sl, s.sym)} pips`,
+    ...(s.tps
+      ? s.tps.map((t, i) => `TP${i + 1}: <code>${px(t, s.sym)}</code> (${pipsBetween(t, s.entry, s.sym)} pips)${(s.tpHit || 0) > i ? " ✅" : ""}`)
+      : [`TP: <code>${px(s.tp, s.sym)}</code>`]),
+    `SL: <code>${px(s.sl0 ?? s.sl, s.sym)}</code>${s.tps && s.sl !== (s.sl0 ?? s.sl) && s.status === "running" ? ` → moved to <code>${px(s.sl, s.sym)}</code>` : ""}`,
+    s.tps ? `Risk ${pipsBetween(s.entry, s.sl0 ?? s.sl, s.sym)} pips · close 1/3 at each TP · SL to entry after TP1` : `Target ${pipsBetween(s.tp, s.entry, s.sym)} pips · Risk ${pipsBetween(s.entry, s.sl, s.sym)} pips`,
   ];
   const lg = lotGuide(s);
   if (lg) lines.push(lg);
@@ -314,12 +334,12 @@ async function cmdHistory(chatId, a) {
     (async () => { for (const k of kinds) all.push(...(await signalsOf(k))); })(),
     playVideo(chatId, "history", "📊 <b>MEEGO AI</b> · loading signal history…", "✅ <b>MEEGO AI</b> · results ready", 3700),
   ]);
-  const closed = all.filter((s) => s.time >= from.getTime() && ["tp", "sl", "closed"].includes(s.status)).sort((x, y) => y.time - x.time);
+  const closed = all.filter((s) => s.time >= from.getTime() && ["tp", "sl", "closed", "be"].includes(s.status)).sort((x, y) => y.time - x.time);
   if (!closed.length) return send(chatId, "No closed signals in the last two months yet.");
-  const pipsOf = (s) => (s.status === "tp" ? pipsBetween(s.tp, s.entry, s.sym) : s.status === "closed" ? closedPips(s) : -pipsBetween(s.entry, s.sl, s.sym));
-  const tp = closed.filter((s) => pipsOf(s) > 0).length;
+  const pipsOf = sigPips;
+  const tp = closed.filter(isWin).length;
   const net = closed.reduce((t, s) => t + pipsOf(s), 0);
-  const rows = closed.slice(0, 10).map((s) => `${pipsOf(s) > 0 ? "✅" : "❌"} ${new Date(s.time).toISOString().slice(5, 10)} ${s.dir > 0 ? "BUY" : "SELL"} ${esc(s.sym)} <b>${pipsOf(s) > 0 ? "+" : ""}${pipsOf(s)}</b> pips`);
+  const rows = closed.slice(0, 10).map((s) => `${isWin(s) ? "✅" : "❌"}${s.tps ? ` TP${s.tpHit || 0}` : ""} ${new Date(s.time).toISOString().slice(5, 10)} ${s.dir > 0 ? "BUY" : "SELL"} ${esc(s.sym)} <b>${pipsOf(s) > 0 ? "+" : ""}${pipsOf(s)}</b> pips`);
   return send(chatId, `📊 <b>Signal history</b> (this month and last)\n\nWins: <b>${tp}</b> · Win rate: <b>${Math.round((tp / closed.length) * 100)}%</b> · Net: <b>${net > 0 ? "+" : ""}${net} pips</b>\n\n${rows.join("\n")}`);
 }
 async function cmdPlan(chatId, a) {
@@ -490,7 +510,7 @@ function findSetup(kind, d, price, drop = 0) {
       if (rk >= 0.4 * a && rk <= maxRisk) { sl = s; risk = rk; break; }
     }
     if (sl === null) continue;
-    if (!best || why.length > best.score) best = { dir, entry: price, sl, tp: price + dir * r.rr * risk, score: why.length, note: `🤖 MEEGO AI · Confluence ${why.length}/9: ${why.join(" + ")} · RR 1:${r.rr}` };
+    if (!best || why.length > best.score) best = { dir, entry: price, sl, tp: price + dir * r.rr * risk, score: why.length, note: `🤖 MEEGO AI · Confluence ${why.length}/9: ${why.join(" + ")}` };
   }
   return best;
 }
@@ -517,11 +537,24 @@ async function watchSignals(list) {
       let path = m1.filter((x) => x.t >= s.time);
       if (m1[0].t > s.time) path = (m15 ??= await candles(sym, "15min")).filter((x) => x.t >= s.time);
       let hit = null, filled = s.pending ? null : s.filled || s.time;
+      const stage0 = s.tpHit || 0;
       for (const x of path) {
         if (!filled) {
           if (x.t - s.time > (s.expire ?? LIMIT.expire) * 3600000) break;
           if (!(s.dir > 0 ? x.l <= s.entry : x.h >= s.entry)) continue;
           filled = x.t; // limit order filled on this candle; check SL/TP from here on
+        }
+        if (s.tps) {
+          if (s.stageAt && x.t <= s.stageAt) continue; // candles already checked before the last TP
+          if (s.dir > 0 ? x.l <= s.sl : x.h >= s.sl) { hit = (s.tpHit || 0) === 0 ? "sl" : s.tpHit === 1 ? "be" : "tp"; break; }
+          let up = false;
+          while ((s.tpHit || 0) < 3 && (s.dir > 0 ? x.h >= s.tps[s.tpHit || 0] : x.l <= s.tps[s.tpHit || 0])) {
+            s.tpHit = (s.tpHit || 0) + 1; up = true;
+            s.sl = s.tpHit === 1 ? s.entry : s.tps[s.tpHit - 2]; // TP1: SL to entry, TP2: SL to TP1
+          }
+          if (up) s.stageAt = x.t;
+          if (s.tpHit >= 3) { hit = "tp"; break; }
+          continue;
         }
         const slHit = s.dir > 0 ? x.l <= s.sl : x.h >= s.sl, tpHit = s.dir > 0 ? x.h >= s.tp : x.l <= s.tp;
         if (slHit) { hit = "sl"; break; }
@@ -530,6 +563,10 @@ async function watchSignals(list) {
       const justFilled = s.pending && filled;
       if (justFilled) Object.assign(s, { pending: false, filled });
       if (hit) await setStatus(s, hit);
+      else if ((s.tpHit || 0) > stage0) { // a TP was hit: save it (members get a "TP1 HIT" message)
+        const { id, ...data } = s;
+        await db.from("signals").update({ data, updated_at: new Date().toISOString() }).eq("id", id);
+      }
       else if (!filled) { if (Date.now() - s.time > (s.expire ?? LIMIT.expire) * 3600000) await setStatus(s, "cancelled"); }
       else if (Date.now() - filled > AUTO[s.kind].life * 3600000) await setStatus(s, "closed", m1[m1.length - 1].c);
       else if (justFilled) {
@@ -542,7 +579,6 @@ async function watchSignals(list) {
 /* ---------- news: prediction + signal ~2 minutes before 🔴 USD news, and a recovery setup if the spike hits SL ---------- */
 const numOf = (v) => { const n = parseFloat(String(v ?? "").replace(/[%KMBT,]/gi, "")); return Number.isFinite(n) ? n : null; };
 const usdInverse = (title) => /unemploy|jobless|claims/i.test(title); // higher number = weaker USD
-const NEWS_RR = 2;
 // Prediction for the 🔴 events at one time: forecast vs previous decides USD; the H1 chart trend breaks a tie
 function predictNews(evs, h1) {
   let usd = 0;
@@ -611,11 +647,11 @@ async function newsAlert() {
   ];
   await broadcast(await audience("Scalping"), head.join("\n"));
   if (!dir || !price || !a) return;
-  const risk = 1.2 * a, d = digits("XAUUSD");
+  const risk = 1.2 * a, d = digits("XAUUSD"), e0 = Number(price.toFixed(d)), sl0 = Number((price - dir * risk).toFixed(d));
   const score = conf.startsWith("Strong") ? 7 : conf.startsWith("Medium") ? 5 : 4;
   await db.from("signals").insert({ id: crypto.randomUUID(), data: {
-    kind: "Scalping", sym: "XAUUSD", dir, entry: Number(price.toFixed(d)), sl: Number((price - dir * risk).toFixed(d)), tp: Number((price + dir * NEWS_RR * risk).toFixed(d)),
-    score, order: "instant", news: "pre", newsAt: t0, note: `🤖 MEEGO AI · News play: ${evs.map((e) => e.title).join(" + ")} · RR 1:${NEWS_RR}`,
+    kind: "Scalping", sym: "XAUUSD", dir, entry: e0, sl: sl0, ...tpPlan("XAUUSD", dir, e0, sl0),
+    score, order: "instant", news: "pre", newsAt: t0, note: `🤖 MEEGO AI · News play: ${evs.map((e) => e.title).join(" + ")}`,
     status: "running", auto: true, time: Date.now(), closedAt: null } });
 }
 // After a news signal hits SL: trade WITH the spike, entering on a 38% pullback (same lot, never bigger)
@@ -638,10 +674,10 @@ async function newsRecovery() {
       if ((price - sl) * dir <= 0.15 * spike) continue; // too close to the SL, skip
       entry = price; order = "instant";
     }
-    const risk = Math.abs(entry - sl), d = digits(s.sym);
+    const d = digits(s.sym), e0 = Number(entry.toFixed(d)), sl0 = Number(sl.toFixed(d));
     await db.from("signals").insert({ id: crypto.randomUUID(), data: {
-      kind: "Scalping", sym: s.sym, dir, entry: Number(entry.toFixed(d)), sl: Number(sl.toFixed(d)), tp: Number((entry + dir * NEWS_RR * risk).toFixed(d)),
-      score: 5, order, pending: order === "limit", expire: 2, news: "recovery", note: `🤖 MEEGO AI · Recovery after news spike: follow the spike, enter on the pullback · same lot, never bigger · RR 1:${NEWS_RR}`,
+      kind: "Scalping", sym: s.sym, dir, entry: e0, sl: sl0, ...tpPlan(s.sym, dir, e0, sl0),
+      score: 5, order, pending: order === "limit", expire: 2, news: "recovery", note: `🤖 MEEGO AI · Recovery after news spike: follow the spike, enter on the pullback · same lot, never bigger`,
       status: "running", auto: true, time: Date.now(), closedAt: null } });
   }
 }
@@ -682,7 +718,8 @@ async function autoScan() {
         s.tp = s.entry + s.dir * AUTO[kind].rr * Math.abs(s.entry - s.sl);
         Object.assign(s, { order: "limit", pending: true });
       } else s.order = "instant";
-      for (const k of ["entry", "sl", "tp"]) s[k] = Number(s[k].toFixed(digits(sym)));
+      for (const k of ["entry", "sl"]) s[k] = Number(s[k].toFixed(digits(sym)));
+      Object.assign(s, tpPlan(sym, s.dir, s.entry, s.sl));
       await db.from("signals").insert({ id: crypto.randomUUID(), data: { kind, sym, ...s, status: "running", auto: true, time: Date.now(), closedAt: null } });
     }
   }
@@ -935,7 +972,8 @@ async function cmdAdmin(chatId, a, text) {
     const { data } = await db.from("signals").select("id,data").order("updated_at", { ascending: false }).limit(300);
     const row = (data ?? []).filter((r) => r.data?.status === "running" && (!sym || r.data.sym === sym)).sort((x, y) => y.data.time - x.data.time)[0];
     if (!row) return send(chatId, "No running signal found" + (sym ? " for " + esc(sym) : "") + ".");
-    const { error } = await db.from("signals").update({ data: { ...row.data, status: st, closedAt: Date.now() }, updated_at: new Date().toISOString() }).eq("id", row.id);
+    const extra = !row.data.tps ? {} : st === "tp" ? { tpHit: 3 } : st === "be" ? { sl: row.data.entry } : { sl: row.data.sl0 ?? row.data.sl, tpHit: 0 };
+    const { error } = await db.from("signals").update({ data: { ...row.data, ...extra, status: st, closedAt: Date.now() }, updated_at: new Date().toISOString() }).eq("id", row.id);
     return send(chatId, error ? "Couldn't update: " + esc(error.message) : `✅ ${esc(row.data.sym)} marked ${st.toUpperCase()}. Members are being notified.`);
   }
   if (cmd === "/announce") {
@@ -987,10 +1025,16 @@ async function onDbEvent(ev) {
       await broadcast(chats, `🚫 <b>CANCELLED</b> · ${label}\n${kindOf(s.kind).label} · entry price not reached`);
       return refreshLive();
     }
+    if (ev.op === "UPDATE" && old && s.status === "running" && s.tps && (s.tpHit || 0) > (old.tpHit || 0)) {
+      const n = s.tpHit, p = pipsBetween(s.tps[n - 1], s.entry, s.sym);
+      await broadcast(chats, `✅ <b>TP${n} HIT</b> · ${label}\n${kindOf(s.kind).label} · <b>+${p} pips</b>\nClose 1/3 of the lot · move SL to <b>${n === 1 ? "entry (breakeven)" : "TP1"}</b> <code>${px(s.sl, s.sym)}</code>`);
+      return refreshLive();
+    }
     if (ev.op === "UPDATE" && old && old.status !== s.status && ["tp", "sl", "be", "closed"].includes(s.status)) {
-      const p = s.status === "tp" ? pipsBetween(s.tp, s.entry, s.sym) : s.status === "sl" ? -pipsBetween(s.entry, s.sl, s.sym) : s.status === "closed" ? closedPips(s) : 0;
-      const head = s.status === "tp" ? "✅ <b>HIT TP</b>" : s.status === "sl" ? "❌ <b>HIT SL</b>" : s.status === "closed" ? "⏹ <b>CLOSED</b> (time limit)" : "➖ <b>BREAKEVEN</b>";
-      await broadcast(chats, `${head} · ${label}\n${kindOf(s.kind).label} · <b>${p > 0 ? "+" : ""}${p} pips</b>`);
+      const p = sigPips(s);
+      const head = s.tps ? resultLine(s).split(" · <b>")[0] + (s.status === "closed" ? " (time limit)" : "")
+        : s.status === "tp" ? "✅ <b>HIT TP</b>" : s.status === "sl" ? "❌ <b>HIT SL</b>" : s.status === "closed" ? "⏹ <b>CLOSED</b> (time limit)" : "➖ <b>BREAKEVEN</b>";
+      await broadcast(chats, `${head} · ${label}\n${kindOf(s.kind).label} · <b>${p > 0 ? "+" : ""}${p} pips</b>${s.tps ? " (avg of 3 TPs)" : ""}`);
       return refreshLive(); // mark the earlier signal messages as closed
     }
     return;
