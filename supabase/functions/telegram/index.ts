@@ -319,7 +319,7 @@ async function cmdNews(chatId, a) {
     const highs = shown.filter((x) => x.t === e.t && x.impact === "High");
     if (e.t > Date.now() && highs.length && rows[i + 1]?.t !== e.t) {
       const p = predictNews(highs, h1);
-      lines.push(`   🔮 Early call: ${callTxt(p.dir)}${p.dir ? ` · ${p.conf.split(" (")[0]}` : ""}`);
+      lines.push(`   🔮 Early call: ${callTxt(p.dir)}${p.dir ? ` · ${p.conf.split(" (")[0]}` : p.lean ? " · news vs chart disagree" : ""}`);
     }
   }
   lines.push("", "F = forecast · P = previous", "🔮 Early call can change. Final call + signal arrive ~2 min before each 🔴 news.", "⚠️ Spreads widen at news time: use a small lot.");
@@ -591,7 +591,9 @@ function predictNews(evs, h1) {
   });
   const chart = tfTrend((h1 || []).slice(0, -1)) || 0;
   const dir = usd ? -Math.sign(usd) : chart; // strong USD = gold down
-  const conf = usd && chart === dir ? "Strong (news + chart agree)" : usd ? "Medium (news only)" : chart ? "Low (chart trend only)" : "None";
+  // News call against (or without) the H1 trend: skipped. In the backtest these lost most often; without them 7 of 8 news trades hit TP1.
+  if (usd && chart !== dir) return { pred, chart, dir: 0, lean: dir, conf: "Skip (news and chart disagree)", usd };
+  const conf = usd ? "Strong (news + chart agree)" : chart ? "Low (chart trend only)" : "None";
   return { pred, chart, dir, conf, usd };
 }
 const callTxt = (d) => (d > 0 ? "🟢 <b>BUY XAUUSD</b>" : d < 0 ? "🔴 <b>SELL XAUUSD</b>" : "⚪ <b>NO TRADE</b> (wait for the spike)");
@@ -642,13 +644,13 @@ async function newsAlert() {
     `Bias: XAUUSD <b>${biasTxt(dir)}</b> · BTCUSD <b>${biasTxt(dir)}</b>`,
     `Chart trend H1: ${biasTxt(chart)} · Confidence: <b>${conf}</b>`,
     "",
-    dir ? "📰 News signal below. Spreads widen at news time: use a small lot." : "No clear bias, so no news signal this time. Wait for the spike to finish.",
+    dir ? "📰 News signal below. Spreads widen at news time: use a small lot." : conf.startsWith("Skip") ? "The news and the chart point different ways, so MEEGO AI skips this one. Wait for the spike to finish." : "No clear bias, so no news signal this time. Wait for the spike to finish.",
     "<i>A prediction is not a guarantee. The real number can surprise.</i>",
   ];
   await broadcast(await audience("Scalping"), head.join("\n"));
   if (!dir || !price || !a) return;
   const risk = 1.2 * a, d = digits("XAUUSD"), e0 = Number(price.toFixed(d)), sl0 = Number((price - dir * risk).toFixed(d));
-  const score = conf.startsWith("Strong") ? 7 : conf.startsWith("Medium") ? 5 : 4;
+  const score = conf.startsWith("Strong") ? 7 : 5;
   await db.from("signals").insert({ id: crypto.randomUUID(), data: {
     kind: "Scalping", sym: "XAUUSD", dir, entry: e0, sl: sl0, ...tpPlan("XAUUSD", dir, e0, sl0),
     score, order: "instant", news: "pre", newsAt: t0, note: `🤖 MEEGO AI · News play: ${evs.map((e) => e.title).join(" + ")}`,
