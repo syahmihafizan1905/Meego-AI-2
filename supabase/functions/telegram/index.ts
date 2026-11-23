@@ -444,7 +444,8 @@ const LIMIT = { pips: 100, k: 0.6, expire: 8 };
 const TF_NAME = { m5: "M5", m15: "M15", h1: "H1", h4: "H4", d1: "D1" };
 const relaxDrop = (kind, hoursQuiet) => Math.max(0, Math.min(AUTO[kind].min - AUTO[kind].floor, Math.floor(hoursQuiet / AUTO[kind].step)));
 // Confluence score out of 9: 1 for the required trend, up to 2 more trends, and 1 per pattern (6 patterns).
-// drop lowers the score needed; at drop 2+ the main trend may be sideways (never against the trade) and other trends are ignored.
+// drop lowers the score needed; at drop 2+ other trends are ignored.
+// Sideways filter: the main trend (M15 scalping, H1 intraday, H4 swing) must always be trending the trade's way, never sideways.
 function findSetup(kind, d, price, drop = 0) {
   const r = AUTO[kind], c = d[r.tf];
   if (!c || c.length < 60) return null;
@@ -452,7 +453,7 @@ function findSetup(kind, d, price, drop = 0) {
   if (!a) return null;
   let best = null;
   for (const dir of [1, -1]) {
-    const needOk = drop >= 2 ? r.need.every((k) => d.trend[k] !== -dir) : r.need.every((k) => d.trend[k] === dir);
+    const needOk = r.need.every((k) => d.trend[k] === dir);
     if (!needOk || (drop < 2 && r.bonus.some((k) => d.trend[k] === -dir))) continue;
     const last = c[c.length - 1];
     if ((last.c - last.o) * dir <= 0) continue; // the trigger candle must close in the trade direction
