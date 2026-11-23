@@ -609,6 +609,101 @@ function findSetup(kind, d, price, drop = 0) {
   }
   return best;
 }
+/* ---------- Intraday: the admin's two setups (gold) ---------- */
+// 66 days of 5-min gold, 4 pips spread: about break-even when the real scanner is replayed (102 trades, -0.4R to +7.8R depending on price delay). On trial.
+// ---- Intraday setup 1: trend pullback + supply/demand · setup 2: trendline / SNR break + retest (the admin's own rules) ----
+const IX = { pivH1: 2, imp: 1.3, base: 0.7, zoneAge: 96, touch: 8, brk: 24, near: 0.35, slBuf: 0.25, minPips: 30, maxPips: 200 };
+// H1 structure: +1 = higher highs and higher lows, -1 = lower highs and lower lows, 0 = neither
+function structure(h1) {
+  const c = h1.slice(-80), p = pivots(c, IX.pivH1), H = p.hi.slice(-2), L = p.lo.slice(-2);
+  if (H.length < 2 || L.length < 2) return 0;
+  const last = c[c.length - 1].c;
+  if (H[1].v > H[0].v && L[1].v > L[0].v && last > L[1].v) return 1;
+  if (H[1].v < H[0].v && L[1].v < L[0].v && last < H[1].v) return -1;
+  return 0;
+}
+// Fresh M30 zones: a small base candle followed by a strong move away (1 or 2 candles), not revisited before
+function zones30(m30, dir, a) {
+  const out = [], n = m30.length;
+  for (let i = n - 3; i >= Math.max(1, n - IX.zoneAge); i--) {
+    const b = m30[i], m1 = m30[i + 1], m2 = m30[i + 2];
+    if (Math.abs(b.c - b.o) > IX.base * a) continue;
+    if (Math.max((m1.c - m1.o) * dir, (m2.c - m1.o) * dir) < IX.imp * a) continue;
+    const top = dir > 0 ? Math.max(b.o, b.c) : b.h, bot = dir > 0 ? b.l : Math.min(b.o, b.c);
+    if (top - bot < 0.1 * a || top - bot > 2 * a) continue;
+    out.push({ top, bot, t: b.t, from: m2.t + 1800000 });
+  }
+  return out;
+}
+const pinOrEngulf = (c, dir) => c.length > 2 && rejectionCandle(c, dir);
+// M15 change of character: closed beyond the last small swing against the pullback
+function choch(m15, dir) {
+  const c = m15.slice(-24), p = pivots(c, 2), s = (dir > 0 ? p.hi : p.lo).filter((x) => x.i < c.length - 2).slice(-1)[0];
+  return !!s && (c[c.length - 1].c - s.v) * dir > 0 && (c[c.length - 2].c - s.v) * dir <= 0.2 * atr(m15);
+}
+function setupPullback(d) { // setup 1
+  const dir = structure(d.h1);
+  if (!dir) return null;
+  const a30 = atr(d.m30), a15 = atr(d.m15), m5 = d.m5, m15 = d.m15;
+  if ((m5[m5.length - 1].c - m5[m5.length - 1].o) * dir <= 0 || !confirmCandle(m5, dir, atr(m5))) return null; // M5 confirmation
+  for (const z of zones30(d.m30, dir, a30)) {
+    const after = m15.filter((x) => x.t >= z.from);
+    if (after.length < 2) continue;
+    const inZone = (x) => (dir > 0 ? x.l <= z.top : x.h >= z.bot), broke = (x) => (dir > 0 ? x.c < z.bot : x.c > z.top);
+    const first = after.findIndex(inZone);
+    if (first < 0 || first < after.length - IX.touch || after.some(broke)) continue; // must be the first visit, recent, and still holding
+    const rej = after.slice(Math.max(first, after.length - 3)).some((x) => { const k = m15.indexOf(x); return pinOrEngulf(m15.slice(0, k + 1), dir); });
+    const ch = choch(m15, dir);
+    if (!rej && !ch) continue;
+    const ext = dir > 0 ? Math.min(z.bot, ...after.slice(first).map((x) => x.l), m5[m5.length - 1].l) : Math.max(z.top, ...after.slice(first).map((x) => x.h), m5[m5.length - 1].h);
+    return { dir, key: "P" + z.t, sl: ext - dir * IX.slBuf * a15, why: (dir > 0 ? "H1 HH+HL · M30 demand" : "H1 LH+LL · M30 supply") + " · M15 " + (rej ? "rejection" : "CHoCH") + " · M5 confirmation" };
+  }
+  return null;
+}
+// H1 trendline through the last two falling highs (dir +1) or rising lows (dir -1); value at time t
+function trendline(h1, dir) {
+  const c = h1.slice(-80), p = pivots(c, 3), s = (dir > 0 ? p.hi : p.lo).slice(-2);
+  if (s.length < 2 || (dir > 0 ? s[1].v >= s[0].v : s[1].v <= s[0].v)) return null;
+  const A = c[s[0].i], B = c[s[1].i], m = (s[1].v - s[0].v) / (B.t - A.t);
+  return (t) => s[0].v + m * (t - A.t);
+}
+function setupBreak(d) { // setup 2
+  const a30 = atr(d.m30), a = atr(d.m15), m15 = d.m15, m5 = d.m5, n = m15.length, lastM5 = m5[m5.length - 1];
+  for (const dir of [1, -1]) {
+    if ((lastM5.c - lastM5.o) * dir <= 0 || !pinOrEngulf(m5, dir)) continue; // M5 rejection / pin bar / engulfing
+    const c30 = d.m30.slice(-120), pv = pivots(c30, 3), lv = (dir > 0 ? pv.hi : pv.lo).filter((x) => x.i < c30.length - 4).map((x) => ({ at: () => x.v, name: dir > 0 ? "M30 resistance" : "M30 support", key: "S" + Math.round(x.v * 10) }));
+    const tl = trendline(d.h1, dir);
+    if (tl) lv.push({ at: tl, name: "H1 trendline", key: "T" + Math.round(tl(0) / 1e3) });
+    let best = null;
+    for (const L of lv) {
+      let k = -1;
+      for (let i = n - 2; i >= Math.max(1, n - IX.brk); i--) if ((m15[i].c - L.at(m15[i].t)) * dir > 0.1 * a && (m15[i - 1].c - L.at(m15[i - 1].t)) * dir <= 0) { k = i; break; }
+      if (k < 0) continue; // M15 closed beyond the level
+      const post = m15.slice(k + 1);
+      if (!post.length || post.some((x) => (x.c - L.at(x.t)) * dir < -0.3 * a)) continue; // still holding
+      if (!post.some((x) => (x.h - L.at(x.t)) * dir > 0.5 * a || (dir < 0 && (L.at(x.t) - x.l) > 0.5 * a)) && (m15[k].c - L.at(m15[k].t)) * dir < 0.4 * a) continue; // it must have moved away first
+      const lv5 = L.at(lastM5.t), touch = m5.slice(-4).some((x) => ((dir > 0 ? x.l : x.h) - lv5) * dir <= IX.near * a);
+      if (!touch || (lastM5.c - lv5) * dir <= 0) continue; // retest, closed back on the right side
+      const ext = dir > 0 ? Math.min(lv5, ...m5.slice(-6).map((x) => x.l)) : Math.max(lv5, ...m5.slice(-6).map((x) => x.h));
+      const s = { dir, key: L.key + dir, sl: ext - dir * IX.slBuf * a, why: `${L.name} break (M15 close) · retest · M5 rejection` };
+      if (!best || Math.abs(lastM5.c - s.sl) < Math.abs(lastM5.c - best.sl)) best = s;
+    }
+    if (best) return best;
+  }
+  return null;
+}
+// Setup 1 first, then setup 2. Uses only finished candles; null when the stop is outside 30-200 pips or the zone/level was already traded.
+function intradaySetup(d, price, used) {
+  if (d.m5.length < 40 || d.m15.length < 60 || d.m30.length < 60 || d.h1.length < 60) return null;
+  for (const [fn, name] of [[setupPullback, "Setup 1 · Trend pullback + SND"], [setupBreak, "Setup 2 · Break + retest"]]) {
+    const s = fn(d);
+    if (!s || used.has(s.key)) continue;
+    const pips = ((price - s.sl) * s.dir) / pip("XAUUSD");
+    if (pips < IX.minPips || pips > IX.maxPips) continue;
+    return { dir: s.dir, entry: price, sl: s.sl, zkey: s.key, order: "instant", note: `🤖 MEEGO AI · ${name}: ${s.why}` };
+  }
+  return null;
+}
 // Forex/gold trade Sun 22:00 to Fri 21:00 UTC
 function marketOpen(now, sym) {
   if (/BTC|ETH/.test(sym)) return true;
@@ -842,6 +937,9 @@ async function autoScan() {
     const closed = (c) => c.slice(0, -1); // drop the candle that is still forming
     const d = { sym, m5: closed(group(m1, 5)), m15: closed(m15), h1: closed(h1), h4: closed(group(h1, 240)), d1: closed(group(h1, 1440)) };
     d.trend = { m5: tfTrend(d.m5), m15: tfTrend(d.m15), h1: tfTrend(d.h1), h4: tfTrend(d.h4), d1: tfTrend(d.d1) };
+    // finished candles only, for the Intraday setups: m1 is cached for up to 3 minutes, so "finished" is judged by its last candle
+    const upTo = m1[m1.length - 1].t, up15 = m15.length ? m15[m15.length - 1].t : 0;
+    const ix = { m5: group(m1, 5).filter((x) => x.t + 300000 <= upTo), m15: m15.filter((x) => x.t < up15), m30: group(m15.filter((x) => x.t < up15), 30).filter((x) => x.t + 1800000 <= up15), h1: d.h1 };
     for (const kind of ["Swing", "Intraday", "Scalping"]) {
       const mine = all.filter((s) => s.kind === kind && s.sym === sym && s.auto && !s.nine);
       if (mine.filter((s) => s.status === "running").length >= AUTO[kind].open) continue;
@@ -851,11 +949,12 @@ async function autoScan() {
       // The longer it's been quiet today, the lower the score needed (so there's at least one a day)
       const dayStart = new Date(now).setUTCHours(0, 0, 0, 0);
       const quiet = (Date.now() - Math.max(dayStart, ...mine.map((s) => s.time))) / 3600000;
-      const s = findSetup(kind, d, price, relaxDrop(kind, quiet));
+      const own = kind === "Intraday" && /^XAU/.test(sym);
+      const s = own ? intradaySetup(ix, price, new Set(mine.map((x) => x.zkey).filter(Boolean))) : findSetup(kind, d, price, relaxDrop(kind, quiet));
       if (!s) continue;
       // Sharp entry: when the stop is far (gold Intraday/Swing over LIMIT.pips), wait for a pullback with a limit order
       const risk = Math.abs(s.entry - s.sl);
-      if (kind !== "Scalping" && /^XAU/.test(sym) && risk / pip(sym) > LIMIT.pips) {
+      if (!own && kind !== "Scalping" && /^XAU/.test(sym) && risk / pip(sym) > LIMIT.pips) {
         s.entry -= s.dir * LIMIT.k * risk;
         s.tp = s.entry + s.dir * AUTO[kind].rr * Math.abs(s.entry - s.sl);
         Object.assign(s, { order: "limit", pending: true });
