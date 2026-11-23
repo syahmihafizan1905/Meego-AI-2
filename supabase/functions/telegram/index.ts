@@ -487,6 +487,66 @@ function rejectionCandle(c, dir) {
   const engulf = (x.c - x.o) * dir > 0 && (p.c - p.o) * dir < 0 && Math.abs(x.c - x.o) > Math.abs(p.c - p.o) && (x.c - p.o) * dir > 0;
   return pin || engulf;
 }
+// ---- Zone setups (price must come back INTO a zone) + a confirmation candle ----
+// Supply & demand: the small "base" candle right before a strong impulse candle; first return of price into that base
+function sndZone(c, dir, a) {
+  const n = c.length;
+  for (let i = n - 6; i >= Math.max(1, n - 80); i--) {
+    const base = c[i], imp = c[i + 1];
+    if ((imp.c - imp.o) * dir < 1.5 * a || Math.abs(base.c - base.o) > 0.6 * a) continue;
+    const top = dir > 0 ? Math.max(base.o, base.c) : base.h, bot = dir > 0 ? base.l : Math.min(base.o, base.c);
+    const between = c.slice(i + 2, n - 3);
+    if (between.some((x) => (dir > 0 ? x.l <= top : x.h >= bot))) continue; // not fresh any more
+    const recent = c.slice(-3);
+    const touched = recent.some((x) => (dir > 0 ? x.l <= top : x.h >= bot));
+    const held = dir > 0 ? c[n - 1].c > bot : c[n - 1].c < top;
+    if (touched && held) return true;
+  }
+  return false;
+}
+// SMC: a break of structure, then price returns to the order block (last opposite candle before the break)
+function orderBlock(c, dir, pv, a) {
+  const n = c.length, swings = (dir > 0 ? pv.hi : pv.lo);
+  for (let k = n - 4; k >= Math.max(10, n - 30); k--) {
+    const prior = swings.filter((p) => p.i < k - 1).slice(-1)[0];
+    if (!prior || (c[k].c - prior.v) * dir <= 0 || (c[k - 1].c - prior.v) * dir > 0) continue; // c[k] is the breaking candle
+    let j = k - 1;
+    while (j > k - 10 && (c[j].c - c[j].o) * dir >= 0) j--;
+    const ob = c[j];
+    if ((ob.c - ob.o) * dir >= 0) return false;
+    const top = ob.h, bot = ob.l;
+    const touched = c.slice(-3).some((x) => (dir > 0 ? x.l <= top : x.h >= bot));
+    const held = dir > 0 ? c[n - 1].c > bot : c[n - 1].c < top;
+    return touched && held && Math.abs(top - bot) <= 2 * a;
+  }
+  return false;
+}
+// BBMA re-entry: a recent close outside the Bollinger Band (momentum), then a pullback to MA5/MA10 that holds
+function lwma(arr, n, i) { let s = 0, w = 0; for (let k = 0; k < n; k++) { s += arr[i - k] * (n - k); w += n - k; } return s / w; }
+function bbmaReentry(c, dir) {
+  const n = c.length;
+  if (n < 45) return false;
+  const cl = c.map((x) => x.c), hi = c.map((x) => x.h), lo = c.map((x) => x.l);
+  const band = (i) => { const w = cl.slice(i - 19, i + 1), m = w.reduce((t, v) => t + v, 0) / 20, sd = Math.sqrt(w.reduce((t, v) => t + (v - m) ** 2, 0) / 20); return { m, up: m + 2 * sd, dn: m - 2 * sd }; };
+  let extreme = false;
+  for (let i = n - 20; i < n - 3; i++) { const b = band(i); if (dir > 0 ? cl[i] > b.up : cl[i] < b.dn) extreme = true; }
+  if (!extreme) return false;
+  const b = band(n - 1);
+  if (dir > 0 ? cl[n - 1] < b.m : cl[n - 1] > b.m) return false;
+  const src = dir > 0 ? lo : hi;
+  const touched = [n - 3, n - 2, n - 1].some((i) => { const ma = Math.max(lwma(src, 5, i), lwma(src, 10, i)) * (dir > 0 ? 1 : 0) + Math.min(lwma(src, 5, i), lwma(src, 10, i)) * (dir > 0 ? 0 : 1); return dir > 0 ? lo[i] <= ma : hi[i] >= ma; });
+  return touched && (dir > 0 ? cl[n - 1] > lwma(lo, 5, n - 1) : cl[n - 1] < lwma(hi, 5, n - 1));
+}
+// Confirmation on the last closed candle: pin bar / engulfing, or a strong momentum close in the trade direction
+function confirmCandle(c, dir, a) {
+  if (rejectionCandle(c, dir)) return "rejection candle";
+  const x = c[c.length - 1], body = (x.c - x.o) * dir, range = x.h - x.l || 1e-9;
+  if (body >= 0.6 * range && body >= 0.6 * a) return "momentum candle";
+  return null;
+}
+// Every setup needs zone(s) (SNR hold, SNR break & retest, supply/demand, SMC order block, BBMA re-entry) AND a confirmation candle.
+// Tuned per type on 66 days of gold (backtest): zones = how many zone setups must line up, snrHold = whether a plain SNR hold counts.
+const SETUP_RULE = { Scalping: { zones: 1, snrHold: true }, Intraday: { zones: 2, snrHold: false }, Swing: { zones: 1, snrHold: false } };
 // trend: higher timeframes that must agree (need) and that add a point when they agree (bonus)
 // min: score needed. step: every `step` hours without a signal of this kind, the score needed drops by 1 (down to floor),
 // so there is at least one signal a day. open: how many may run at once. cool: hours to wait after the last one.
@@ -524,6 +584,15 @@ function findSetup(kind, d, price, drop = 0) {
     if (sweep(c, dir)) why.push("liquidity sweep");
     if (rejectionCandle(c, dir)) why.push("rejection candle");
     if (why.length < Math.max(MIN_SCORE, r.min - drop) || why.length === trends) continue; // always at least one price pattern
+    const zones = [];
+    const rule = SETUP_RULE[kind] || { zones: 1, snrHold: true };
+    if (rule.snrHold && (why.includes("support hold") || why.includes("resistance hold"))) zones.push("SNR hold");
+    if (why.includes("SNR break & retest")) zones.push("SNR break & retest");
+    if (sndZone(c, dir, a)) zones.push(dir > 0 ? "demand zone" : "supply zone");
+    if (orderBlock(cc, dir, pv, a)) zones.push("SMC order block");
+    if (bbmaReentry(c, dir)) zones.push("BBMA re-entry");
+    const confirm = confirmCandle(c, dir, a);
+    if (zones.length < rule.zones || !confirm) continue;
     // SL beyond the nearest swing point (or the sweep wick), with a small buffer
     // Try the last 12, 6 then 3 candles, so the SL is as close as structure allows (gold scalps: within maxPips)
     const sym = d.sym || "XAUUSD";
@@ -536,7 +605,7 @@ function findSetup(kind, d, price, drop = 0) {
       if (rk >= 0.4 * a && rk <= maxRisk) { sl = s; risk = rk; break; }
     }
     if (sl === null) continue;
-    if (!best || why.length > best.score) best = { dir, entry: price, sl, tp: price + dir * r.rr * risk, score: why.length, note: `🤖 MEEGO AI · Confluence ${why.length}/9: ${why.join(" + ")}` };
+    if (!best || why.length > best.score) best = { dir, entry: price, sl, tp: price + dir * r.rr * risk, score: why.length, note: `🤖 MEEGO AI · Setup: ${zones.join(" + ") || "trend pullback"} · Confirmation: ${confirm || "candle close"} · Confluence ${why.length}/9: ${why.join(" + ")}` };
   }
   return best;
 }
