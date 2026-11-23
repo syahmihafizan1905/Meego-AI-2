@@ -1235,7 +1235,9 @@ async function onDbEvent(ev) {
     }
     const label = `${s.dir > 0 ? "BUY" : "SELL"}${s.order === "limit" ? " LIMIT" : ""} <b>${esc(s.sym)}</b>`;
     if (ev.op === "UPDATE" && old?.pending && s.status === "running" && !s.pending) {
-      await broadcast(chats, `⚡ <b>ENTRY TRIGGERED</b> · ${label}\n${kindOf(s.kind).label} · entry <code>${px(s.entry, s.sym)}</code>`);
+      // the full signal card again (entry, zone, TPs, SL, lot guide), kept live like a new signal
+      const sig = { id: ev.record.id, ...s }, title = `⚡ ENTRY TRIGGERED · ${kindOf(s.kind).title.replace(/^\S+\s/, "")}`;
+      for (const c of chats) { await sendLive(c, sig, title); await new Promise((r) => setTimeout(r, 60)); }
       return refreshLive();
     }
     if (ev.op === "UPDATE" && old && old.status !== s.status && s.status === "cancelled") {
