@@ -107,7 +107,7 @@ function signalText(s, title, live) {
   ];
   if (s.score) lines.push(`Rating Setup: <b>${grade(s.score)}</b>`);
   if (s.order === "limit" && s.status === "running") {
-    lines.push(s.pending ? `⏳ Pending · waiting for price to reach entry (cancelled after ${LIMIT.expire}h)` : `⚡ Entry triggered${s.filled ? ` at ${myTime(s.filled)}` : ""}`);
+    lines.push(s.pending ? `⏳ Pending · waiting for price to reach entry (cancelled after ${s.expire ?? LIMIT.expire}h)` : `⚡ Entry triggered${s.filled ? ` at ${myTime(s.filled)}` : ""}`);
   }
   if (s.pending && Number.isFinite(live)) lines.push(`Now: <code>${px(live, s.sym)}</code> · updated ${myTime()}`);
   else if (Number.isFinite(live)) {
@@ -489,7 +489,7 @@ async function watchSignals(list) {
       let hit = null, filled = s.pending ? null : s.filled || s.time;
       for (const x of path) {
         if (!filled) {
-          if (x.t - s.time > LIMIT.expire * 3600000) break;
+          if (x.t - s.time > (s.expire ?? LIMIT.expire) * 3600000) break;
           if (!(s.dir > 0 ? x.l <= s.entry : x.h >= s.entry)) continue;
           filled = x.t; // limit order filled on this candle; check SL/TP from here on
         }
@@ -500,13 +500,91 @@ async function watchSignals(list) {
       const justFilled = s.pending && filled;
       if (justFilled) Object.assign(s, { pending: false, filled });
       if (hit) await setStatus(s, hit);
-      else if (!filled) { if (Date.now() - s.time > LIMIT.expire * 3600000) await setStatus(s, "cancelled"); }
+      else if (!filled) { if (Date.now() - s.time > (s.expire ?? LIMIT.expire) * 3600000) await setStatus(s, "cancelled"); }
       else if (Date.now() - filled > AUTO[s.kind].life * 3600000) await setStatus(s, "closed", m1[m1.length - 1].c);
       else if (justFilled) {
         const { id, ...data } = s;
         await db.from("signals").update({ data, updated_at: new Date().toISOString() }).eq("id", id);
       }
     }
+  }
+}
+/* ---------- news: prediction + signal ~2 minutes before 🔴 USD news, and a recovery setup if the spike hits SL ---------- */
+const numOf = (v) => { const n = parseFloat(String(v ?? "").replace(/[%KMBT,]/gi, "")); return Number.isFinite(n) ? n : null; };
+const usdInverse = (title) => /unemploy|jobless|claims/i.test(title); // higher number = weaker USD
+const NEWS_RR = 2;
+async function newsAlert() {
+  const now = Date.now();
+  await newsRecovery().catch((e) => console.error("news recovery failed", e));
+  if (!marketOpen(new Date(now), "XAUUSD")) return;
+  const list = await newsWeek(100000).catch(() => []);
+  const due = list.filter((e) => e.impact === "High" && e.t - now > 0 && e.t - now <= 150000);
+  if (!due.length) return;
+  const t0 = due[0].t, evs = due.filter((e) => e.t === t0);
+  const cfg = await settings();
+  if (Number(cfg.news_alerted || 0) >= t0) return;
+  await db.from("app_settings").upsert({ key: "news_alerted", value: String(t0) });
+  // Prediction: forecast vs previous tells which way the number is expected to move
+  let usd = 0;
+  const pred = evs.map((e) => {
+    const f = numOf(e.forecast), pr = numOf(e.previous);
+    if (f === null || pr === null || f === pr) return `• ${esc(e.title)}: ${f === null ? "no forecast" : `expected same as before (${esc(e.forecast)})`}`;
+    const up = f > pr, good = up !== usdInverse(e.title);
+    usd += good ? 1 : -1;
+    return `• ${esc(e.title)}: likely <b>${up ? "HIGHER" : "LOWER"}</b> (F ${esc(e.forecast)} vs P ${esc(e.previous)}) → USD ${good ? "stronger" : "weaker"}`;
+  });
+  const [m1, m15, h1] = [await candles("XAUUSD", "1min"), await candles("XAUUSD", "15min"), await candles("XAUUSD", "1h")];
+  const price = m1[m1.length - 1]?.c, a = atr(m15.slice(0, -1));
+  const chart = tfTrend(h1.slice(0, -1)) || 0;
+  const dir = usd ? -Math.sign(usd) : chart; // strong USD = gold down
+  const conf = usd && chart === dir ? "Strong (news + chart agree)" : usd ? "Medium (news only, chart disagrees or flat)" : "Low (chart trend only)";
+  const biasTxt = (d) => (d > 0 ? "🟢 BULLISH" : d < 0 ? "🔴 BEARISH" : "⚪ NEUTRAL");
+  const head = [
+    `⚠️ <b>NEWS IN ${Math.max(1, Math.round((t0 - now) / 60000))} MIN</b> · 🔴 ${myTime(t0)} (Malaysia)`,
+    "",
+    "🔮 <b>MEEGO AI prediction</b>",
+    ...pred,
+    "",
+    `Bias: XAUUSD <b>${biasTxt(dir)}</b> · BTCUSD <b>${biasTxt(dir)}</b>`,
+    `Chart trend H1: ${biasTxt(chart)} · Confidence: <b>${conf}</b>`,
+    "",
+    dir ? "📰 News signal below. Spreads widen at news time: use a small lot." : "No clear bias, so no news signal this time. Wait for the spike to finish.",
+    "<i>A prediction is not a guarantee. The real number can surprise.</i>",
+  ];
+  await broadcast(await audience("Scalping"), head.join("\n"));
+  if (!dir || !price || !a) return;
+  const risk = 1.2 * a, d = digits("XAUUSD");
+  const score = conf.startsWith("Strong") ? 7 : conf.startsWith("Medium") ? 5 : 4;
+  await db.from("signals").insert({ id: crypto.randomUUID(), data: {
+    kind: "Scalping", sym: "XAUUSD", dir, entry: Number(price.toFixed(d)), sl: Number((price - dir * risk).toFixed(d)), tp: Number((price + dir * NEWS_RR * risk).toFixed(d)),
+    score, order: "instant", news: "pre", newsAt: t0, note: `🤖 MEEGO AI · News play: ${evs.map((e) => e.title).join(" + ")} · RR 1:${NEWS_RR}`,
+    status: "running", auto: true, time: Date.now(), closedAt: null } });
+}
+// After a news signal hits SL: trade WITH the spike, entering on a 38% pullback (same lot, never bigger)
+async function newsRecovery() {
+  const { data } = await db.from("signals").select("id,data").order("updated_at", { ascending: false }).limit(50);
+  const lost = (data ?? []).map((r) => ({ id: r.id, ...r.data })).filter((s) => s.news === "pre" && s.status === "sl" && !s.recovered && s.closedAt && Date.now() - s.closedAt >= 3 * 60000 && Date.now() - s.closedAt < 60 * 60000);
+  for (const s of lost) {
+    const { id, ...rest } = s;
+    await db.from("signals").update({ data: { ...rest, recovered: true } }).eq("id", id);
+    const m1 = (await candles(s.sym, "1min")).filter((x) => x.t >= s.time);
+    if (m1.length < 3) continue;
+    const dir = -s.dir, price = m1[m1.length - 1].c;
+    const extreme = dir > 0 ? Math.max(...m1.map((x) => x.h)) : Math.min(...m1.map((x) => x.l));
+    const spike = Math.abs(extreme - s.entry);
+    if (!spike) continue;
+    let entry = extreme - dir * 0.382 * spike;
+    const sl = extreme - dir * 0.786 * spike;
+    let order = "limit";
+    if ((price - entry) * dir <= 0) { // price already pulled back past the entry
+      if ((price - sl) * dir <= 0.15 * spike) continue; // too close to the SL, skip
+      entry = price; order = "instant";
+    }
+    const risk = Math.abs(entry - sl), d = digits(s.sym);
+    await db.from("signals").insert({ id: crypto.randomUUID(), data: {
+      kind: "Scalping", sym: s.sym, dir, entry: Number(entry.toFixed(d)), sl: Number(sl.toFixed(d)), tp: Number((entry + dir * NEWS_RR * risk).toFixed(d)),
+      score: 5, order, pending: order === "limit", expire: 2, news: "recovery", note: `🤖 MEEGO AI · Recovery after news spike: follow the spike, enter on the pullback · same lot, never bigger · RR 1:${NEWS_RR}`,
+      status: "running", auto: true, time: Date.now(), closedAt: null } });
   }
 }
 async function autoScan() {
@@ -834,7 +912,8 @@ async function onDbEvent(ev) {
     const chats = await audience(s.kind);
     if (ev.op === "INSERT" && s.status === "running") {
       const sig = { id: ev.record.id, ...s };
-      for (const c of chats) { await sendLive(c, sig, kindOf(s.kind).fresh); await new Promise((r) => setTimeout(r, 60)); }
+      const title = s.news === "pre" ? "📰 NEWS SIGNAL" : s.news === "recovery" ? "🔁 RECOVERY SETUP (after news spike)" : kindOf(s.kind).fresh;
+      for (const c of chats) { await sendLive(c, sig, title); await new Promise((r) => setTimeout(r, 60)); }
       return;
     }
     const label = `${s.dir > 0 ? "BUY" : "SELL"}${s.order === "limit" ? " LIMIT" : ""} <b>${esc(s.sym)}</b>`;
@@ -854,6 +933,7 @@ async function onDbEvent(ev) {
     }
     return;
   }
+  if (ev.event === "news") return newsAlert().catch((e) => console.error("news alert failed", e));
   if (ev.event === "scan") {
     await autoScan().catch((e) => console.error("auto scan failed", e));
     if (new Date().getUTCMinutes() < 5) await newsWeek(55).catch((e) => console.error("news refresh failed", e));
