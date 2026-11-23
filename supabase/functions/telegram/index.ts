@@ -334,9 +334,15 @@ function historyStats(list, now = Date.now()) {
   const block = (name, from) => {
     const c = list.filter((s) => (s.closedAt || s.time) >= from);
     if (!c.length) return `<b>${name}</b>\nNo closed signals yet.`;
-    const win = c.filter(isWin).length, sl = c.filter((s) => !isWin(s) && sigPips(s) < 0).length, flat = c.length - win - sl;
-    const net = c.reduce((t, s) => t + sigPips(s), 0);
-    return `<b>${name}</b>\n✅ TP: <b>${win}</b> · ❌ SL: <b>${sl}</b>${flat ? ` · ➖ BE: <b>${flat}</b>` : ""}\nWin rate: <b>${Math.round((win / Math.max(1, win + sl)) * 100)}%</b> · Net: <b>${net > 0 ? "+" : ""}${net} pips</b>`;
+    const win = c.filter(isWin).length, sl = c.filter((s) => !isWin(s) && sigPips(s) < 0).length, be = c.length - win - sl;
+    const pp = c.map(sigPips), winP = pp.filter((p) => p > 0).reduce((t, p) => t + p, 0), lossP = pp.filter((p) => p < 0).reduce((t, p) => t + p, 0), net = winP + lossP;
+    return [
+      `<b>${name}</b> · ${c.length} closed`,
+      `✅ Hit TP: <b>${win}</b> · ❌ Hit SL: <b>${sl}</b> · ➖ Hit BE: <b>${be}</b>`,
+      `🎯 Win rate: <b>${Math.round((win / Math.max(1, win + sl)) * 100)}%</b>`,
+      `💰 Win pips: <b>+${winP}</b> · 🔻 Loss pips: <b>${lossP}</b>`,
+      `📈 Net: <b>${net > 0 ? "+" : ""}${net} pips</b>`,
+    ].join("\n");
   };
   return [block("📅 Today", dayStart), block("🗓 This week", weekStart), block("📆 This month", monthStart)].join("\n\n");
 }
