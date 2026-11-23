@@ -217,28 +217,52 @@ function trend(closes) {
   sc += e20[n] > e20[Math.max(0, n - 5)] ? 1 : -1;
   return sc;
 }
-async function candles(sym) {
-  const r = await fetch(`${SB_URL}/functions/v1/${CANDLES_FN}?symbol=${sym}&interval=1h`, { headers: { Authorization: `Bearer ${SB_SERVICE}`, apikey: SB_SERVICE } });
+async function candles(sym, interval = "1h") {
+  const r = await fetch(`${SB_URL}/functions/v1/${CANDLES_FN}?symbol=${sym}&interval=${interval}`, { headers: { Authorization: `Bearer ${SB_SERVICE}`, apikey: SB_SERVICE } });
   const j = await r.json().catch(() => ({}));
   return Array.isArray(j.candles) ? j.candles : [];
 }
+// Merge candles into a bigger timeframe (e.g. 1min -> 5min, 1h -> 4h), aligned to clock time
+function group(c, minutes) {
+  const ms = minutes * 60000, out = [];
+  for (const x of c) {
+    const b = Math.floor(x.t / ms) * ms, last = out[out.length - 1];
+    if (last && last.t === b) { last.h = Math.max(last.h, x.h); last.l = Math.min(last.l, x.l); last.c = x.c; }
+    else out.push({ t: b, o: x.o, h: x.h, l: x.l, c: x.c });
+  }
+  return out;
+}
+// Trend of one timeframe: +1 bullish, -1 bearish, 0 sideways, null = not enough data
+function tfTrend(c) {
+  if (c.length < 60) return null;
+  const sc = trend(c.map((x) => x.c));
+  return sc >= 2 ? 1 : sc <= -2 ? -1 : 0;
+}
+const TF_LABEL = (v) => (v === 1 ? "🟢 Bullish" : v === -1 ? "🔴 Bearish" : v === 0 ? "⚪ Sideways" : "▫️ –");
+async function pairDirection(p) {
+  const [m1, m15, h1] = [await candles(p, "1min"), await candles(p, "15min"), await candles(p, "1h")];
+  const tf = { M1: tfTrend(m1), M5: tfTrend(group(m1, 5)), M15: tfTrend(m15), H1: tfTrend(h1), H4: tfTrend(group(h1, 240)) };
+  const weight = { M1: 0.5, M5: 1, M15: 1.5, H1: 2, H4: 2.5 };
+  let score = 0, used = 0;
+  for (const k of Object.keys(tf)) if (tf[k] !== null) { score += tf[k] * weight[k]; used += weight[k]; }
+  const bias = !used ? null : score / used >= 0.35 ? 1 : score / used <= -0.35 ? -1 : 0;
+  const last = (h1.length ? h1 : m15.length ? m15 : m1).slice(-1)[0];
+  return { p, tf, bias, price: last ? last.c : null };
+}
 async function cmdDirection(chatId, a) {
   if (!a.admin && !a.tier) return send(chatId, noPlan(a));
-  const out = [];
   const video = playVideo(chatId, "direction", "🧭 <b>MEEGO AI</b> · reading today's direction…", "✅ <b>MEEGO AI</b> · direction ready");
   const pairs = ["XAUUSD", "EURUSD", "GBPUSD", "USDJPY", "BTCUSD"];
-  const data = await Promise.all(pairs.map((p) => candles(p).catch(() => [])));
+  const rows = [];
+  for (const p of pairs) rows.push(await pairDirection(p).catch(() => ({ p, tf: {}, bias: null, price: null })));
   await video;
-  for (const [idx, p] of pairs.entries()) {
-    const c = data[idx];
-    if (c.length < 120) { out.push(`${p}: no data`); continue; }
-    const h1 = c.map((x) => x.c);
-    const h4 = [];
-    for (let i = c.length % 4; i < c.length; i += 4) h4.push(c[Math.min(i + 3, c.length - 1)].c);
-    const sum = trend(h1) + trend(h4);
-    out.push(`<b>${p}</b> ${sum >= 4 ? "🟢 BUY" : sum <= -4 ? "🔴 SELL" : "⚪ WAIT"} · <code>${px(h1[h1.length - 1], p)}</code>`);
-  }
-  return send(chatId, `🧭 <b>Direction today</b> (H1 + H4 trend)\n\n${out.join("\n")}\n\n${DISCLAIMER}`);
+  const blocks = rows.map((r) => {
+    const head = r.bias === 1 ? "🟢" : r.bias === -1 ? "🔴" : "⚪";
+    const word = r.bias === 1 ? "BULLISH" : r.bias === -1 ? "BEARISH" : r.bias === 0 ? "SIDEWAYS" : "NO DATA";
+    const tfs = ["M1", "M5", "M15", "H1", "H4"].map((k) => `${k} ${TF_LABEL(r.tf[k] ?? null)}`);
+    return `${head} <b>${r.p} · ${word}</b>${r.price ? ` · <code>${px(r.price, r.p)}</code>` : ""}\n${tfs.slice(0, 3).join("  ")}\n${tfs.slice(3).join("  ")}`;
+  });
+  return send(chatId, `🧭 <b>MEEGO AI · Market Direction</b>\n\n${blocks.join("\n\n")}\n\n${DISCLAIMER}`);
 }
 
 /* ---------- AI chart scan from a photo ---------- */
