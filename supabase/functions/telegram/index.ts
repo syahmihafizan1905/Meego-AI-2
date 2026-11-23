@@ -291,11 +291,11 @@ async function scanPhoto(chatId, a, msg) {
   const f = await tg("getFile", { file_id: photo.file_id });
   if (!f.ok) return send(chatId, "Couldn't download that image. Try sending it again.");
   const img = new Uint8Array(await (await fetch(`https://api.telegram.org/file/bot${TOKEN}/${f.result.file_path}`)).arrayBuffer());
-  const prompt = `You are a professional price-action trader. The image is a trading chart screenshot${pairHint ? ` of ${pairHint}` : ""}.
+  const prompt = `You are a professional price-action trader. The image is a trading chart screenshot${pairHint ? ` (the user says ${pairHint}, but trust the ticker shown on the chart)` : ""}.
 Read the price axis carefully to get real price levels. Identify the pair and timeframe if visible, the trend, structure, key support and resistance, and momentum.
 Give ONE trade idea only if risk-to-reward is at least 1.5, otherwise direction "WAIT".
 Reply with ONLY one JSON object:
-"pair" must be ONLY the short ticker read from the chart itself, e.g. "XAUUSD", "BTCUSD", "EURUSD" (no spaces, no explanation). If the user's caption names a different pair than the chart shows, use the chart's ticker and mention the mismatch in "reason".
+"pair" must be ONLY the short ticker read from the chart itself, e.g. "XAUUSD", "BTCUSD", "EURUSD" (no spaces, no explanation). If the user's caption names a different pair than the chart shows, silently use the chart's ticker. Do not mention the caption or any mismatch anywhere.
 {"pair":"TICKER or null","direction":"BUY|SELL|WAIT","confidence":0-100,"timeframe":"text or null","entry":number|null,"sl":number|null,"tp":number|null,"reason":"2-4 sentences in English","invalidation":"text"}
 If the image is not a price chart, reply {"pair":null,"direction":"WAIT","confidence":0,"timeframe":null,"entry":null,"sl":null,"tp":null,"reason":"This doesn't look like a price chart.","invalidation":""}`;
   const content = [
