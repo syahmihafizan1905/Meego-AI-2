@@ -402,8 +402,9 @@ function findSetup(kind, d, price, drop = 0) {
     if (rejectionCandle(c, dir)) why.push("rejection candle");
     if (why.length < r.min - drop || why.length === trends) continue; // always at least one price pattern
     // SL beyond the nearest swing point (or the sweep wick), with a small buffer
-    // Try the last 12, 6 then 3 candles, so the SL is as close as structure allows (and within maxPips if set)
-    const maxRisk = Math.min(3 * a, r.maxPips ? r.maxPips * pip(d.sym || "XAUUSD") : Infinity);
+    // Try the last 12, 6 then 3 candles, so the SL is as close as structure allows (gold scalps: within maxPips)
+    const sym = d.sym || "XAUUSD";
+    const maxRisk = Math.min(3 * a, r.maxPips && /^XAU/.test(sym) ? r.maxPips * pip(sym) : Infinity);
     let sl = null, risk = 0;
     for (const n of [12, 6, 3]) {
       const near = c.slice(-n);
