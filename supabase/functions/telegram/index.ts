@@ -87,16 +87,18 @@ const showRef = (k) => (/^-?\d+$/.test(k) ? `ID ${k}` : `@${k}`);
 const grade = (score) => ["D", "D+", "C", "C+", "B", "B+", "A", "A+"][Math.max(0, Math.min(7, Math.round(score) - 2))];
 const myTime = (t = Date.now()) => new Date(t + 8 * 3600000).toISOString().slice(11, 16); // Malaysia time
 function resultLine(s) {
+  if (s.status === "cancelled") return "🚫 <b>CANCELLED</b> · entry price not reached";
   const p = s.status === "tp" ? pipsBetween(s.tp, s.entry, s.sym) : s.status === "sl" ? -pipsBetween(s.entry, s.sl, s.sym) : s.status === "closed" ? Math.round(((Number(s.exit) - s.entry) * s.dir) / pip(s.sym)) : 0;
   const head = s.status === "tp" ? "✅ <b>HIT TP</b>" : s.status === "sl" ? "❌ <b>HIT SL</b>" : s.status === "closed" ? "⏹ <b>CLOSED</b>" : "➖ <b>BREAKEVEN</b>";
   return `${head} · <b>${p > 0 ? "+" : ""}${p} pips</b>`;
 }
 // live = current price (shown while the signal is running; the message is refreshed every 5 minutes)
 function signalText(s, title, live) {
-  const side = s.dir > 0 ? "🟢 <b>BUY</b>" : "🔴 <b>SELL</b>";
+  const word = s.dir > 0 ? "BUY" : "SELL", dot = s.dir > 0 ? "🟢" : "🔴";
+  const side = s.order === "limit" ? `${dot} <b>${word} LIMIT ${esc(s.sym)}</b>` : s.order === "instant" ? `${dot} <b>${word} ${esc(s.sym)}</b> · INSTANT ENTRY` : `${dot} <b>${word}</b> <b>${esc(s.sym)}</b>`;
   const lines = [
     `<b>${esc(title)}</b>`,
-    `${side} <b>${esc(s.sym)}</b>`,
+    side,
     "",
     `Entry: <code>${px(s.entry, s.sym)}</code>`,
     `TP: <code>${px(s.tp, s.sym)}</code>`,
@@ -104,7 +106,11 @@ function signalText(s, title, live) {
     `Target ${pipsBetween(s.tp, s.entry, s.sym)} pips · Risk ${pipsBetween(s.entry, s.sl, s.sym)} pips`,
   ];
   if (s.score) lines.push(`Rating Setup: <b>${grade(s.score)}</b>`);
-  if (Number.isFinite(live)) {
+  if (s.order === "limit" && s.status === "running") {
+    lines.push(s.pending ? `⏳ Pending · waiting for price to reach entry (cancelled after ${LIMIT.expire}h)` : `⚡ Entry triggered${s.filled ? ` at ${myTime(s.filled)}` : ""}`);
+  }
+  if (s.pending && Number.isFinite(live)) lines.push(`Now: <code>${px(live, s.sym)}</code> · updated ${myTime()}`);
+  else if (Number.isFinite(live)) {
     const p = Math.round(((live - s.entry) * s.dir) / pip(s.sym));
     lines.push(p >= 0 ? `🟢 Running pips: <b>+${p}</b>` : `🔴 Floating pips: <b>${p}</b>`, `Now: <code>${px(live, s.sym)}</code> · updated ${myTime()}`);
   }
@@ -377,6 +383,8 @@ const AUTO = {
   Intraday: { tf: "m15", ema: 20, look: 3, need: ["h1"], bonus: ["m15", "h4"], min: 5, floor: 2, step: 3, buf: 0.2, rr: 2, life: 24, cool: 1, max: 3, open: 2 },
   Swing: { tf: "h1", ema: 50, look: 4, need: ["h4"], bonus: ["h1", "d1"], min: 6, floor: 2, step: 4, buf: 0.3, rr: 2, life: 72, cool: 4, max: 2, open: 2 },
 };
+// Limit entry: placed k of the way from price to the SL; cancelled if not reached within `expire` hours
+const LIMIT = { pips: 100, k: 0.6, expire: 8 };
 const TF_NAME = { m5: "M5", m15: "M15", h1: "H1", h4: "H4", d1: "D1" };
 const relaxDrop = (kind, hoursQuiet) => Math.max(0, Math.min(AUTO[kind].min - AUTO[kind].floor, Math.floor(hoursQuiet / AUTO[kind].step)));
 // Confluence score out of 9: 1 for the required trend, up to 2 more trends, and 1 per pattern (6 patterns).
@@ -439,14 +447,26 @@ async function watchSignals(list) {
     for (const s of sigs) {
       let path = m1.filter((x) => x.t >= s.time);
       if (m1[0].t > s.time) path = (m15 ??= await candles(sym, "15min")).filter((x) => x.t >= s.time);
-      let hit = null;
+      let hit = null, filled = s.pending ? null : s.filled || s.time;
       for (const x of path) {
+        if (!filled) {
+          if (x.t - s.time > LIMIT.expire * 3600000) break;
+          if (!(s.dir > 0 ? x.l <= s.entry : x.h >= s.entry)) continue;
+          filled = x.t; // limit order filled on this candle; check SL/TP from here on
+        }
         const slHit = s.dir > 0 ? x.l <= s.sl : x.h >= s.sl, tpHit = s.dir > 0 ? x.h >= s.tp : x.l <= s.tp;
         if (slHit) { hit = "sl"; break; }
         if (tpHit) { hit = "tp"; break; }
       }
+      const justFilled = s.pending && filled;
+      if (justFilled) Object.assign(s, { pending: false, filled });
       if (hit) await setStatus(s, hit);
-      else if (Date.now() - s.time > AUTO[s.kind].life * 3600000) await setStatus(s, "closed", m1[m1.length - 1].c);
+      else if (!filled) { if (Date.now() - s.time > LIMIT.expire * 3600000) await setStatus(s, "cancelled"); }
+      else if (Date.now() - filled > AUTO[s.kind].life * 3600000) await setStatus(s, "closed", m1[m1.length - 1].c);
+      else if (justFilled) {
+        const { id, ...data } = s;
+        await db.from("signals").update({ data, updated_at: new Date().toISOString() }).eq("id", id);
+      }
     }
   }
 }
@@ -480,6 +500,13 @@ async function autoScan() {
       const quiet = (Date.now() - Math.max(dayStart, ...mine.map((s) => s.time))) / 3600000;
       const s = findSetup(kind, d, price, relaxDrop(kind, quiet));
       if (!s) continue;
+      // Sharp entry: when the stop is far (gold Intraday/Swing over LIMIT.pips), wait for a pullback with a limit order
+      const risk = Math.abs(s.entry - s.sl);
+      if (kind !== "Scalping" && /^XAU/.test(sym) && risk / pip(sym) > LIMIT.pips) {
+        s.entry -= s.dir * LIMIT.k * risk;
+        s.tp = s.entry + s.dir * AUTO[kind].rr * Math.abs(s.entry - s.sl);
+        Object.assign(s, { order: "limit", pending: true });
+      } else s.order = "instant";
       for (const k of ["entry", "sl", "tp"]) s[k] = Number(s[k].toFixed(digits(sym)));
       await db.from("signals").insert({ id: crypto.randomUUID(), data: { kind, sym, ...s, status: "running", auto: true, time: Date.now(), closedAt: null } });
     }
@@ -771,10 +798,19 @@ async function onDbEvent(ev) {
       for (const c of chats) { await sendLive(c, sig, kindOf(s.kind).fresh); await new Promise((r) => setTimeout(r, 60)); }
       return;
     }
+    const label = `${s.dir > 0 ? "BUY" : "SELL"}${s.order === "limit" ? " LIMIT" : ""} <b>${esc(s.sym)}</b>`;
+    if (ev.op === "UPDATE" && old?.pending && s.status === "running" && !s.pending) {
+      await broadcast(chats, `⚡ <b>ENTRY TRIGGERED</b> · ${label}\n${kindOf(s.kind).label} · entry <code>${px(s.entry, s.sym)}</code>`);
+      return refreshLive();
+    }
+    if (ev.op === "UPDATE" && old && old.status !== s.status && s.status === "cancelled") {
+      await broadcast(chats, `🚫 <b>CANCELLED</b> · ${label}\n${kindOf(s.kind).label} · entry price not reached`);
+      return refreshLive();
+    }
     if (ev.op === "UPDATE" && old && old.status !== s.status && ["tp", "sl", "be", "closed"].includes(s.status)) {
       const p = s.status === "tp" ? pipsBetween(s.tp, s.entry, s.sym) : s.status === "sl" ? -pipsBetween(s.entry, s.sl, s.sym) : s.status === "closed" ? closedPips(s) : 0;
       const head = s.status === "tp" ? "✅ <b>HIT TP</b>" : s.status === "sl" ? "❌ <b>HIT SL</b>" : s.status === "closed" ? "⏹ <b>CLOSED</b> (time limit)" : "➖ <b>BREAKEVEN</b>";
-      await broadcast(chats, `${head} · ${s.dir > 0 ? "BUY" : "SELL"} <b>${esc(s.sym)}</b>\n${kindOf(s.kind).label} · <b>${p > 0 ? "+" : ""}${p} pips</b>`);
+      await broadcast(chats, `${head} · ${label}\n${kindOf(s.kind).label} · <b>${p > 0 ? "+" : ""}${p} pips</b>`);
       return refreshLive(); // mark the earlier signal messages as closed
     }
     return;
