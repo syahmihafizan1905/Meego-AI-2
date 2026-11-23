@@ -240,14 +240,22 @@ async function refreshLive() {
   }
 }
 /* ---------- economic news (USD events move XAUUSD and BTCUSD) ---------- */
-let newsCache = { t: 0, list: [] };
-async function newsWeek() {
-  if (Date.now() - newsCache.t < 30 * 60000 && newsCache.list.length) return newsCache.list;
-  const r = await fetch("https://nfs.faireconomy.media/ff_calendar_thisweek.json", { headers: { "User-Agent": "Mozilla/5.0" } });
-  if (!r.ok) throw new Error(`news ${r.status}`);
-  const list = (await r.json()).filter((e) => e.country === "USD" && ["High", "Medium"].includes(e.impact)).map((e) => ({ ...e, t: new Date(e.date).getTime() })).filter((e) => Number.isFinite(e.t)).sort((x, y) => x.t - y.t);
-  newsCache = { t: Date.now(), list };
-  return list;
+// The feed allows only a few requests, so the week's list is kept in app_settings (refreshed hourly by the scan)
+async function newsWeek(maxAgeMin = 180) {
+  const { data: row } = await db.from("app_settings").select("value").eq("key", "news_cache").maybeSingle();
+  let cached = null;
+  try { cached = row?.value ? JSON.parse(row.value) : null; } catch (_) { cached = null; }
+  if (cached?.list && Date.now() - cached.t < maxAgeMin * 60000) return cached.list;
+  try {
+    const r = await fetch("https://nfs.faireconomy.media/ff_calendar_thisweek.json", { headers: { "User-Agent": "Mozilla/5.0" } });
+    if (!r.ok) throw new Error(`news ${r.status}`);
+    const list = (await r.json()).filter((e) => e.country === "USD" && ["High", "Medium"].includes(e.impact)).map((e) => ({ title: e.title, impact: e.impact, forecast: e.forecast, previous: e.previous, t: new Date(e.date).getTime() })).filter((e) => Number.isFinite(e.t)).sort((x, y) => x.t - y.t);
+    await db.from("app_settings").upsert({ key: "news_cache", value: JSON.stringify({ t: Date.now(), list }) });
+    return list;
+  } catch (e) {
+    if (cached?.list) return cached.list; // use the older copy
+    throw e;
+  }
 }
 async function cmdNews(chatId, a) {
   if (!a.admin && !a.tier) return send(chatId, noPlan(a));
@@ -846,7 +854,11 @@ async function onDbEvent(ev) {
     }
     return;
   }
-  if (ev.event === "scan") { await autoScan().catch((e) => console.error("auto scan failed", e)); return refreshLive(); }
+  if (ev.event === "scan") {
+    await autoScan().catch((e) => console.error("auto scan failed", e));
+    if (new Date().getUTCMinutes() < 5) await newsWeek(55).catch((e) => console.error("news refresh failed", e));
+    return refreshLive();
+  }
   if (ev.event === "daily") {
     const { data } = await db.from("telegram_users").select("*").not("tier", "is", null);
     const soon = addDays(today(), 3), yesterday = addDays(today(), -1);
