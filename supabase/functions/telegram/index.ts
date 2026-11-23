@@ -329,7 +329,7 @@ function rejectionCandle(c, dir) {
 // min: score needed. step: every `step` hours without a signal of this kind, the score needed drops by 1 (down to floor),
 // so there is at least one signal a day. open: how many may run at once. cool: hours to wait after the last one.
 const AUTO = {
-  Scalping: { tf: "m5", ema: 20, look: 3, need: ["m15"], bonus: ["m5", "h1"], min: 4, floor: 2, step: 2, buf: 0.2, rr: 1.5, life: 3, cool: 0.5, max: 5, open: 1 },
+  Scalping: { tf: "m5", ema: 20, look: 3, need: ["m15"], bonus: ["m5", "h1"], min: 4, floor: 2, step: 2, buf: 0.2, rr: 1.5, life: 3, cool: 0.5, max: 5, open: 1, maxPips: 80 },
   Intraday: { tf: "m15", ema: 20, look: 3, need: ["h1"], bonus: ["m15", "h4"], min: 5, floor: 2, step: 3, buf: 0.2, rr: 2, life: 24, cool: 1, max: 3, open: 2 },
   Swing: { tf: "h1", ema: 50, look: 4, need: ["h4"], bonus: ["h1", "d1"], min: 6, floor: 2, step: 4, buf: 0.3, rr: 2, life: 72, cool: 4, max: 2, open: 2 },
 };
@@ -358,10 +358,16 @@ function findSetup(kind, d, price, drop = 0) {
     if (rejectionCandle(c, dir)) why.push("rejection candle");
     if (why.length < r.min - drop || why.length === trends) continue; // always at least one price pattern
     // SL beyond the nearest swing point (or the sweep wick), with a small buffer
-    const near = c.slice(-12);
-    const sl = dir > 0 ? Math.min(...near.map((x) => x.l)) - r.buf * a : Math.max(...near.map((x) => x.h)) + r.buf * a;
-    const risk = (price - sl) * dir;
-    if (!(risk >= 0.4 * a && risk <= 3 * a)) continue;
+    // Try the last 12, 6 then 3 candles, so the SL is as close as structure allows (and within maxPips if set)
+    const maxRisk = Math.min(3 * a, r.maxPips ? r.maxPips * pip(d.sym || "XAUUSD") : Infinity);
+    let sl = null, risk = 0;
+    for (const n of [12, 6, 3]) {
+      const near = c.slice(-n);
+      const s = dir > 0 ? Math.min(...near.map((x) => x.l)) - r.buf * a : Math.max(...near.map((x) => x.h)) + r.buf * a;
+      const rk = (price - s) * dir;
+      if (rk >= 0.4 * a && rk <= maxRisk) { sl = s; risk = rk; break; }
+    }
+    if (sl === null) continue;
     if (!best || why.length > best.score) best = { dir, entry: price, sl, tp: price + dir * r.rr * risk, score: why.length, note: `🤖 MEEGO AI · Confluence ${why.length}/9: ${why.join(" + ")} · RR 1:${r.rr}` };
   }
   return best;
@@ -416,7 +422,7 @@ async function autoScan() {
     const m15 = await candles(sym, "15min"), h1 = await candles(sym, "1h");
     const price = m1[m1.length - 1].c;
     const closed = (c) => c.slice(0, -1); // drop the candle that is still forming
-    const d = { m5: closed(group(m1, 5)), m15: closed(m15), h1: closed(h1), h4: closed(group(h1, 240)), d1: closed(group(h1, 1440)) };
+    const d = { sym, m5: closed(group(m1, 5)), m15: closed(m15), h1: closed(h1), h4: closed(group(h1, 240)), d1: closed(group(h1, 1440)) };
     d.trend = { m5: tfTrend(d.m5), m15: tfTrend(d.m15), h1: tfTrend(d.h1), h4: tfTrend(d.h4), d1: tfTrend(d.d1) };
     for (const kind of ["Swing", "Intraday", "Scalping"]) {
       const mine = all.filter((s) => s.kind === kind && s.sym === sym && s.auto);
