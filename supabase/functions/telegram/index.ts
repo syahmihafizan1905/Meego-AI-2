@@ -23,8 +23,14 @@ async function tg(method, body) {
   const r = await fetch(`https://api.telegram.org/bot${TOKEN}/${method}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
   return await r.json().catch(() => ({ ok: false }));
 }
-const MENU = { keyboard: [[{ text: "📈 Signal" }, { text: "⭐ Swing" }], [{ text: "🧭 Direction" }, { text: "📊 History" }], [{ text: "👤 My plan" }, { text: "❓ Help" }]], resize_keyboard: true };
-const ADMIN_MENU = { keyboard: [[{ text: "➕ Add customer" }, { text: "👥 Customers" }], [{ text: "📈 Signal" }, { text: "⭐ Swing" }], [{ text: "📊 History" }, { text: "❓ Help" }]], resize_keyboard: true };
+const MENU = { keyboard: [[{ text: "⚡ Scalping" }, { text: "📈 Intraday" }, { text: "⭐ Swing" }], [{ text: "🧭 Direction" }, { text: "📊 History" }], [{ text: "👤 My plan" }, { text: "❓ Help" }]], resize_keyboard: true };
+const ADMIN_MENU = { keyboard: [[{ text: "➕ Add customer" }, { text: "👥 Customers" }], [{ text: "⚡ Scalping" }, { text: "📈 Intraday" }, { text: "⭐ Swing" }], [{ text: "📊 History" }, { text: "❓ Help" }]], resize_keyboard: true };
+const KIND = {
+  Scalping: { title: "⚡ DAILY SIGNAL SCALPING", fresh: "📢 NEW SCALPING SIGNAL", label: "Scalping", none: "No scalping setup running right now. You'll get a message here as soon as one is posted." },
+  Intraday: { title: "📈 DAILY SIGNAL INTRADAY", fresh: "📢 NEW DAILY SIGNAL INTRADAY", label: "Daily Intraday", none: "No intraday setup running right now. You'll get a message here as soon as one is posted." },
+  Swing: { title: "⭐ PRIORITY SIGNAL SWING", fresh: "📢 NEW PRIORITY SIGNAL SWING", label: "Priority Swing", none: "No Priority Swing right now. It's posted only when a high-quality setup appears." },
+};
+const kindOf = (k) => KIND[k] ?? KIND.Intraday;
 const send = (chat_id, text, extra = {}) => tg("sendMessage", { chat_id, text, parse_mode: "HTML", disable_web_page_preview: true, ...extra });
 const kb = (a) => ({ reply_markup: a.admin ? ADMIN_MENU : MENU });
 let BOT_NAME = "";
@@ -98,19 +104,50 @@ async function signalsOf(kind) {
 }
 
 /* ---------- member commands ---------- */
+// "MEEGO AI is scanning" progress message, edited in place (about 3 seconds)
+const bar = (n) => "▰".repeat(n) + "▱".repeat(10 - n);
+async function scanAnimation(chatId, kind) {
+  const head = `🤖 <b>MEEGO AI</b> · ${kindOf(kind).label} scan`;
+  const frames = [
+    `🔍 Connecting to live market data…
+<code>${bar(1)}</code> 10%`,
+    `📊 Reading XAUUSD · EURUSD · GBPUSD · USDJPY…
+<code>${bar(4)}</code> 40%`,
+    `🧠 Checking trend, structure and momentum…
+<code>${bar(7)}</code> 70%`,
+    `🎯 Matching ${kindOf(kind).label.toLowerCase()} setups…
+<code>${bar(9)}</code> 90%`,
+    `✅ Scan complete
+<code>${bar(10)}</code> 100%`,
+  ];
+  const first = await send(chatId, `${head}
+
+${frames[0]}`);
+  const id = first?.result?.message_id;
+  if (!id) return;
+  for (const f of frames.slice(1)) {
+    await new Promise((r) => setTimeout(r, 750));
+    await tg("editMessageText", { chat_id: chatId, message_id: id, text: `${head}
+
+${f}`, parse_mode: "HTML" });
+  }
+}
 async function cmdSignal(chatId, a, kind) {
   if (!canSee(a, kind)) {
     if (kind === "Swing" && a.tier) return send(chatId, "⭐ Priority Swing is for the <b>Ultimate</b> plan. Contact the admin to upgrade.");
     return send(chatId, noPlan(a));
   }
-  const list = (await signalsOf(kind)).filter((s) => s.status === "running").sort((x, y) => y.time - x.time);
-  if (!list.length) return send(chatId, kind === "Swing" ? "No Priority Swing right now. It's posted only when a high-quality setup appears." : "No intraday signal running right now. You'll get a message here when one is posted.");
-  for (const s of list.slice(0, 3)) await send(chatId, signalText(s, kind === "Swing" ? "⭐ PRIORITY SIGNAL SWING" : "📈 DAILY SIGNAL INTRADAY"));
+  const [list] = await Promise.all([
+    signalsOf(kind).then((l) => l.filter((s) => s.status === "running").sort((x, y) => y.time - x.time)),
+    scanAnimation(chatId, kind),
+  ]);
+  if (!list.length) return send(chatId, kindOf(kind).none);
+  for (const s of list.slice(0, 3)) await send(chatId, signalText(s, kindOf(kind).title));
 }
 async function cmdHistory(chatId, a) {
   if (!a.admin && !a.tier) return send(chatId, noPlan(a));
   const from = new Date(); from.setUTCDate(1); from.setUTCMonth(from.getUTCMonth() - 1);
-  const kinds = canSee(a, "Swing") ? ["Swing", "Intraday"] : ["Intraday"];
+  const kinds = canSee(a, "Swing") ? ["Swing", "Intraday", "Scalping"] : ["Intraday", "Scalping"];
   const all = [];
   for (const k of kinds) all.push(...(await signalsOf(k)));
   const closed = all.filter((s) => s.time >= from.getTime() && (s.status === "tp" || s.status === "sl")).sort((x, y) => y.time - x.time);
@@ -243,7 +280,7 @@ async function grant(u, tier, days) {
   const base = u.tier === tier && u.plan_end && u.plan_end >= today() ? u.plan_end : today();
   const end = addDays(base, days);
   await db.from("telegram_users").update({ tier, plan_end: end }).eq("chat_id", u.chat_id);
-  await send(u.chat_id, `🎉 Your <b>${tier}</b> plan is active until <b>${end}</b>.\n\nYou'll get new signals here automatically. Tap 📈 Signal to see what's running.`, { reply_markup: MENU });
+  await send(u.chat_id, `🎉 Your <b>${tier}</b> plan is active until <b>${end}</b>.\n\nYou'll get new signals here automatically. Tap ⚡ Scalping, 📈 Intraday or ⭐ Swing to see what's running.`, { reply_markup: MENU });
   return end;
 }
 // Admin picked customer + plan + days. If the customer hasn't pressed START yet, save it and it turns on when they do.
@@ -326,6 +363,7 @@ async function cmdAdmin(chatId, a, text) {
       "",
       "<b>Signals</b>",
       "<code>/post BUY XAUUSD 4040 4080 3990</code> intraday signal (entry, TP, SL)",
+      "<code>/post BUY XAUUSD 4040 4048 4034 scalp</code> scalping signal",
       "<code>/post SELL XAUUSD 4129 4119 4140 swing Sell area, wait for price</code> swing (Ultimate only) with a note",
       "<code>/close tp</code> · <code>/close sl</code> · <code>/close be</code> closes the latest running signal (add a pair to choose: <code>/close tp XAUUSD</code>)",
       "",
@@ -362,12 +400,13 @@ async function cmdAdmin(chatId, a, text) {
   if (cmd === "/post") {
     const side = (parts[1] || "").toUpperCase(), sym = (parts[2] || "").toUpperCase();
     const entry = Number(parts[3]), tp = Number(parts[4]), sl = Number(parts[5]);
-    const swing = (parts[6] || "").toLowerCase() === "swing";
-    const note = parts.slice(swing ? 7 : 6).join(" ");
+    const tag = (parts[6] || "").toLowerCase();
+    const kind = tag === "swing" ? "Swing" : /^scalp/.test(tag) ? "Scalping" : "Intraday";
+    const note = parts.slice(kind === "Intraday" ? 6 : 7).join(" ");
     const dir = side === "BUY" ? 1 : side === "SELL" ? -1 : 0;
-    if (!dir || !/^[A-Z0-9]{3,10}$/.test(sym) || ![entry, tp, sl].every(Number.isFinite)) return send(chatId, "Format: <code>/post BUY XAUUSD entry tp sl [swing] [note]</code>");
+    if (!dir || !/^[A-Z0-9]{3,10}$/.test(sym) || ![entry, tp, sl].every(Number.isFinite)) return send(chatId, "Format: <code>/post BUY XAUUSD entry tp sl [scalp|swing] [note]</code>");
     if (dir > 0 ? !(tp > entry && sl < entry) : !(tp < entry && sl > entry)) return send(chatId, dir > 0 ? "For BUY, TP must be above entry and SL below it." : "For SELL, TP must be below entry and SL above it.");
-    const { error } = await db.from("signals").insert({ id: crypto.randomUUID(), data: { kind: swing ? "Swing" : "Intraday", sym, dir, entry, tp, sl, note, status: "running", time: Date.now(), closedAt: null } });
+    const { error } = await db.from("signals").insert({ id: crypto.randomUUID(), data: { kind, sym, dir, entry, tp, sl, note, status: "running", time: Date.now(), closedAt: null } });
     return send(chatId, error ? "Couldn't save the signal: " + esc(error.message) : "✅ Signal posted. Members are being notified.");
   }
   if (cmd === "/close") {
@@ -410,12 +449,12 @@ async function onDbEvent(ev) {
     if (!s || !s.sym) return;
     const chats = await audience(s.kind);
     if (ev.op === "INSERT" && s.status === "running") {
-      return broadcast(chats, signalText(s, s.kind === "Swing" ? "📢 NEW PRIORITY SIGNAL SWING" : "📢 NEW DAILY SIGNAL INTRADAY"));
+      return broadcast(chats, signalText(s, kindOf(s.kind).fresh));
     }
     if (ev.op === "UPDATE" && old && old.status !== s.status && ["tp", "sl", "be"].includes(s.status)) {
       const p = s.status === "tp" ? pipsBetween(s.tp, s.entry, s.sym) : s.status === "sl" ? -pipsBetween(s.entry, s.sl, s.sym) : 0;
       const head = s.status === "tp" ? "✅ <b>HIT TP</b>" : s.status === "sl" ? "❌ <b>HIT SL</b>" : "➖ <b>BREAKEVEN</b>";
-      return broadcast(chats, `${head} · ${s.dir > 0 ? "BUY" : "SELL"} <b>${esc(s.sym)}</b>\n${s.kind === "Swing" ? "Priority Swing" : "Daily Intraday"} · <b>${p > 0 ? "+" : ""}${p} pips</b>`);
+      return broadcast(chats, `${head} · ${s.dir > 0 ? "BUY" : "SELL"} <b>${esc(s.sym)}</b>\n${kindOf(s.kind).label} · <b>${p > 0 ? "+" : ""}${p} pips</b>`);
     }
     return;
   }
@@ -487,14 +526,16 @@ async function onMessage(msg) {
   }
   if (msg.photo && msg.photo.length) return scanPhoto(chatId, a, msg);
   if (/^\/(admin|activate|renew|remove|customers|post|close|announce|members)\b/.test(t)) return cmdAdmin(chatId, a, text);
-  if (t.startsWith("/signal") || (t.includes("signal") && !t.includes("swing"))) return cmdSignal(chatId, a, "Intraday");
+  if (t.startsWith("/scalp") || t.includes("scalp")) return cmdSignal(chatId, a, "Scalping");
+  if (t.startsWith("/intraday") || t.startsWith("/signal") || t.includes("intraday") || (t.includes("signal") && !t.includes("swing"))) return cmdSignal(chatId, a, "Intraday");
   if (t.startsWith("/swing") || t.includes("swing")) return cmdSignal(chatId, a, "Swing");
   if (t.startsWith("/direction") || t.includes("direction")) return cmdDirection(chatId, a);
   if (t.startsWith("/history") || t.includes("history")) return cmdHistory(chatId, a);
   if (t.startsWith("/plan") || t.includes("my plan")) return cmdPlan(chatId, a);
   return send(chatId, [
     "<b>MEEGO AI</b>",
-    "📈 /signal latest intraday signal",
+    "⚡ /scalping scalping signals",
+    "📈 /intraday intraday signals",
     "⭐ /swing Priority Swing (Ultimate)",
     "🧭 /direction today's direction",
     "📊 /history wins and pips",
@@ -513,7 +554,8 @@ Deno.serve(async (req) => {
     const me = await tg("getMe", {});
     const hook = await tg("setWebhook", { url: cfg.telegram_url, secret_token: secret, allowed_updates: ["message", "callback_query"], drop_pending_updates: true });
     await tg("setMyCommands", { commands: [
-      { command: "signal", description: "Latest intraday signal" },
+      { command: "scalping", description: "Scalping signals" },
+      { command: "intraday", description: "Intraday signals" },
       { command: "swing", description: "Priority Swing (Ultimate)" },
       { command: "direction", description: "Today's direction" },
       { command: "history", description: "Wins and pips" },
