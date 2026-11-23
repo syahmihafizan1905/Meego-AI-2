@@ -277,14 +277,22 @@ async function cmdNews(chatId, a) {
   const lines = ["📰 <b>MEEGO AI · News (USD)</b>", "Malaysia time · 🔴 high impact · 🟠 medium"];
   const next = shown.find((e) => e.impact === "High" && e.t > Date.now());
   if (next && next.t - Date.now() < 3 * 3600000) lines.push("", `⚠️ Next 🔴 news: <b>${esc(next.title)}</b> in <b>${Math.max(1, Math.round((next.t - Date.now()) / 60000))} min</b>`);
+  const h1 = await candles("XAUUSD", "1h").catch(() => []);
+  const rows = shown.slice(0, 30);
   let day = "";
-  for (const e of shown.slice(0, 30)) {
+  for (const [i, e] of rows.entries()) {
     const d = my(e.t), dayName = d.toLocaleDateString("en-GB", { weekday: "short", day: "numeric", month: "short", timeZone: "UTC" });
     if (dayName !== day) { lines.push("", `<b>${dayName}</b>`); day = dayName; }
     const extra = [e.forecast && `F ${esc(e.forecast)}`, e.previous && `P ${esc(e.previous)}`].filter(Boolean).join(" · ");
     lines.push(`${e.t < Date.now() ? "✔️" : e.impact === "High" ? "🔴" : "🟠"} ${d.toISOString().slice(11, 16)} ${esc(e.title)}${extra ? ` · ${extra}` : ""}`);
+    // after the last event at this time: MEEGO AI's early call for the 🔴 news
+    const highs = shown.filter((x) => x.t === e.t && x.impact === "High");
+    if (e.t > Date.now() && highs.length && rows[i + 1]?.t !== e.t) {
+      const p = predictNews(highs, h1);
+      lines.push(`   🔮 Early call: ${callTxt(p.dir)}${p.dir ? ` · ${p.conf.split(" (")[0]}` : ""}`);
+    }
   }
-  lines.push("", "F = forecast · P = previous", "⚠️ Avoid new entries 30 min before and after 🔴 news.");
+  lines.push("", "F = forecast · P = previous", "🔮 Early call can change. Final call + signal arrive ~2 min before each 🔴 news.", "⚠️ Spreads widen at news time: use a small lot.");
   return send(chatId, lines.join("\n"));
 }
 async function cmdHistory(chatId, a) {
@@ -522,18 +530,8 @@ async function watchSignals(list) {
 const numOf = (v) => { const n = parseFloat(String(v ?? "").replace(/[%KMBT,]/gi, "")); return Number.isFinite(n) ? n : null; };
 const usdInverse = (title) => /unemploy|jobless|claims/i.test(title); // higher number = weaker USD
 const NEWS_RR = 2;
-async function newsAlert() {
-  const now = Date.now();
-  await newsRecovery().catch((e) => console.error("news recovery failed", e));
-  if (!marketOpen(new Date(now), "XAUUSD")) return;
-  const list = await newsWeek(100000).catch(() => []);
-  const due = list.filter((e) => e.impact === "High" && e.t - now > 0 && e.t - now <= 150000);
-  if (!due.length) return;
-  const t0 = due[0].t, evs = due.filter((e) => e.t === t0);
-  const cfg = await settings();
-  if (Number(cfg.news_alerted || 0) >= t0) return;
-  await db.from("app_settings").upsert({ key: "news_alerted", value: String(t0) });
-  // Prediction: forecast vs previous tells which way the number is expected to move
+// Prediction for the 🔴 events at one time: forecast vs previous decides USD; the H1 chart trend breaks a tie
+function predictNews(evs, h1) {
   let usd = 0;
   const pred = evs.map((e) => {
     const f = numOf(e.forecast), pr = numOf(e.previous);
@@ -542,18 +540,56 @@ async function newsAlert() {
     usd += good ? 1 : -1;
     return `• ${esc(e.title)}: likely <b>${up ? "HIGHER" : "LOWER"}</b> (F ${esc(e.forecast)} vs P ${esc(e.previous)}) → USD ${good ? "stronger" : "weaker"}`;
   });
+  const chart = tfTrend((h1 || []).slice(0, -1)) || 0;
+  const dir = usd ? -Math.sign(usd) : chart; // strong USD = gold down
+  const conf = usd && chart === dir ? "Strong (news + chart agree)" : usd ? "Medium (news only)" : chart ? "Low (chart trend only)" : "None";
+  return { pred, chart, dir, conf, usd };
+}
+const callTxt = (d) => (d > 0 ? "🟢 <b>BUY XAUUSD</b>" : d < 0 ? "🔴 <b>SELL XAUUSD</b>" : "⚪ <b>NO TRADE</b> (wait for the spike)");
+const biasTxt = (d) => (d > 0 ? "🟢 BULLISH" : d < 0 ? "🔴 BEARISH" : "⚪ NEUTRAL");
+async function newsAlert() {
+  const now = Date.now();
+  await newsRecovery().catch((e) => console.error("news recovery failed", e));
+  if (!marketOpen(new Date(now), "XAUUSD")) return;
+  const list = await newsWeek(100000).catch(() => []);
+  const high = list.filter((e) => e.impact === "High" && e.t > now);
+  if (!high.length) return;
+  const cfg = await settings();
+  const t0 = high[0].t, evs = high.filter((e) => e.t === t0), left = t0 - now;
+  let early = null;
+  try { early = cfg.news_early ? JSON.parse(cfg.news_early) : null; } catch (_) { early = null; }
+  // 1) Early prediction, about an hour before
+  if (left > 150000 && left <= 60 * 60000 && early?.t !== t0) {
+    const p = predictNews(evs, await candles("XAUUSD", "1h"));
+    await db.from("app_settings").upsert({ key: "news_early", value: JSON.stringify({ t: t0, dir: p.dir }) });
+    await broadcast(await audience("Scalping"), [
+      `🔮 <b>EARLY PREDICTION</b> · 🔴 news at ${myTime(t0)} (Malaysia), in ${Math.round(left / 60000)} min`,
+      "",
+      ...p.pred,
+      "",
+      `MEEGO AI call: ${callTxt(p.dir)}`,
+      `Chart trend H1: ${biasTxt(p.chart)} · Confidence: <b>${p.conf}</b>`,
+      "",
+      "Final call and the news signal come about 2 minutes before the news. If MEEGO AI changes its mind you'll see 🔄 <b>CHANGED</b>.",
+      "<i>A prediction is not a guarantee.</i>",
+    ].join("\n"));
+    return;
+  }
+  // 2) Final call + news signal, about 2 minutes before
+  if (left > 150000 || Number(cfg.news_alerted || 0) >= t0) return;
+  await db.from("app_settings").upsert({ key: "news_alerted", value: String(t0) });
   const [m1, m15, h1] = [await candles("XAUUSD", "1min"), await candles("XAUUSD", "15min"), await candles("XAUUSD", "1h")];
   const price = m1[m1.length - 1]?.c, a = atr(m15.slice(0, -1));
-  const chart = tfTrend(h1.slice(0, -1)) || 0;
-  const dir = usd ? -Math.sign(usd) : chart; // strong USD = gold down
-  const conf = usd && chart === dir ? "Strong (news + chart agree)" : usd ? "Medium (news only, chart disagrees or flat)" : "Low (chart trend only)";
-  const biasTxt = (d) => (d > 0 ? "🟢 BULLISH" : d < 0 ? "🔴 BEARISH" : "⚪ NEUTRAL");
+  const { pred, chart, dir, conf } = predictNews(evs, h1);
+  const change = early?.t !== t0 ? "" : early.dir === dir ? "✅ Same as the early prediction" : `🔄 <b>CHANGED</b>: early call was ${callTxt(early.dir)}, now ${callTxt(dir)}`;
   const head = [
-    `⚠️ <b>NEWS IN ${Math.max(1, Math.round((t0 - now) / 60000))} MIN</b> · 🔴 ${myTime(t0)} (Malaysia)`,
+    `⚠️ <b>NEWS IN ${Math.max(1, Math.round(left / 60000))} MIN</b> · 🔴 ${myTime(t0)} (Malaysia)`,
     "",
-    "🔮 <b>MEEGO AI prediction</b>",
+    "🔮 <b>MEEGO AI final call</b>",
     ...pred,
     "",
+    `Call: ${callTxt(dir)}`,
+    ...(change ? [change] : []),
     `Bias: XAUUSD <b>${biasTxt(dir)}</b> · BTCUSD <b>${biasTxt(dir)}</b>`,
     `Chart trend H1: ${biasTxt(chart)} · Confidence: <b>${conf}</b>`,
     "",
