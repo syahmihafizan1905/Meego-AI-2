@@ -73,10 +73,11 @@ async function account(chatId) {
   return { ...u, chatId, admin: !!u.is_admin, ...planOf(u) };
 }
 const canSee = (a, kind) => a.admin || (!!a.tier && (kind !== "Swing" || a.tier === "Ultimate"));
-// Auto signals of these kinds go to the admin only while they are being tested (news signals and /post are not affected).
+// Auto signals of these kinds go to the admin only while they are being tested (news signals, the 9:59 AM setup and /post are not affected).
 // To send them to customers again, take the kind out of this list.
-const TRIAL = ["Scalping"];
-const scalpOff = TRIAL.includes("Scalping");
+const TRIAL = ["Scalping", "Intraday", "Swing"];
+const off = (k) => TRIAL.includes(k);
+const trialText = TRIAL.join(", ").replace(/, ([^,]*)$/, " and $1");
 const canSeeSignal = (a, s) => canSee(a, s.kind) && (a.admin || !s.trial);
 const noPlan = (a) => `You don't have an active plan yet.\n\nSend this to the admin to get activated:\n<b>MEEGO ID: <code>${a.chatId}</code></b>`;
 const privateNote = (a) => `🔒 <b>MEEGO AI is a private service.</b>\n\nIf you've bought a plan, send this to the admin:\n<b>MEEGO ID: <code>${a.chatId}</code></b>`;
@@ -250,7 +251,7 @@ async function cmdSignal(chatId, a, kind) {
     signalsOf(kind).then((l) => l.filter((s) => s.status === "running" && canSeeSignal(a, s)).sort((x, y) => y.time - x.time)),
     scanAnimation(chatId, kind),
   ]);
-  if (!list.length) return send(chatId, TRIAL.includes(kind) && !a.admin ? `No ${kind.toLowerCase()} signal right now. Auto ${kind.toLowerCase()} signals are paused while we re-test the setup. News signals still come here.` : kindOf(kind).none);
+  if (!list.length) return send(chatId, TRIAL.includes(kind) && !a.admin ? `No ${kind.toLowerCase()} signal right now. Auto ${kind.toLowerCase()} signals are paused while we re-test the setup.${kind === "Scalping" ? " News signals still come here." : kind === "Intraday" ? " The 9:59 AM setup still comes here." : ""}` : kindOf(kind).none);
   const prices = {};
   for (const s of list.slice(0, 3)) await sendLive(chatId, s, kindOf(kind).title, await priceOf(s.sym, prices));
 }
@@ -1310,9 +1311,9 @@ async function showPlans(chatId, intro) {
     "",
     ...TIERS.map((t) => `${t === "Ultimate" ? "⭐" : "•"} <b>${t}</b> · RM${pr[t].rm} for ${pr[t].days} days`),
     "",
-    `All plans: ${scalpOff ? "" : "⚡ Scalping, "}📈 Intraday, 📰 News signals, 🧭 Direction, 🖼 Chart Scanner, 📊 History.`,
-    "⭐ <b>Priority Swing</b> signals are for <b>Ultimate</b> only.",
-    ...(scalpOff ? ["🧪 Auto Scalping signals are being re-tested, so they're not included right now."] : []),
+    `All plans: ${off("Scalping") ? "" : "⚡ Scalping, "}${off("Intraday") ? "" : "📈 Intraday, "}📰 News signals, 🕘 9:59 AM setup, 🧭 Direction, 🖼 Chart Scanner, 📊 History.`,
+    ...(off("Swing") ? [] : ["⭐ <b>Priority Swing</b> signals are for <b>Ultimate</b> only."]),
+    ...(TRIAL.length ? [`🧪 Auto ${trialText} signals are being re-tested, so they're not included right now.`] : []),
     "",
     "Tap a plan to pay by bank transfer:",
   ];
@@ -1544,7 +1545,7 @@ async function grant(u, tier, days) {
   const base = u.tier === tier && u.plan_end && u.plan_end >= today() ? u.plan_end : today();
   const end = addDays(base, days);
   await db.from("telegram_users").update({ tier, plan_end: end }).eq("chat_id", u.chat_id);
-  await welcome(u.chat_id, `🎉 Welcome to <b>MEEGO AI</b>! Your <b>${tier}</b> plan is active until <b>${end}</b>.\n\nYou'll get new signals here automatically. Tap ${scalpOff ? "" : "⚡ Scalping, "}📈 Intraday or ⭐ Swing to see what's running.${scalpOff ? " Auto Scalping signals are being re-tested and aren't sent right now." : ""}`, { reply_markup: MENU });
+  await welcome(u.chat_id, `🎉 Welcome to <b>MEEGO AI</b>! Your <b>${tier}</b> plan is active until <b>${end}</b>.\n\nYou'll get new signals here automatically. Tap ⚡ Scalping, 📈 Intraday or ⭐ Swing to see what's running.${TRIAL.length ? ` Auto ${trialText} signals are being re-tested and aren't sent right now; news signals and the 9:59 AM setup are.` : ""}`, { reply_markup: MENU });
   return end;
 }
 // Admin picked customer + plan + days. If the customer hasn't pressed START yet, save it and it turns on when they do.
@@ -1905,9 +1906,9 @@ async function onMessage(msg) {
   if (t.startsWith("/plan") || t.includes("my plan")) return cmdPlan(chatId, a);
   return send(chatId, [
     "<b>MEEGO AI</b>",
-    scalpOff && !a.admin ? "⚡ /scalping (auto signals paused, being re-tested)" : "⚡ /scalping scalping signals",
-    "📈 /intraday intraday signals",
-    "⭐ /swing Priority Swing (Ultimate)",
+    off("Scalping") && !a.admin ? "⚡ /scalping (auto signals paused, being re-tested)" : "⚡ /scalping scalping signals",
+    off("Intraday") && !a.admin ? "📈 /intraday (auto signals paused, being re-tested)" : "📈 /intraday intraday signals",
+    off("Swing") && !a.admin ? "⭐ /swing (auto signals paused, being re-tested)" : "⭐ /swing Priority Swing (Ultimate)",
     "🧭 /direction today's direction",
     "📊 /history wins and pips",
     "📰 /news this week's important USD news",
@@ -1931,9 +1932,9 @@ Deno.serve(async (req) => {
     const me = await tg("getMe", {});
     const hook = await tg("setWebhook", { url: cfg.telegram_url, secret_token: secret, allowed_updates: ["message", "callback_query"], drop_pending_updates: true });
     await tg("setMyCommands", { commands: [
-      { command: "scalping", description: scalpOff ? "Scalping (being re-tested)" : "Scalping signals" },
-      { command: "intraday", description: "Intraday signals" },
-      { command: "swing", description: "Priority Swing (Ultimate)" },
+      { command: "scalping", description: off("Scalping") ? "Scalping (being re-tested)" : "Scalping signals" },
+      { command: "intraday", description: off("Intraday") ? "Intraday (being re-tested)" : "Intraday signals" },
+      { command: "swing", description: off("Swing") ? "Swing (being re-tested)" : "Priority Swing (Ultimate)" },
       { command: "direction", description: "Today's direction" },
       { command: "scanner", description: "AI chart scanner" },
       { command: "history", description: "Wins and pips" },
