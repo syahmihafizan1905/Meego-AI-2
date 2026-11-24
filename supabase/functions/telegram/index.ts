@@ -76,6 +76,7 @@ const canSee = (a, kind) => a.admin || (!!a.tier && (kind !== "Swing" || a.tier 
 // Auto signals of these kinds go to the admin only while they are being tested (news signals and /post are not affected).
 // To send them to customers again, take the kind out of this list.
 const TRIAL = ["Scalping"];
+const scalpOff = TRIAL.includes("Scalping");
 const canSeeSignal = (a, s) => canSee(a, s.kind) && (a.admin || !s.trial);
 const noPlan = (a) => `You don't have an active plan yet.\n\nSend this to the admin to get activated:\n<b>MEEGO ID: <code>${a.chatId}</code></b>`;
 const privateNote = (a) => `🔒 <b>MEEGO AI is a private service.</b>\n\nIf you've bought a plan, send this to the admin:\n<b>MEEGO ID: <code>${a.chatId}</code></b>`;
@@ -1197,8 +1198,9 @@ async function showPlans(chatId, intro) {
     "",
     ...TIERS.map((t) => `${t === "Ultimate" ? "⭐" : "•"} <b>${t}</b> · RM${pr[t].rm} for ${pr[t].days} days`),
     "",
-    "All plans: ⚡ Scalping, 📈 Intraday, 📰 News signals, 🧭 Direction, 🖼 Chart Scanner, 📊 History.",
+    `All plans: ${scalpOff ? "" : "⚡ Scalping, "}📈 Intraday, 📰 News signals, 🧭 Direction, 🖼 Chart Scanner, 📊 History.`,
     "⭐ <b>Priority Swing</b> signals are for <b>Ultimate</b> only.",
+    ...(scalpOff ? ["🧪 Auto Scalping signals are being re-tested, so they're not included right now."] : []),
     "",
     "Tap a plan to pay by bank transfer:",
   ];
@@ -1430,7 +1432,7 @@ async function grant(u, tier, days) {
   const base = u.tier === tier && u.plan_end && u.plan_end >= today() ? u.plan_end : today();
   const end = addDays(base, days);
   await db.from("telegram_users").update({ tier, plan_end: end }).eq("chat_id", u.chat_id);
-  await welcome(u.chat_id, `🎉 Welcome to <b>MEEGO AI</b>! Your <b>${tier}</b> plan is active until <b>${end}</b>.\n\nYou'll get new signals here automatically. Tap ⚡ Scalping, 📈 Intraday or ⭐ Swing to see what's running.`, { reply_markup: MENU });
+  await welcome(u.chat_id, `🎉 Welcome to <b>MEEGO AI</b>! Your <b>${tier}</b> plan is active until <b>${end}</b>.\n\nYou'll get new signals here automatically. Tap ${scalpOff ? "" : "⚡ Scalping, "}📈 Intraday or ⭐ Swing to see what's running.${scalpOff ? " Auto Scalping signals are being re-tested and aren't sent right now." : ""}`, { reply_markup: MENU });
   return end;
 }
 // Admin picked customer + plan + days. If the customer hasn't pressed START yet, save it and it turns on when they do.
@@ -1791,7 +1793,7 @@ async function onMessage(msg) {
   if (t.startsWith("/plan") || t.includes("my plan")) return cmdPlan(chatId, a);
   return send(chatId, [
     "<b>MEEGO AI</b>",
-    "⚡ /scalping scalping signals",
+    scalpOff && !a.admin ? "⚡ /scalping (auto signals paused, being re-tested)" : "⚡ /scalping scalping signals",
     "📈 /intraday intraday signals",
     "⭐ /swing Priority Swing (Ultimate)",
     "🧭 /direction today's direction",
@@ -1817,7 +1819,7 @@ Deno.serve(async (req) => {
     const me = await tg("getMe", {});
     const hook = await tg("setWebhook", { url: cfg.telegram_url, secret_token: secret, allowed_updates: ["message", "callback_query"], drop_pending_updates: true });
     await tg("setMyCommands", { commands: [
-      { command: "scalping", description: "Scalping signals" },
+      { command: "scalping", description: scalpOff ? "Scalping (being re-tested)" : "Scalping signals" },
       { command: "intraday", description: "Intraday signals" },
       { command: "swing", description: "Priority Swing (Ultimate)" },
       { command: "direction", description: "Today's direction" },
