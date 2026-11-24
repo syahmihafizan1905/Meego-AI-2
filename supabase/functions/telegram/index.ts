@@ -584,7 +584,7 @@ const SETUP_RULE = { Scalping: { zones: 1, snrHold: true }, Intraday: { zones: 2
 // min: score needed. step: every `step` hours without a signal of this kind, the score needed drops by 1 (down to floor),
 // so there is at least one signal a day. open: how many may run at once. cool: hours to wait after the last one.
 const AUTO = {
-  Scalping: { tf: "m5", ema: 20, look: 3, need: ["m15"], bonus: ["m5", "h1"], min: 4, floor: 2, step: 2, buf: 0.2, rr: 1.5, life: 3, cool: 0.5, max: 5, open: 1, maxPips: 80 },
+  Scalping: { tf: "m5", ema: 20, look: 3, need: ["m15"], bonus: ["m5", "h1"], min: 4, floor: 2, step: 2, buf: 0.2, rr: 1.5, life: 3, cool: 0.5, max: 5, open: 1, maxPips: 100 },
   Intraday: { tf: "m15", ema: 20, look: 3, need: ["h1"], bonus: ["m15", "h4"], min: 5, floor: 2, step: 3, buf: 0.2, rr: 2, life: 24, cool: 1, max: 3, open: 2 },
   Swing: { tf: "h1", ema: 50, look: 4, need: ["h4"], bonus: ["h1", "d1"], min: 6, floor: 2, step: 4, buf: 0.3, rr: 2, life: 72, cool: 4, max: 2, open: 2 },
 };
@@ -1057,7 +1057,7 @@ async function nineSetup(now = Date.now()) {
 // To go back to the earlier setups (intradaySetup, swingSetup, findSetup), set SND to false.
 const SND = true;
 const KX = {
-  Scalping: { st: 60, zt: 15, ct: 5, min: 20, max: 80, life: 3, cool: 0.5, day: 5 }, // enters on the zone touch, see touchSetup
+  Scalping: { st: 60, zt: 15, ct: 5, min: 20, max: 100, life: 3, cool: 0.5, day: 5 }, // enters on the zone touch, see touchSetup
   Intraday: { st: 60, zt: 15, ct: 5, min: 30, max: 200, life: 24, cool: 1, day: 3 },
   Swing: { st: 240, zt: 60, ct: 60, min: 60, max: 600, life: 120, cool: 4, day: 2 },
 };
@@ -1152,7 +1152,7 @@ function sndSetup(kind, G, price, used) {
     note: `🤖 MEEGO AI · ${s.dir > 0 ? "Demand" : "Supply"} zone ${tf(k.zt)} ${s.z.bot.toFixed(2)} - ${s.z.top.toFixed(2)} · ${s.opt.join(" + ")}` };
 }
 // Scalping: price comes into a strong, fresh M15 zone (price left it by 2x ATR or more) -> signal at once, no confirmation candle.
-// 2 months of 5-min gold, 4 pips spread, this scanner: stops up to 80 pips 93-97 signals -5.1R to -7.1R, up to 120 pips 110-114 signals +1.8R to +6.7R. M5 zones lost 35R.
+// 2 months of 5-min gold, 4 pips spread, this scanner: stops up to 80 pips 93-97 signals -5.1R to -7.1R, up to 100 pips (in use) 101-106 signals +1.3R to -3.1R, up to 120 pips 110-114 signals +1.8R to +6.7R. M5 zones lost 35R.
 const TOUCH = { imp: 2, fresh: 2, over: 0.1, near: 1 };
 function touchZones(G, price, used) { // strong zones close to price
   const k = KX.Scalping, Z = G(k.zt), a = atr(Z), strong = smStrong(G(k.st)), out = [];
