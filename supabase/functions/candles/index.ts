@@ -29,7 +29,20 @@ Deno.serve(async (req) => {
   const symbol = u.searchParams.get("symbol") ?? "";
   const interval = u.searchParams.get("interval") ?? "15min";
   const prov = toProvider(symbol);
-  if (!prov || !TTL[interval]) return json({ error: "Unknown symbol or interval." }, 400);
+  if (!prov || (!TTL[interval] && interval !== "price")) return json({ error: "Unknown symbol or interval." }, 400);
+  // the current price (candles are only complete ones, 1-2 minutes late). Server only, so nobody else can use up the daily calls
+  if (interval === "price") {
+    if (req.headers.get("Authorization") !== `Bearer ${Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")}`) return json({ error: "Not allowed." }, 403);
+    const apiKey = Deno.env.get("TWELVEDATA_API_KEY");
+    if (!apiKey) return json({ error: "Server price key is missing." }, 500);
+    try {
+      const r = await fetch(`https://api.twelvedata.com/price?symbol=${encodeURIComponent(prov)}&apikey=${apiKey}`);
+      const j = await r.json(), price = Number(j.price);
+      return Number.isFinite(price) && price > 0 ? json({ price, at: Date.now() }) : json({ error: "No price." }, 502);
+    } catch {
+      return json({ error: "Couldn't reach the price provider." }, 502);
+    }
+  }
 
   const db = createClient(Deno.env.get("SUPABASE_URL")!, Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!);
   const key = `${prov}|${interval}`;

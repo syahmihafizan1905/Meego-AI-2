@@ -390,6 +390,24 @@ async function candles(sym, interval = "1h") {
   const list = Array.isArray(j.candles) ? j.candles : [];
   return /^XAU/.test(sym) && interval !== "1min" ? list.filter((x) => goldOpen(x.t)) : list; // drop weekend / daily-break candles
 }
+// The current price. Candles only include finished minutes, so their last close is 1-2 minutes old (plus up to 3 minutes of cache):
+// on 24 Nov 2026 a SELL went out 50 pips below the market, 3 pips from its stop. Every new signal is checked against this first.
+async function livePrice(sym) {
+  const r = await fetch(`${SB_URL}/functions/v1/${CANDLES_FN}?symbol=${sym}&interval=price`, { headers: { Authorization: `Bearer ${SB_SERVICE}`, apikey: SB_SERVICE } });
+  const j = await r.json().catch(() => ({}));
+  return r.ok && Number.isFinite(j.price) && j.price > 0 ? j.price : null;
+}
+const MAX_SLIP = 0.2; // skip the signal when price has moved more than this part of the stop distance since the setup
+// Re-prices setup s at the market; false = too late (or no price), so don't send it
+async function reprice(s, sym) {
+  const live = await livePrice(sym).catch(() => null), risk = Math.abs(s.entry - s.sl);
+  if (live === null || !risk || (live - s.sl) * s.dir <= 0 || Math.abs(live - s.entry) > MAX_SLIP * risk) {
+    console.log("signal skipped, price moved or unavailable", sym, s.dir, s.entry, s.sl, live);
+    return false;
+  }
+  s.entry = live;
+  return true;
+}
 // Gold trades Sunday 18:00 to Friday 17:00 New York time, with a break 17:00-18:00 every day
 function goldOpen(t) {
   const y = new Date(t).getUTCFullYear(), sun = (mo, n) => { const d = new Date(Date.UTC(y, mo, 1)); return Date.UTC(y, mo, 1 + ((7 - d.getUTCDay()) % 7) + 7 * (n - 1)); };
@@ -921,7 +939,7 @@ async function newsAlert() {
   if (left > 150000 || Number(cfg.news_alerted || 0) >= t0) return;
   await db.from("app_settings").upsert({ key: "news_alerted", value: String(t0) });
   const [m1, m15, h1] = [await candles("XAUUSD", "1min"), await candles("XAUUSD", "15min"), await candles("XAUUSD", "1h")];
-  const price = m1[m1.length - 1]?.c, a = atr(m15.slice(0, -1));
+  const price = await livePrice("XAUUSD").catch(() => null), a = atr(m15.slice(0, -1));
   const { pred, chart, dir, conf } = predictNews(evs, h1);
   const change = early?.t !== t0 ? "" : early.dir === dir ? "✅ Same as the early prediction" : `🔄 <b>CHANGED</b>: early call was ${callTxt(early.dir)}, now ${callTxt(dir)}`;
   const head = [
@@ -935,7 +953,7 @@ async function newsAlert() {
     `Bias: XAUUSD <b>${biasTxt(dir)}</b> · BTCUSD <b>${biasTxt(dir)}</b>`,
     `Chart trend H1: ${biasTxt(chart)} · Confidence: <b>${conf}</b>`,
     "",
-    dir ? "📰 News signal below. Spreads widen at news time: use a small lot." : conf.startsWith("Skip") ? "The news and the chart point different ways, so MEEGO AI skips this one. Wait for the spike to finish." : "No clear bias, so no news signal this time. Wait for the spike to finish.",
+    dir && !price ? "The live price isn't available right now, so no news signal this time." : dir ? "📰 News signal below. Spreads widen at news time: use a small lot." : conf.startsWith("Skip") ? "The news and the chart point different ways, so MEEGO AI skips this one. Wait for the spike to finish." : "No clear bias, so no news signal this time. Wait for the spike to finish.",
     "<i>A prediction is not a guarantee. The real number can surprise.</i>",
   ];
   await broadcast(await audience("Scalping"), head.join("\n"));
@@ -956,7 +974,9 @@ async function newsRecovery() {
     await db.from("signals").update({ data: { ...rest, recovered: true } }).eq("id", id);
     const m1 = (await candles(s.sym, "1min")).filter((x) => x.t >= s.time);
     if (m1.length < 3) continue;
-    const dir = -s.dir, price = m1[m1.length - 1].c;
+    const live = await livePrice(s.sym).catch(() => null);
+    if (live === null) continue;
+    const dir = -s.dir, price = live;
     const extreme = dir > 0 ? Math.max(...m1.map((x) => x.h)) : Math.min(...m1.map((x) => x.l));
     const spike = Math.abs(extreme - s.entry);
     if (!spike) continue;
@@ -1013,7 +1033,12 @@ async function nineSetup(now = Date.now()) {
     return;
   }
   const dg = digits("XAUUSD"), risk = Math.min(NINE.max, Math.max(NINE.min, NINE.sl * a));
-  const last = m1[m1.length - 1].c, entry = Number(last.toFixed(dg)), sl = Number((last - dir * risk).toFixed(dg));
+  const last = await livePrice("XAUUSD").catch(() => null);
+  if (last === null || Math.abs(last - price) > MAX_SLIP * risk) {
+    console.log("9:59 signal skipped, price moved or unavailable", price, last);
+    return broadcast(chats, "⏰ <b>9:59 AM SETUP</b>\nNo entry today: price has already moved too far from the setup.");
+  }
+  const entry = Number(last.toFixed(dg)), sl = Number((last - dir * risk).toFixed(dg));
   await db.from("signals").insert({ id: crypto.randomUUID(), data: {
     kind: "Intraday", sym: "XAUUSD", dir, entry, sl, ...tpPlan("XAUUSD", dir, entry, sl), order: "instant", nine: true, life: NINE.life,
     note: "🤖 MEEGO AI · 9:59 AM setup: the 9-10 AM candle and the H1 trend agree · closes after 6 hours",
@@ -1052,7 +1077,9 @@ async function autoScan() {
       const quiet = (Date.now() - Math.max(dayStart, ...mine.map((s) => s.time))) / 3600000;
       const own = kind !== "Scalping" && /^XAU/.test(sym), used = new Set(mine.map((x) => x.zkey).filter(Boolean));
       const s = !own ? findSetup(kind, d, price, relaxDrop(kind, quiet)) : kind === "Intraday" ? intradaySetup(ix, price, used) : swingSetup(d.h1, h1.length ? h1[h1.length - 1].t : 0, price, used);
-      if (!s) continue;
+      if (!s || !(await reprice(s, sym))) continue;
+      const nowPips = Math.abs(s.entry - s.sl) / pip(sym);
+      if (/^XAU/.test(sym) && nowPips > (kind === "Scalping" ? AUTO.Scalping.maxPips : kind === "Intraday" ? IX.maxPips : SX.maxPips)) continue; // the stop must still be within its limit
       // Sharp entry: when the stop is far (gold Intraday/Swing over LIMIT.pips), wait for a pullback with a limit order
       const risk = Math.abs(s.entry - s.sl);
       if (!own && kind !== "Scalping" && /^XAU/.test(sym) && risk / pip(sym) > LIMIT.pips) {
