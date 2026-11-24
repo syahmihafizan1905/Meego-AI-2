@@ -1057,7 +1057,7 @@ async function nineSetup(now = Date.now()) {
 // To go back to the earlier setups (intradaySetup, swingSetup, findSetup), set SND to false.
 const SND = true;
 const KX = {
-  Scalping: { st: 15, zt: 5, ct: 5, min: 20, max: 80, life: 3, cool: 0.5, day: 5 },
+  Scalping: { st: 60, zt: 15, ct: 5, min: 20, max: 80, life: 3, cool: 0.5, day: 5 }, // enters on the zone touch, see touchSetup
   Intraday: { st: 60, zt: 15, ct: 5, min: 30, max: 200, life: 24, cool: 1, day: 3 },
   Swing: { st: 240, zt: 60, ct: 60, min: 60, max: 600, life: 120, cool: 4, day: 2 },
 };
@@ -1151,6 +1151,39 @@ function sndSetup(kind, G, price, used) {
   return { dir: s.dir, entry: s.entry, sl: s.sl, zkey: s.key, zone: [Number(s.z.bot.toFixed(2)), Number(s.z.top.toFixed(2))], order: "instant", ...(kind === "Swing" ? { life: k.life } : {}),
     note: `🤖 MEEGO AI · ${s.dir > 0 ? "Demand" : "Supply"} zone ${tf(k.zt)} ${s.z.bot.toFixed(2)} - ${s.z.top.toFixed(2)} · ${s.opt.join(" + ")}` };
 }
+// Scalping: price comes into a strong, fresh M15 zone (price left it by 2x ATR or more) -> signal at once, no confirmation candle.
+// 2 months of 5-min gold, 4 pips spread, this scanner: stops up to 80 pips 93-97 signals -5.1R to -7.1R, up to 120 pips 110-114 signals +1.8R to +6.7R. M5 zones lost 35R.
+const TOUCH = { imp: 2, fresh: 2, over: 0.1, near: 1 };
+function touchZones(G, price, used) { // strong zones close to price
+  const k = KX.Scalping, Z = G(k.zt), a = atr(Z), strong = smStrong(G(k.st)), out = [];
+  if (Z.length < 60 || !a) return out;
+  for (const dir of [1, -1]) {
+    if (strong === -dir) continue; // not against a strong trend
+    for (const z of smZones(Z, dir)) {
+      if ((z.f && z.fage > TOUCH.fresh) || used.has("Z" + z.t + dir)) continue; // first visit only
+      const b = Z.findIndex((x) => x.t === z.t), imp = Math.max(...Z.slice(b + 1, b + 5).map((x) => (x.c - Z[b].c) * dir)) / a;
+      if (imp < TOUCH.imp || (price - (dir > 0 ? z.top : z.bot)) * dir > TOUCH.near * a) continue;
+      out.push({ dir, z, imp, a, sl: (dir > 0 ? z.bot : z.top) - dir * SM.buf * a });
+    }
+  }
+  return out;
+}
+function touchSetup(zones, live) {
+  const k = KX.Scalping, hit = zones.filter(({ dir, z, a, sl }) => {
+    const pips = Math.abs(live - sl) / pip("XAUUSD");
+    return (dir > 0 ? live <= z.top + TOUCH.over * a && live >= z.bot : live >= z.bot - TOUCH.over * a && live <= z.top) && pips >= k.min && pips <= k.max;
+  }).sort((x, y) => y.imp - x.imp)[0];
+  if (!hit) return null;
+  const { dir, z, sl, imp } = hit, opt = [z.bos && "BOS", z.fvg && "FVG", z.same >= SM.snr && "SNR"].filter(Boolean);
+  return { dir, entry: live, sl, zkey: "Z" + z.t + dir, zone: [Number(z.bot.toFixed(2)), Number(z.top.toFixed(2))], order: "instant",
+    note: `🤖 MEEGO AI · ${dir > 0 ? "Demand" : "Supply"} zone M15 ${z.bot.toFixed(2)} - ${z.top.toFixed(2)} · strong zone (${imp.toFixed(1)}x ATR)${opt.length ? " · " + opt.join(" + ") : ""} · price entered the zone` };
+}
+async function scalpTouch(sym, G, price, used) {
+  const zones = touchZones(G, price, used);
+  if (!zones.length) return null; // nothing near: no price call
+  const live = await livePrice(sym).catch(() => null);
+  return live === null ? null : touchSetup(zones, live);
+}
 // Last saved copy of the candles (no API call); asks for new ones when it is over 20 minutes old
 async function savedCandles(sym, interval) {
   const { data } = await db.from("price_cache").select("data,fetched_at").eq("key", `${sym.slice(0, 3)}/${sym.slice(3)}|${interval}`).maybeSingle();
@@ -1193,8 +1226,9 @@ async function autoScan() {
       const dayStart = new Date(now).setUTCHours(0, 0, 0, 0);
       const quiet = (Date.now() - Math.max(dayStart, ...mine.map((s) => s.time))) / 3600000;
       const own = snd || (kind !== "Scalping" && /^XAU/.test(sym)), used = new Set(mine.map((x) => x.zkey).filter(Boolean));
-      const s = snd ? sndSetup(kind, sndG, price, used) : !own ? findSetup(kind, d, price, relaxDrop(kind, quiet)) : kind === "Intraday" ? intradaySetup(ix, price, used) : swingSetup(d.h1, h1.length ? h1[h1.length - 1].t : 0, price, used);
-      if (!s || !(await reprice(s, sym))) continue;
+      const touch = snd && kind === "Scalping"; // already priced at the live price
+      const s = touch ? await scalpTouch(sym, sndG, price, used) : snd ? sndSetup(kind, sndG, price, used) : !own ? findSetup(kind, d, price, relaxDrop(kind, quiet)) : kind === "Intraday" ? intradaySetup(ix, price, used) : swingSetup(d.h1, h1.length ? h1[h1.length - 1].t : 0, price, used);
+      if (!s || !(touch || (await reprice(s, sym)))) continue;
       const nowPips = Math.abs(s.entry - s.sl) / pip(sym);
       if (snd && nowPips < KX[kind].min) continue;
       if (/^XAU/.test(sym) && nowPips > (kind === "Scalping" ? AUTO.Scalping.maxPips : kind === "Intraday" ? IX.maxPips : SX.maxPips)) continue; // the stop must still be within its limit
