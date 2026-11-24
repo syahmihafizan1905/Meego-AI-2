@@ -73,6 +73,10 @@ async function account(chatId) {
   return { ...u, chatId, admin: !!u.is_admin, ...planOf(u) };
 }
 const canSee = (a, kind) => a.admin || (!!a.tier && (kind !== "Swing" || a.tier === "Ultimate"));
+// Auto signals of these kinds go to the admin only while they are being tested (news signals and /post are not affected).
+// To send them to customers again, take the kind out of this list.
+const TRIAL = ["Scalping"];
+const canSeeSignal = (a, s) => canSee(a, s.kind) && (a.admin || !s.trial);
 const noPlan = (a) => `You don't have an active plan yet.\n\nSend this to the admin to get activated:\n<b>MEEGO ID: <code>${a.chatId}</code></b>`;
 const privateNote = (a) => `🔒 <b>MEEGO AI is a private service.</b>\n\nIf you've bought a plan, send this to the admin:\n<b>MEEGO ID: <code>${a.chatId}</code></b>`;
 // A customer reference: a Telegram username (without @, lowercase) or a MEEGO ID (chat id)
@@ -242,10 +246,10 @@ async function cmdSignal(chatId, a, kind) {
     return send(chatId, noPlan(a));
   }
   const [list] = await Promise.all([
-    signalsOf(kind).then((l) => l.filter((s) => s.status === "running").sort((x, y) => y.time - x.time)),
+    signalsOf(kind).then((l) => l.filter((s) => s.status === "running" && canSeeSignal(a, s)).sort((x, y) => y.time - x.time)),
     scanAnimation(chatId, kind),
   ]);
-  if (!list.length) return send(chatId, kindOf(kind).none);
+  if (!list.length) return send(chatId, TRIAL.includes(kind) && !a.admin ? `No ${kind.toLowerCase()} signal right now. Auto ${kind.toLowerCase()} signals are paused while we re-test the setup. News signals still come here.` : kindOf(kind).none);
   const prices = {};
   for (const s of list.slice(0, 3)) await sendLive(chatId, s, kindOf(kind).title, await priceOf(s.sym, prices));
 }
@@ -353,7 +357,7 @@ async function cmdHistory(chatId, a) {
   const kinds = canSee(a, "Swing") ? ["Swing", "Intraday", "Scalping"] : ["Intraday", "Scalping"];
   const all = [];
   await Promise.all([
-    (async () => { for (const k of kinds) all.push(...(await signalsOf(k))); })(),
+    (async () => { for (const k of kinds) all.push(...(await signalsOf(k)).filter((s) => canSeeSignal(a, s))); })(),
     playVideo(chatId, "history", "📊 <b>MEEGO AI</b> · loading signal history…", "✅ <b>MEEGO AI</b> · results ready", 3700),
   ]);
   const closed = all.filter((s) => ["tp", "sl", "closed", "be"].includes(s.status)).sort((x, y) => (y.closedAt || y.time) - (x.closedAt || x.time));
@@ -1089,7 +1093,7 @@ async function autoScan() {
       } else s.order = "instant";
       for (const k of ["entry", "sl"]) s[k] = Number(s[k].toFixed(digits(sym)));
       Object.assign(s, tpPlan(sym, s.dir, s.entry, s.sl, own && kind === "Swing" ? SWING_TP : TP_PLAN));
-      await db.from("signals").insert({ id: crypto.randomUUID(), data: { kind, sym, ...s, status: "running", auto: true, time: Date.now(), closedAt: null } });
+      await db.from("signals").insert({ id: crypto.randomUUID(), data: { kind, sym, ...s, status: "running", auto: true, ...(TRIAL.includes(kind) ? { trial: true } : {}), time: Date.now(), closedAt: null } });
     }
   }
 }
@@ -1363,7 +1367,7 @@ async function eaFeed(key) {
   const { data } = await db.from("signals").select("id,data").order("updated_at", { ascending: false }).limit(150);
   const since = Date.now() - 72 * 3600000;
   const n = (v) => (Number.isFinite(Number(v)) ? String(Number(v)) : "0");
-  const rows = (data ?? []).map((r) => ({ id: r.id, ...r.data })).filter((x) => x && x.sym && (x.status === "running" || (x.closedAt || x.time) >= since) && canSee(a, x.kind));
+  const rows = (data ?? []).map((r) => ({ id: r.id, ...r.data })).filter((x) => x && x.sym && (x.status === "running" || (x.closedAt || x.time) >= since) && canSeeSignal(a, x));
   const lines = rows.map((x) => ["S", x.id, x.kind, x.news || "", x.sym, x.dir, x.order || "instant", x.status, x.pending ? 1 : 0, n(x.entry), n(x.sl0 ?? x.sl),
     ...(x.tps ? x.tps.map(n) : [n(x.tp), "0", "0"]), x.tpHit || 0, n(x.sl), Math.round(x.time || 0), x.expire ?? LIMIT.expire, Math.round(x.filled || 0)].join("|"));
   return txt([`OK|${Date.now()}|${a.admin ? "ADMIN" : a.tier}`, ...lines].join("\n"));
@@ -1645,9 +1649,9 @@ async function cmdAdmin(chatId, a, text) {
 }
 
 /* ---------- broadcasts (new signal, Hit TP/SL, daily reminders) ---------- */
-async function audience(kind) {
+async function audience(kind, trial = false) {
   const { data } = await db.from("telegram_users").select("*");
-  return (data ?? []).filter((u) => u.is_admin || (planOf(u).tier && (kind !== "Swing" || planOf(u).tier === "Ultimate"))).map((u) => u.chat_id);
+  return (data ?? []).filter((u) => u.is_admin || (!trial && planOf(u).tier && (kind !== "Swing" || planOf(u).tier === "Ultimate"))).map((u) => u.chat_id);
 }
 async function broadcast(chats, text) {
   for (const c of chats) { await send(c, text); await new Promise((r) => setTimeout(r, 60)); }
@@ -1656,14 +1660,14 @@ async function onDbEvent(ev) {
   if (ev.event === "signals") {
     const s = ev.record?.data, old = ev.old?.data;
     if (!s || !s.sym) return;
-    const chats = await audience(s.kind);
+    const chats = await audience(s.kind, !!s.trial);
     if (ev.op === "INSERT" && s.status === "running") {
       const sig = { id: ev.record.id, ...s };
-      const title = s.nine ? "🕘 9:59 AM SETUP" : s.news === "pre" ? "📰 NEWS SIGNAL" : s.news === "recovery" ? "🔁 RECOVERY SETUP (after news spike)" : kindOf(s.kind).fresh;
+      const title = s.trial ? `🧪 ${s.kind.toUpperCase()} TEST (admin only)` : s.nine ? "🕘 9:59 AM SETUP" : s.news === "pre" ? "📰 NEWS SIGNAL" : s.news === "recovery" ? "🔁 RECOVERY SETUP (after news spike)" : kindOf(s.kind).fresh;
       for (const c of chats) { await sendLive(c, sig, title); await new Promise((r) => setTimeout(r, 60)); }
       return;
     }
-    const label = `${s.dir > 0 ? "BUY" : "SELL"}${s.order === "limit" ? " LIMIT" : ""} <b>${esc(s.sym)}</b>`;
+    const label = `${s.trial ? "🧪 " : ""}${s.dir > 0 ? "BUY" : "SELL"}${s.order === "limit" ? " LIMIT" : ""} <b>${esc(s.sym)}</b>`;
     if (ev.op === "UPDATE" && old?.pending && s.status === "running" && !s.pending) {
       // the full signal card again (entry, zone, TPs, SL, lot guide), kept live like a new signal
       const sig = { id: ev.record.id, ...s }, title = `⚡ ENTRY TRIGGERED · ${kindOf(s.kind).title.replace(/^\S+\s/, "")}`;
