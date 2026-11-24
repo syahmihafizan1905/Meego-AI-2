@@ -1049,6 +1049,114 @@ async function nineSetup(now = Date.now()) {
     note: "🤖 MEEGO AI · 9:59 AM setup: the 9-10 AM candle and the H1 trend agree · closes after 6 hours",
     status: "running", auto: true, time: Date.now(), closedAt: null } });
 }
+/* ---------- S&D setup for Scalping, Intraday and Swing (gold), the admin's rules ---------- */
+// Must have: a valid unbroken S&D zone, not against a strong trend, room of 1.5R to the next swing, one entry confirmation (engulfing, rejection or CHoCH).
+// Optional, shown on the signal: sweep, CHoCH, BOS, engulfing, rejection, FVG, SNR.
+// Backtest, 4 pips spread: Intraday 41 signals +4.7R and Scalping 28 signals -9.8R in 2 months, Swing 87 signals +2.3R in 19 clean months. On trial.
+// To go back to the earlier setups (intradaySetup, swingSetup, findSetup), set SND to false.
+const SND = true;
+const KX = {
+  Scalping: { st: 15, zt: 5, ct: 5, min: 20, max: 80, life: 3, cool: 0.5, day: 5 },
+  Intraday: { st: 60, zt: 15, ct: 5, min: 30, max: 200, life: 24, cool: 1, day: 3 },
+  Swing: { st: 240, zt: 60, ct: 60, min: 60, max: 600, life: 120, cool: 4, day: 2 },
+};
+const SM = { base: 0.7, imp: 1.3, age: 96, touch: 8, near: 0.5, look: 40, win: 24, pre: 4, buf: 0.25, rr: 1.5, snr: 2 };
+function smStruct(c) {
+  const x = c.slice(-80), p = pivots(x, 2), H = p.hi.slice(-2), L = p.lo.slice(-2);
+  if (H.length < 2 || L.length < 2) return null;
+  const cl = x[x.length - 1].c, pt = (q) => ({ t: x[q.i].t, v: q.v });
+  if (H[1].v > H[0].v && L[1].v > L[0].v && cl > L[1].v) return { dir: 1, H: H.map(pt), L: L.map(pt) };
+  if (H[1].v < H[0].v && L[1].v < L[0].v && cl < H[1].v) return { dir: -1, H: H.map(pt), L: L.map(pt) };
+  return null;
+}
+function smZones(c, dir) {
+  const a = atr(c), n = c.length, out = [];
+  for (let i = n - 3; i >= Math.max(20, n - SM.age); i--) {
+    const b = c[i];
+    if (Math.abs(b.c - b.o) > SM.base * a) continue;
+    let k = -1;
+    for (let j = i + 1; j <= Math.min(n - 1, i + 3); j++) if ((c[j].c - b.c) * dir >= SM.imp * a) { k = j; break; }
+    if (k < 0) continue;
+    let lv = null;
+    const pre = c.slice(Math.max(0, i - 40), i + 1), p = pivots(pre, 2), q = (dir > 0 ? p.hi : p.lo).at(-1);
+    if (q) for (let j = i + 1; j <= Math.min(n - 1, i + 6); j++) if ((c[j].c - q.v) * dir > 0) { lv = { v: q.v, t: pre[q.i].t, bt: c[j].t }; break; }
+    let fvg = null;
+    for (let j = i; j <= k - 1 && j + 2 < n; j++) if (dir > 0 ? c[j + 2].l > c[j].h : c[j + 2].h < c[j].l) { fvg = dir > 0 ? { t: c[j + 1].t, lo: c[j].h, hi: c[j + 2].l } : { t: c[j + 1].t, lo: c[j + 2].h, hi: c[j].l }; break; }
+    const same = p.hi.concat(p.lo).filter((x) => x.i < pre.length - 3 && x.v >= b.l - 0.25 * a && x.v <= b.h + 0.25 * a).length;
+    const bot = b.l, top = b.h, aft = c.slice(k + 1);
+    if (top - bot < 0.05 * a) continue; // a flat candle is not a zone
+    if (aft.some((x) => (dir > 0 ? x.c < bot : x.c > top))) continue;
+    const f = aft.findIndex((x) => (dir > 0 ? x.l <= top : x.h >= bot));
+    out.push({ t: b.t, kt: c[k].t, bot, top, f: f < 0 ? null : aft[f].t, fage: f < 0 ? 0 : aft.length - f, bos: lv, fvg, same });
+  }
+  return out;
+}
+
+function smStrong(c) { // strong trend: structure AND price beyond a sloping EMA50
+  const s = smStruct(c); if (!s || c.length < 70) return 0;
+  const e = ema(c.slice(-300).map((x) => x.c), 50), v = e[e.length - 1], o = e[e.length - 6], cl = c[c.length - 1].c;
+  return (cl - v) * s.dir > 0 && (v - o) * s.dir > 0 ? s.dir : 0;
+}
+function smc(kind, G, used) {
+  const k = KX[kind], S = G(k.st), Z = G(k.zt), C = G(k.ct);
+  if (C.length < 60 || Z.length < 60) return null;
+  const z15 = atr(Z), ac = atr(C), n = C.length, s = smStruct(S), strong = smStrong(S);
+  let best = null;
+  for (const dir of [1, -1]) {
+    if (strong === -dir) continue; // not against a strong trend
+    const L = C[n - 1], P = C[n - 2];
+    if ((L.c - L.o) * dir <= 0) continue;
+    const body = Math.abs(L.c - L.o), range = L.h - L.l || 1e-9, wick = dir > 0 ? Math.min(L.o, L.c) - L.l : L.h - Math.max(L.o, L.c);
+    const pin = wick >= 2 * body && wick >= 0.5 * range, eng = (P.c - P.o) * dir < 0 && body > Math.abs(P.c - P.o) && (L.c - P.o) * dir > 0;
+    for (const z of smZones(Z, dir)) {
+      if ((z.f && z.fage > SM.touch) || used.has("Z" + z.t + dir)) continue;
+      const ft = C.findIndex((x) => x.t >= z.kt + k.zt * 6e4 && (dir > 0 ? x.l <= z.top : x.h >= z.bot));
+      if (ft < 0 || n - ft > SM.win) continue;
+      const rec = C.slice(ft), ext = dir > 0 ? Math.min(...rec.map((x) => x.l)) : Math.max(...rec.map((x) => x.h)), e = rec.findLastIndex((x) => (dir > 0 ? x.l : x.h) === ext);
+      if (dir > 0 ? !(ext <= z.top && ext >= z.bot - SM.near * z15) : !(ext >= z.bot && ext <= z.top + SM.near * z15)) continue;
+      if ((L.c - (dir > 0 ? z.bot : z.top)) * dir <= 0 || rec.some((x) => (dir > 0 ? x.c < z.bot : x.c > z.top))) continue;
+      const old = Z.filter((x) => x.t + k.zt * 6e4 <= rec[e].t).slice(-SM.look), p = pivots(old, 2);
+      const cand = (dir > 0 ? p.lo : p.hi).map((q) => ({ v: q.v, t: old[q.i].t })).filter((q) => (q.v - ext) * dir > 0.05 * z15 && (q.v - ext) * dir < 1.5 * z15 && !old.slice(0, old.length - SM.pre).some((x) => x.t > q.t && (dir > 0 ? x.c < q.v : x.c > q.v)));
+      let lv = cand.sort((x, y) => (x.v - y.v) * dir)[0] || null;
+      if (lv && (L.c - lv.v) * dir <= 0) lv = null;
+      const b = n - rec.length + e, pre = C.slice(Math.max(0, b - 20), b + 2), ph = pivots(pre, 2), hs = (dir > 0 ? ph.hi : ph.lo).filter((x) => x.i < pre.length - 1).at(-1);
+      const ch = hs && (L.c - hs.v) * dir > 0 && b < n - 1 ? { v: hs.v, t: pre[hs.i].t } : null;
+      if (!(pin || eng || ch)) continue; // at least one entry confirmation
+      const opt = []; if (lv) opt.push("Sweep"); if (ch) opt.push("CHoCH"); if (z.bos) opt.push("BOS"); if (eng) opt.push("Engulfing"); if (pin) opt.push("Rejection"); if (z.fvg) opt.push("FVG"); if (z.same >= SM.snr) opt.push("SNR");
+      const sl = (dir > 0 ? Math.min(ext, z.bot) : Math.max(ext, z.top)) - dir * SM.buf * z15, risk = Math.abs(L.c - sl);
+      // room: the nearest opposite swing must be at least rr x the risk away
+      const zp = pivots(Z.slice(-80), 3), opp = (dir > 0 ? zp.hi : zp.lo).map((x) => x.v).filter((v) => (v - L.c) * dir > 0).sort((x, y) => (x - y) * dir)[0];
+      const room = opp === undefined ? 9 : Math.abs(opp - L.c) / risk;
+      if (room < SM.rr) continue;
+      const rp = risk / pip("XAUUSD");
+      if (rp < k.min || rp > k.max) continue;
+      if (!best || opt.length > best.opt.length) best = { dir, key: "Z" + z.t + dir, entry: L.c, sl, z, opt };
+    }
+  }
+  return best;
+}
+// Finished candles of every timeframe. m1 is fresh; m15 and h1 may be a few minutes old, so their newest candles are completed from m1.
+function sndCandles(sym, m1, m15, h1) {
+  const upTo = m1[m1.length - 1].t, g = m1.filter((x) => !/^XAU/.test(sym) || goldOpen(x.t)), done = (c, min) => c.filter((x) => x.t + min * 60000 <= upTo);
+  const first = g.length ? g[0].t : 0;
+  const join = (old, min) => { const fresh = done(group(g, min), min).filter((x) => x.t >= first), o = done(old.slice(0, -1), min), last = o.length ? o[o.length - 1].t : 0; return o.concat(fresh.filter((x) => x.t > last)).slice(-400); };
+  const H1 = join(h1, 60), by = { 5: done(group(g, 5), 5).filter((x) => x.t >= first).slice(-400), 15: join(m15, 15), 60: H1, 240: done(group(done(h1.slice(0, -1), 60).concat(H1.filter((x) => !h1.slice(0, -1).some((y) => y.t === x.t))), 240), 240).slice(-400) };
+  return (min) => by[min];
+}
+function sndSetup(kind, G, price, used) {
+  const s = smc(kind, G, used);
+  if (!s) return null;
+  const tf = (x) => (x >= 240 ? "H4" : x >= 60 ? "H1" : "M" + x), k = KX[kind];
+  return { dir: s.dir, entry: s.entry, sl: s.sl, zkey: s.key, zone: [Number(s.z.bot.toFixed(2)), Number(s.z.top.toFixed(2))], order: "instant", ...(kind === "Swing" ? { life: k.life } : {}),
+    note: `🤖 MEEGO AI · ${s.dir > 0 ? "Demand" : "Supply"} zone ${tf(k.zt)} ${s.z.bot.toFixed(2)} - ${s.z.top.toFixed(2)} · ${s.opt.join(" + ")}` };
+}
+// Last saved copy of the candles (no API call); asks for new ones when it is over 20 minutes old
+async function savedCandles(sym, interval) {
+  const { data } = await db.from("price_cache").select("data,fetched_at").eq("key", `${sym.slice(0, 3)}/${sym.slice(3)}|${interval}`).maybeSingle();
+  const list = data?.data?.candles;
+  if (!Array.isArray(list) || Date.now() - new Date(data.fetched_at).getTime() > 20 * 60000) return candles(sym, interval);
+  return /^XAU/.test(sym) ? list.filter((x) => goldOpen(x.t)) : list;
+}
 async function autoScan() {
   const cfg = await settings();
   if (cfg.auto_scan === "off") return;
@@ -1057,14 +1165,17 @@ async function autoScan() {
   const running = all.filter((s) => s.status === "running" && s.auto);
   if (running.length) await watchSignals(running);
   const now = new Date();
-  if (now.getUTCMinutes() % 15 >= 5) return; // look for new setups every 15 minutes
+  const quarter = now.getUTCMinutes() % 15 < 5; // other setups are looked for every 15 minutes, the gold S&D setups every 5
+  if (!quarter && !SND) return;
   const pairs = String(cfg.scan_pairs || "XAUUSD").split(",").map((p) => p.trim().toUpperCase()).filter(Boolean);
   for (const sym of pairs) {
-    if (!marketOpen(now, sym)) continue;
+    const snd = SND && /^XAU/.test(sym);
+    if (!marketOpen(now, sym) || (!quarter && !snd)) continue;
     const m1 = await candles(sym, "1min");
     if (!m1.length || Date.now() - m1[m1.length - 1].t > 20 * 60000) continue; // no fresh prices (holiday)
-    const m15 = await candles(sym, "15min"), h1 = await candles(sym, "1h");
+    const load = quarter ? candles : savedCandles, m15 = await load(sym, "15min"), h1 = await load(sym, "1h");
     const price = m1[m1.length - 1].c;
+    const sndG = snd ? sndCandles(sym, m1, m15, h1) : null;
     const closed = (c) => c.slice(0, -1); // drop the candle that is still forming
     const d = { sym, m5: closed(group(m1, 5)), m15: closed(m15), h1: closed(h1), h4: closed(group(h1, 240)), d1: closed(group(h1, 1440)) };
     d.trend = { m5: tfTrend(d.m5), m15: tfTrend(d.m15), h1: tfTrend(d.h1), h4: tfTrend(d.h4), d1: tfTrend(d.d1) };
@@ -1080,10 +1191,11 @@ async function autoScan() {
       // The longer it's been quiet today, the lower the score needed (so there's at least one a day)
       const dayStart = new Date(now).setUTCHours(0, 0, 0, 0);
       const quiet = (Date.now() - Math.max(dayStart, ...mine.map((s) => s.time))) / 3600000;
-      const own = kind !== "Scalping" && /^XAU/.test(sym), used = new Set(mine.map((x) => x.zkey).filter(Boolean));
-      const s = !own ? findSetup(kind, d, price, relaxDrop(kind, quiet)) : kind === "Intraday" ? intradaySetup(ix, price, used) : swingSetup(d.h1, h1.length ? h1[h1.length - 1].t : 0, price, used);
+      const own = snd || (kind !== "Scalping" && /^XAU/.test(sym)), used = new Set(mine.map((x) => x.zkey).filter(Boolean));
+      const s = snd ? sndSetup(kind, sndG, price, used) : !own ? findSetup(kind, d, price, relaxDrop(kind, quiet)) : kind === "Intraday" ? intradaySetup(ix, price, used) : swingSetup(d.h1, h1.length ? h1[h1.length - 1].t : 0, price, used);
       if (!s || !(await reprice(s, sym))) continue;
       const nowPips = Math.abs(s.entry - s.sl) / pip(sym);
+      if (snd && nowPips < KX[kind].min) continue;
       if (/^XAU/.test(sym) && nowPips > (kind === "Scalping" ? AUTO.Scalping.maxPips : kind === "Intraday" ? IX.maxPips : SX.maxPips)) continue; // the stop must still be within its limit
       // Sharp entry: when the stop is far (gold Intraday/Swing over LIMIT.pips), wait for a pullback with a limit order
       const risk = Math.abs(s.entry - s.sl);

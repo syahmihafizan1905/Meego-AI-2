@@ -13,7 +13,7 @@ const json = (body: unknown, status = 200) =>
 
 // how long a cached answer is reused, per interval (seconds)
 const TTL: Record<string, number> = { "1min": 180, "15min": 300, "1h": 900 };
-const SIZE: Record<string, number> = { "1min": 400, "15min": 500, "1h": 2000 };
+const SIZE: Record<string, number> = { "1min": 800, "15min": 500, "1h": 2000 };
 
 function toProvider(sym: string): string | null {
   const s = sym.toUpperCase().replace(/[^A-Z0-9]/g, "");
