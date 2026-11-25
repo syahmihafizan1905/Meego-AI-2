@@ -368,7 +368,7 @@ async function cmdHistory(chatId, a) {
   const kinds = canSee(a, "Swing") ? ["Swing", "Intraday", "Scalping"] : ["Intraday", "Scalping"];
   const all = [];
   await Promise.all([
-    (async () => { for (const k of kinds) all.push(...(await signalsOf(k)).filter((s) => canSeeSignal(a, s))); })(),
+    (async () => { for (const k of kinds) all.push(...(await signalsOf(k)).filter((s) => canSeeSignal(a, s) && !s.test)); })(),
     playVideo(chatId, "history", "📊 <b>MEEGO AI</b> · loading signal history…", "✅ <b>MEEGO AI</b> · results ready", 3700),
   ]);
   const closed = all.filter((s) => ["tp", "sl", "closed", "be"].includes(s.status)).sort((x, y) => (y.closedAt || y.time) - (x.closedAt || x.time));
@@ -1233,7 +1233,7 @@ async function autoScan() {
     const upTo = m1[m1.length - 1].t, up15 = m15.length ? m15[m15.length - 1].t : 0;
     const ix = { m5: group(m1.filter((x) => !/^XAU/.test(sym) || goldOpen(x.t)), 5).filter((x) => x.t + 300000 <= upTo), m15: m15.filter((x) => x.t < up15), m30: group(m15.filter((x) => x.t < up15), 30).filter((x) => x.t + 1800000 <= up15), h1: d.h1 };
     for (const kind of ["Swing", "Intraday", "Scalping"]) {
-      const mine = all.filter((s) => s.kind === kind && s.sym === sym && s.auto && !s.nine);
+      const mine = all.filter((s) => s.kind === kind && s.sym === sym && s.auto && !s.nine && !s.test);
       if (mine.filter((s) => s.status === "running").length >= AUTO[kind].open) continue;
       const lastEnd = Math.max(0, ...mine.map((s) => s.closedAt || s.time));
       if (Date.now() - lastEnd < AUTO[kind].cool * 3600000) continue;
@@ -1721,6 +1721,7 @@ async function cmdAdmin(chatId, a, text) {
       "Post your own too:",
       "<code>/post BUY XAUUSD 4040 4080 3990</code> intraday signal (entry, TP, SL)",
       "<code>/post BUY XAUUSD 4040 4048 4034 scalp</code> scalping signal",
+      "<code>/testsignal buy</code> EA test signal (only you get it) · <code>/testend</code> closes it",
       "<code>/post SELL XAUUSD 4129 4119 4140 swing Sell area, wait for price</code> swing (Ultimate only) with a note",
       "<code>/close tp</code> · <code>/close sl</code> · <code>/close be</code> closes the latest running signal (add a pair to choose: <code>/close tp XAUUSD</code>)",
       "",
@@ -1782,6 +1783,21 @@ async function cmdAdmin(chatId, a, text) {
     const { error } = await db.from("signals").insert({ id: crypto.randomUUID(), data: { kind, sym, dir, entry, tp, sl, note, status: "running", time: Date.now(), closedAt: null } });
     return send(chatId, error ? "Couldn't save the signal: " + esc(error.message) : "✅ Signal posted. Members are being notified.");
   }
+  // A made-up signal at the current price, only for the admin, to check the EA (zone lines, entry, TPs). Not counted anywhere.
+  if (cmd === "/testsignal") {
+    const dir = /^s/i.test(parts[1] || "") ? -1 : 1, live = marketOpen(new Date(), "XAUUSD") ? await livePrice("XAUUSD").catch(() => null) : null;
+    if (live === null) return send(chatId, "No gold price right now (market closed or price not available). Try again later.");
+    const entry = Number(live.toFixed(2)), sl = Number((live - dir * 6).toFixed(2)), z = [live - dir * 4, live + dir * 1].map((x) => Number(x.toFixed(2))).sort((x, y) => x - y);
+    const { error } = await db.from("signals").insert({ id: crypto.randomUUID(), data: { kind: "Scalping", sym: "XAUUSD", dir, entry, sl, ...tpPlan("XAUUSD", dir, entry, sl), zone: z, order: "instant", life: 1, test: true, trial: true, auto: true,
+      note: `EA TEST, not a real setup · test zone ${z[0].toFixed(2)} - ${z[1].toFixed(2)} · closes after 1 hour`, status: "running", time: Date.now(), closedAt: null } });
+    return send(chatId, error ? "Couldn't save the test signal: " + esc(error.message) : "🧪 Test signal sent. The EA should react within about 30 seconds. Send /testend to close it.");
+  }
+  if (cmd === "/testend") {
+    const { data } = await db.from("signals").select("id,data").order("updated_at", { ascending: false }).limit(100);
+    const open = (data ?? []).map((r) => ({ id: r.id, ...r.data })).filter((x) => x.test && x.status === "running"), live = open.length ? await livePrice("XAUUSD").catch(() => null) : null;
+    for (const x of open) await setStatus(x, "closed", live ?? x.entry);
+    return send(chatId, open.length ? `🧪 Closed ${open.length} test signal${open.length > 1 ? "s" : ""}. The EA closes its test trades within about 30 seconds.` : "No test signal is running.");
+  }
   if (cmd === "/close") {
     const st = (parts[1] || "").toLowerCase(), sym = (parts[2] || "").toUpperCase();
     if (!["tp", "sl", "be"].includes(st)) return send(chatId, "Format: <code>/close tp</code>, <code>/close sl</code> or <code>/close be</code> (optionally add the pair)");
@@ -1828,7 +1844,7 @@ async function onDbEvent(ev) {
     const chats = await audience(s.kind, !!s.trial);
     if (ev.op === "INSERT" && s.status === "running") {
       const sig = { id: ev.record.id, ...s };
-      const title = s.trial ? `🧪 ${s.kind.toUpperCase()} TEST (admin only)` : s.nine ? "🕘 9:59 AM SETUP" : s.news === "pre" ? "📰 NEWS SIGNAL" : s.news === "recovery" ? "🔁 RECOVERY SETUP (after news spike)" : kindOf(s.kind).fresh;
+      const title = s.test ? "🧪 EA TEST (not a real setup)" : s.trial ? `🧪 ${s.kind.toUpperCase()} TEST (admin only)` : s.nine ? "🕘 9:59 AM SETUP" : s.news === "pre" ? "📰 NEWS SIGNAL" : s.news === "recovery" ? "🔁 RECOVERY SETUP (after news spike)" : kindOf(s.kind).fresh;
       for (const c of chats) { await sendLive(c, sig, title); await new Promise((r) => setTimeout(r, 60)); }
       return;
     }
@@ -1941,7 +1957,7 @@ async function onMessage(msg) {
     return showPlans(chatId, `Your <b>${esc(a.rawTier)}</b> plan has ended.\n\n💳 <b>Renew your plan</b>`);
   }
   if (msg.photo && msg.photo.length) return scanPhoto(chatId, a, msg);
-  if (/^\/(admin|activate|renew|remove|customers|post|close|announce|members|autoscan|setbank|addbank|setprice|payments)\b/.test(t)) return cmdAdmin(chatId, a, text);
+  if (/^\/(admin|activate|renew|remove|customers|post|close|announce|members|autoscan|setbank|addbank|setprice|payments|testsignal|testend)\b/.test(t)) return cmdAdmin(chatId, a, text);
   if (t === "/ea" || t.startsWith("/ea ") || t.startsWith("/ea@") || t.includes("mt5")) return cmdEA(chatId, a, t);
   if (t.startsWith("/scanner") || t.includes("chart scanner")) {
     if (!a.admin && !a.tier) return send(chatId, noPlan(a));
