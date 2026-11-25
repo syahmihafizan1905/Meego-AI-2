@@ -97,6 +97,8 @@ const myTime = (t = Date.now()) => new Date(t + 8 * 3600000).toISOString().slice
 const TP_PLAN = [[0.7, 50, 100], [2, 100, 200], [3, 200, 500]];
 // Swing targets follow the stop: TP1 1.5x the risk (at least 100 pips), TP2 2x, TP3 3x
 const SWING_TP = [[1.5, 100, Infinity], [2, 100, Infinity], [3, 100, Infinity]];
+// Intraday (S&D): held for at least 100 pips. 41 signals in 2 months: +8.6R, TP1 hit 51% (with the 50-100 pip TP1: +4.7R, 66%)
+const INTRADAY_TP = [[1, 100, Infinity], [2, 150, Infinity], [3, 200, Infinity]];
 function tpPlan(sym, dir, entry, sl, plan = TP_PLAN) {
   const rp = Math.abs(entry - sl) / pip(sym), gold = /^XAU/.test(sym), d = digits(sym);
   const tps = plan.map(([k, lo, hi]) => Number((entry + dir * (gold ? Math.min(hi, Math.max(lo, k * rp)) : k * rp) * pip(sym)).toFixed(d)));
@@ -1240,7 +1242,7 @@ async function autoScan() {
         Object.assign(s, { order: "limit", pending: true });
       } else s.order = "instant";
       for (const k of ["entry", "sl"]) s[k] = Number(s[k].toFixed(digits(sym)));
-      Object.assign(s, tpPlan(sym, s.dir, s.entry, s.sl, own && kind === "Swing" ? SWING_TP : TP_PLAN));
+      Object.assign(s, tpPlan(sym, s.dir, s.entry, s.sl, own && kind === "Swing" ? SWING_TP : snd && kind === "Intraday" ? INTRADAY_TP : TP_PLAN));
       await db.from("signals").insert({ id: crypto.randomUUID(), data: { kind, sym, ...s, status: "running", auto: true, ...(TRIAL.includes(kind) ? { trial: true } : {}), time: Date.now(), closedAt: null } });
     }
   }
