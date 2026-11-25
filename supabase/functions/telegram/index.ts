@@ -1062,7 +1062,7 @@ async function nineSetup(now = Date.now()) {
   }
   const entry = Number(last.toFixed(dg)), sl = Number((last - dir * risk).toFixed(dg));
   await db.from("signals").insert({ id: crypto.randomUUID(), data: {
-    kind: "Intraday", sym: "XAUUSD", dir, entry, sl, ...tpPlan("XAUUSD", dir, entry, sl), order: "instant", nine: true, life: NINE.life,
+    kind: "Intraday", sym: "XAUUSD", dir, entry, sl, ...tpPlan("XAUUSD", dir, entry, sl, INTRADAY_TP), order: "instant", nine: true, life: NINE.life,
     note: "🤖 MEEGO AI · 9:59 AM setup: the 9-10 AM candle and the H1 trend agree · closes after 6 hours",
     status: "running", auto: true, time: Date.now(), closedAt: null } });
 }
