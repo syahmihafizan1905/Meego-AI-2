@@ -4,7 +4,7 @@
 //|  Get your key by sending /ea to the bot.                          |
 //+------------------------------------------------------------------+
 #property copyright "MEEGO AI"
-#property version   "1.10"
+#property version   "1.20"
 #property description "Copies MEEGO AI gold signals into MT5: draws the zone, enters while price is in it, TP1/TP2/TP3,"
 #property description "closes half and moves SL to entry at +100 pips, lot size from your risk %."
 #property description "Tools > Options > Expert Advisors > Allow WebRequest for the MEEGO URL first."
@@ -13,7 +13,9 @@
 
 input string InpKey           = "";        // MEEGO EA key (send /ea in the bot)
 input string InpSymbol        = "XAUUSD";  // Your broker's gold symbol (found by itself if this one does not exist)
-input double InpRiskPct       = 1.0;       // Risk per signal (% of balance)
+input double InpFixedLot      = 0.01;      // Lot of every layer, whatever the balance (0 = use the risk % instead)
+input int    InpLayers        = 3;         // Layers per signal (1-10), TP1/TP2/TP3 in turn
+input double InpRiskPct       = 1.0;       // Risk per signal (% of balance), only when the fixed lot is 0
 input double InpMaxLot        = 1.0;       // Max total lot per signal
 input bool   InpScalping      = true;      // Copy Scalping signals
 input bool   InpIntraday      = true;      // Copy Intraday signals
@@ -26,6 +28,7 @@ input bool   InpMinLotIfSmall = false;     // Use the minimum lot when the risk 
 input double InpBEPips        = 100;       // At this profit (pips): close half and SL to entry (0 = off)
 input double InpZoneTolPips   = 10;        // Entry allowed this far outside the zone (pips)
 input double InpMinSLPips     = 20;        // Don't enter when the SL is closer than this (pips)
+input bool   InpZoneLimit     = true;      // Price outside the zone: place limit orders at the zone
 input bool   InpDrawZone      = true;      // Draw the zone with horizontal lines
 input int    InpPollSec       = 30;        // Check for signals every N seconds
 input long   InpMagic         = 771905;    // Magic number
@@ -209,40 +212,34 @@ double NormLot(double v)
   }
 
 //+------------------------------------------------------------------+
-// Open a new signal: 3 positions (TP1/TP2/TP3) or one, market or limit
-bool OpenSignal(Sig &s)
+// Open a new signal in layers: at market, as limit orders of a limit signal, or (zoneLimit > 0) as limit orders at the zone
+bool OpenSignal(Sig &s, double zoneLimit = 0)
   {
    int    dg  = (int)SymbolInfoInteger(g_sym, SYMBOL_DIGITS);
    double ask = SymbolInfoDouble(g_sym, SYMBOL_ASK), bid = SymbolInfoDouble(g_sym, SYMBOL_BID);
    if(ask <= 0 || bid <= 0) return(false);
-   bool limit = (s.order == "limit" && s.pending == 1);
-   if(limit && ((s.dir > 0 && ask <= s.entry) || (s.dir < 0 && bid >= s.entry))) limit = false; // already at a better price
+   bool limit = (zoneLimit > 0 || (s.order == "limit" && s.pending == 1));
+   double lp = zoneLimit > 0 ? zoneLimit : s.entry;
+   if(limit && ((s.dir > 0 && ask <= lp) || (s.dir < 0 && bid >= lp))) limit = false; // already at a better price
    double mkt = (s.dir > 0 ? ask : bid);
-   // market signals keep the same distances from your broker's price; limit orders use the signal's prices
+   // market signals without a zone keep the same distances from your broker's price; zones and limit orders use the signal's prices
    double delta = (limit || s.order == "limit" || HasZone(s)) ? 0.0 : mkt - s.entry;
    double sl = NormalizeDouble(s.sl + delta, dg);
-   double ref = limit ? s.entry : mkt;
+   double ref = limit ? lp : mkt;
    if((ref - sl) * s.dir <= 0) { Print("MEEGO AI EA: skip ", s.id8, " - price already past the SL"); return(false); }
-
    if(MathAbs(ref - sl) < InpMinSLPips * PIP) return(false);     // too close to the SL for now
 
    bool three = (s.tp2 > 0 && s.tp3 > 0);
-   double total = RiskLot(MathAbs(ref - sl));
-   double minL = SymbolInfoDouble(g_sym, SYMBOL_VOLUME_MIN);
-   double lots[3];
-   double tps[3];
-   int parts = 0;
-   double part = NormLot(total / 3.0);
-   if(three && g_hedging && part >= minL)
-     {
-      parts = 3;
-      lots[0] = part; lots[1] = part; lots[2] = part;
-      tps[0] = s.tp1; tps[1] = s.tp2; tps[2] = s.tp3;
-     }
+   int  layers = g_hedging ? (int)MathMax(1, MathMin(10, InpLayers)) : 1;
+   double minL = SymbolInfoDouble(g_sym, SYMBOL_VOLUME_MIN), part;
+   if(InpFixedLot > 0)
+      part = MathMax(minL, NormLot(MathMin(InpFixedLot, InpMaxLot / layers)));
    else
      {
-      double one = NormLot(total);
-      if(one < minL)
+      double total = RiskLot(MathAbs(ref - sl));
+      layers = (int)MathMax(1, MathMin(layers, MathFloor(total / minL + 1e-9)));   // fewer layers when the risk lot is small
+      part = NormLot(total / layers);
+      if(part < minL)
         {
          if(!InpMinLotIfSmall)
            {
@@ -250,11 +247,16 @@ bool OpenSignal(Sig &s)
             GlobalVariableSet(GvDone(s.id8), 3);
             return(false);
            }
-         one = minL;
+         part = minL;
         }
-      parts = 1;
-      lots[0] = one;
-      tps[0] = three ? s.tp2 : s.tp1;
+     }
+   double lots[10], tps[10];
+   int parts = layers;
+   for(int i = 0; i < parts; i++)
+     {
+      lots[i] = part;
+      int k = (parts == 1) ? 1 : i % 3;                          // one layer: TP2
+      tps[i] = !three ? s.tp1 : (k == 0 ? s.tp1 : k == 1 ? s.tp2 : s.tp3);
      }
 
    int ok = 0;
@@ -262,11 +264,11 @@ bool OpenSignal(Sig &s)
      {
       double tp = NormalizeDouble(tps[i] + delta, dg);
       if((tp - ref) * s.dir <= 0) continue; // this TP is already behind the price
-      string c = Tag(s.id8, parts == 3 ? i + 1 : 9);
+      string c = Tag(s.id8, i + 1);
       bool r;
       if(limit)
         {
-         double price = NormalizeDouble(s.entry, dg);
+         double price = NormalizeDouble(lp, dg);
          r = (s.dir > 0) ? trade.BuyLimit(lots[i], price, g_sym, sl, tp, ORDER_TIME_GTC, 0, c)
                          : trade.SellLimit(lots[i], price, g_sym, sl, tp, ORDER_TIME_GTC, 0, c);
         }
@@ -279,7 +281,7 @@ bool OpenSignal(Sig &s)
    if(ok > 0)
      {
       GlobalVariableSet(GvDone(s.id8), 1);
-      if(s.lifeH > 0 && !limit) GlobalVariableSet(GvEnd(s.id8), (double)TimeCurrent() + s.lifeH * 3600.0);
+      if(s.lifeH > 0) GlobalVariableSet(GvEnd(s.id8), (double)TimeCurrent() + s.lifeH * 3600.0);
       Print("MEEGO AI EA: opened ", s.kind, " ", (s.dir > 0 ? "BUY" : "SELL"), (limit ? " LIMIT " : " "), s.id8, " parts ", ok);
      }
    return(ok > 0);
@@ -291,7 +293,9 @@ bool OpenSignal(Sig &s)
 void Manage(Sig &s)
   {
    bool ended   = (s.status != "running");
-   bool expired = (s.pending == 1 && ((long)TimeGMT() - s.time / 1000) > (long)(s.expireH * 3600.0));
+   double age   = (double)TimeGMT() - s.time / 1000.0;
+   bool expired = (s.pending == 1 && age > s.expireH * 3600.0) || (s.lifeH > 0 && s.pending != 1 && age > s.lifeH * 3600.0);
+   if(HasZone(s) && s.tpHit > 0) expired = true;                 // TP1 reached without us: the zone orders are too late
    for(int i = OrdersTotal() - 1; i >= 0; i--)
      {
       ulong t = OrderGetTicket(i);
@@ -459,6 +463,12 @@ int ZoneState(Sig &s)
    return(p >= lo && p <= hi ? 1 : 0);
   }
 
+// Algo trading on, and no failed order in the last 20 seconds
+bool TradeOk(Sig &s)
+  {
+   if(!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED) || !MQLInfoInteger(MQL_TRADE_ALLOWED)) return(false);
+   return(!GlobalVariableCheck("MEEGO_T_" + s.id8) || TimeLocal() - (datetime)GlobalVariableGet("MEEGO_T_" + s.id8) >= 20);
+  }
 // Entries and trade management, every second
 void Work()
   {
@@ -472,19 +482,26 @@ void Work()
       if(s.status != "running" || GlobalVariableCheck(GvDone(s.id8))) continue;
       if(HasAny(s.id8)) { GlobalVariableSet(GvDone(s.id8), 1); continue; }
       bool pendingLimit = (s.order == "limit" && s.pending == 1);
-      if(HasZone(s))
+      if(HasZone(s) && !pendingLimit)
         {
          int z = ZoneState(s);
          if(z < 0) { GlobalVariableSet(GvDone(s.id8), 2); continue; }
-         if(z == 0) continue;
+         if(z == 0)
+           {
+            // price has left the zone in the trade's direction: wait for it with limit orders at the edge of the zone
+            double mk = s.dir > 0 ? SymbolInfoDouble(g_sym, SYMBOL_ASK) : SymbolInfoDouble(g_sym, SYMBOL_BID), edge = s.dir > 0 ? s.zHi : s.zLo;
+            if(!InpZoneLimit || pendingLimit || (mk - edge) * s.dir <= 0 || open >= InpMaxSignals || !TradeOk(s)) continue;
+            if(OpenSignal(s, edge)) { open++; Print("MEEGO AI EA: limit orders at the zone edge ", DoubleToString(edge, 2), " for ", s.id8); }
+            else GlobalVariableSet("MEEGO_T_" + s.id8, (double)TimeLocal());
+            continue;
+           }
         }
       else
         {
          long since = (s.filled > 0 ? s.filled : s.time) / 1000;
          if(!pendingLimit && (long)TimeGMT() - since > InpMaxAgeMin * 60) { GlobalVariableSet(GvDone(s.id8), 2); continue; } // too late to copy
         }
-      if(open >= InpMaxSignals || !TerminalInfoInteger(TERMINAL_TRADE_ALLOWED) || !MQLInfoInteger(MQL_TRADE_ALLOWED)) continue;
-      if(GlobalVariableCheck("MEEGO_T_" + s.id8) && TimeLocal() - (datetime)GlobalVariableGet("MEEGO_T_" + s.id8) < 20) continue; // failed order: try again in 20 s
+      if(open >= InpMaxSignals || !TradeOk(s)) continue;
       if(OpenSignal(s)) open++;
       else GlobalVariableSet("MEEGO_T_" + s.id8, (double)TimeLocal());
      }
@@ -536,6 +553,7 @@ void OnTimer()
    for(int i = 0; i < ArraySize(g_sigs); i++)
       if(g_sigs[i].status == "running" && !GlobalVariableCheck(GvDone(g_sigs[i].id8))) waiting++;
    g_status = "connected - " + IntegerToString(ArraySize(g_sigs)) + " signals in feed - " + IntegerToString(waiting) + " waiting for entry - " + IntegerToString(OpenSignalCount()) + " open - checked " + TimeToString(TimeLocal(), TIME_MINUTES | TIME_SECONDS);
-   Comment("MEEGO AI EA (" + g_sym + ", risk " + DoubleToString(InpRiskPct, 2) + "%): " + g_status);
+   string lotTxt = InpFixedLot > 0 ? IntegerToString(InpLayers) + " x " + DoubleToString(InpFixedLot, 2) + " lot" : "risk " + DoubleToString(InpRiskPct, 2) + "%";
+   Comment("MEEGO AI EA 1.20 (" + g_sym + ", " + lotTxt + (TerminalInfoInteger(TERMINAL_TRADE_ALLOWED) && MQLInfoInteger(MQL_TRADE_ALLOWED) ? "" : ", ALGO TRADING IS OFF") + "): " + g_status);
   }
 //+------------------------------------------------------------------+

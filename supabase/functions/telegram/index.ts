@@ -1721,7 +1721,7 @@ async function cmdAdmin(chatId, a, text) {
       "Post your own too:",
       "<code>/post BUY XAUUSD 4040 4080 3990</code> intraday signal (entry, TP, SL)",
       "<code>/post BUY XAUUSD 4040 4048 4034 scalp</code> scalping signal",
-      "<code>/testsignal buy</code> EA test signal (only you get it) · <code>/testend</code> closes it",
+      "<code>/testsignal buy|sell scalping|intraday|swing [limit]</code> EA test signal (only you get it) · <code>/testend</code> closes it",
       "<code>/post SELL XAUUSD 4129 4119 4140 swing Sell area, wait for price</code> swing (Ultimate only) with a note",
       "<code>/close tp</code> · <code>/close sl</code> · <code>/close be</code> closes the latest running signal (add a pair to choose: <code>/close tp XAUUSD</code>)",
       "",
@@ -1785,12 +1785,17 @@ async function cmdAdmin(chatId, a, text) {
   }
   // A made-up signal at the current price, only for the admin, to check the EA (zone lines, entry, TPs). Not counted anywhere.
   if (cmd === "/testsignal") {
-    const dir = /^s/i.test(parts[1] || "") ? -1 : 1, live = marketOpen(new Date(), "XAUUSD") ? await livePrice("XAUUSD").catch(() => null) : null;
+    const words = parts.slice(1).map((w) => w.toLowerCase()), dir = words.includes("sell") ? -1 : 1, limit = words.includes("limit");
+    const kind = words.some((w) => /^swing/.test(w)) ? "Swing" : words.some((w) => /^intra/.test(w)) ? "Intraday" : "Scalping";
+    const live = marketOpen(new Date(), "XAUUSD") ? await livePrice("XAUUSD").catch(() => null) : null;
     if (live === null) return send(chatId, "No gold price right now (market closed or price not available). Try again later.");
-    const entry = Number(live.toFixed(2)), sl = Number((live - dir * 6).toFixed(2)), z = [live - dir * 4, live + dir * 1].map((x) => Number(x.toFixed(2))).sort((x, y) => x - y);
-    const { error } = await db.from("signals").insert({ id: crypto.randomUUID(), data: { kind: "Scalping", sym: "XAUUSD", dir, entry, sl, ...tpPlan("XAUUSD", dir, entry, sl), zone: z, order: "instant", life: 1, test: true, trial: true, auto: true,
+    // stop 60 / 100 / 200 pips; a limit order waits 30 pips away from the price
+    const stop = kind === "Swing" ? 20 : kind === "Intraday" ? 10 : 6, e = limit ? live - dir * 3 : live, r2 = (x) => Number(x.toFixed(2));
+    const entry = r2(e), sl = r2(e - dir * stop), z = [e - dir * stop * 0.65, e + dir * (limit ? 0 : 1)].map(r2).sort((x, y) => x - y);
+    const { error } = await db.from("signals").insert({ id: crypto.randomUUID(), data: { kind, sym: "XAUUSD", dir, entry, sl, ...tpPlan("XAUUSD", dir, entry, sl, kind === "Swing" ? SWING_TP : kind === "Intraday" ? INTRADAY_TP : TP_PLAN), zone: z,
+      order: limit ? "limit" : "instant", ...(limit ? { pending: true, expire: 1 } : {}), life: 1, test: true, trial: true, auto: true,
       note: `EA TEST, not a real setup · test zone ${z[0].toFixed(2)} - ${z[1].toFixed(2)} · closes after 1 hour`, status: "running", time: Date.now(), closedAt: null } });
-    return send(chatId, error ? "Couldn't save the test signal: " + esc(error.message) : "🧪 Test signal sent. The EA should react within about 30 seconds. Send /testend to close it.");
+    return send(chatId, error ? "Couldn't save the test signal: " + esc(error.message) : `🧪 Test ${kind} ${dir > 0 ? "BUY" : "SELL"}${limit ? " LIMIT" : ""} sent. The EA should react within about 30 seconds. Send /testend to close it.`);
   }
   if (cmd === "/testend") {
     const { data } = await db.from("signals").select("id,data").order("updated_at", { ascending: false }).limit(100);
