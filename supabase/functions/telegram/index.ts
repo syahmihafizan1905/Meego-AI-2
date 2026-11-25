@@ -335,13 +335,16 @@ async function cmdNews(chatId, a) {
   lines.push("", "F = forecast · P = previous", "🔮 Early call can change. Final call + signal arrive ~2 min before each 🔴 news.", "⚠️ Spreads widen at news time: use a small lot.");
   return send(chatId, lines.join("\n"));
 }
+// Malaysia date of a time, e.g. "Wed, 25 Nov 2026"
+const myDay = (t, o = { weekday: "short", day: "numeric", month: "short", year: "numeric" }) => new Date(t + 8 * 3600000).toLocaleDateString("en-GB", { ...o, timeZone: "UTC" });
 // Results for today, this week (from Monday) and this month, in Malaysia time
 function historyStats(list, now = Date.now()) {
   const MY = 8 * 3600000, d = new Date(now + MY);
   const dayStart = Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()) - MY;
   const weekStart = dayStart - ((d.getUTCDay() + 6) % 7) * 86400000;
   const monthStart = Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), 1) - MY;
-  const block = (name, from) => {
+  const block = (name, from, when) => {
+    name = `${name} · ${when}`;
     const c = list.filter((s) => (s.closedAt || s.time) >= from);
     if (!c.length) return `<b>${name}</b>\nNo closed signals yet.`;
     const win = c.filter(isWin).length, sl = c.filter((s) => !isWin(s) && sigPips(s) < 0).length, be = c.length - win - sl;
@@ -354,7 +357,11 @@ function historyStats(list, now = Date.now()) {
       `📈 Net: <b>${net > 0 ? "+" : ""}${net} pips</b>`,
     ].join("\n");
   };
-  return [block("📅 Today", dayStart), block("🗓 This week", weekStart), block("📆 This month", monthStart)].join("\n\n");
+  return [
+    block("📅 Today", dayStart, myDay(dayStart, { weekday: "long", day: "numeric", month: "short", year: "numeric" })),
+    block("🗓 This week", weekStart, `${myDay(weekStart, { weekday: "short", day: "numeric", month: "short" })} – ${myDay(weekStart + 6 * 86400000).replace(",", "")}`),
+    block("📆 This month", monthStart, myDay(monthStart, { month: "long", year: "numeric" })),
+  ].join("\n\n");
 }
 async function cmdHistory(chatId, a) {
   if (!a.admin && !a.tier) return send(chatId, noPlan(a));
@@ -366,14 +373,21 @@ async function cmdHistory(chatId, a) {
   ]);
   const closed = all.filter((s) => ["tp", "sl", "closed", "be"].includes(s.status)).sort((x, y) => (y.closedAt || y.time) - (x.closedAt || x.time));
   const running = all.filter((s) => s.status === "running").length;
-  const rows = closed.slice(0, 10).map((s) => `${isWin(s) ? "✅" : sigPips(s) < 0 ? "❌" : "➖"}${s.tps ? ` TP${s.tpHit || 0}` : ""} ${new Date((s.closedAt || s.time) + 8 * 3600000).toISOString().slice(5, 16).replace("T", " ")} ${s.dir > 0 ? "BUY" : "SELL"} ${esc(s.sym)} · ${esc(s.kind)} <b>${sigPips(s) > 0 ? "+" : ""}${sigPips(s)}</b> pips`);
+  const rows = [];
+  let lastDay = "";
+  for (const s of closed.slice(0, 10)) {
+    const t = s.closedAt || s.time, day = myDay(t, { weekday: "long", day: "numeric", month: "short", year: "numeric" }), p = sigPips(s);
+    if (day !== lastDay) rows.push(...(rows.length ? [""] : []), `🗓 <b>${day}</b>`);
+    lastDay = day;
+    rows.push(`${isWin(s) ? "✅" : p < 0 ? "❌" : "➖"}${s.tps ? ` TP${s.tpHit || 0}` : ""} ${new Date(t + 8 * 3600000).toISOString().slice(11, 16)} ${s.dir > 0 ? "BUY" : "SELL"} ${esc(s.sym)} · ${esc(s.kind)} <b>${p > 0 ? "+" : ""}${p}</b> pips`);
+  }
   return send(chatId, [
     "📊 <b>MEEGO AI · Signal history</b> (Malaysia time)",
     "",
     historyStats(closed),
     "",
     `⏳ Running now: <b>${running}</b>`,
-    ...(rows.length ? ["", "<b>Last 10 closed</b>", ...rows] : []),
+    ...(rows.length ? ["", "<b>Last 10 closed</b> (closing time)", ...rows] : []),
     "",
     "<i>Win = TP hit (with 3 TPs: TP1 hit). Pips = average of the 3 TPs.</i>",
   ].join("\n"));
