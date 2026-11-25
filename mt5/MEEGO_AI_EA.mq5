@@ -4,15 +4,15 @@
 //|  Get your key by sending /ea to the bot.                          |
 //+------------------------------------------------------------------+
 #property copyright "MEEGO AI"
-#property version   "1.00"
-#property description "Copies MEEGO AI gold signals into MT5: entry or limit order, SL, TP1/TP2/TP3,"
-#property description "SL to entry after TP1 and to TP1 after TP2, lot size from your risk %."
+#property version   "1.10"
+#property description "Copies MEEGO AI gold signals into MT5: draws the zone, enters while price is in it, TP1/TP2/TP3,"
+#property description "closes half and moves SL to entry at +100 pips, lot size from your risk %."
 #property description "Tools > Options > Expert Advisors > Allow WebRequest for the MEEGO URL first."
 
 #include <Trade\Trade.mqh>
 
 input string InpKey           = "";        // MEEGO EA key (send /ea in the bot)
-input string InpSymbol        = "XAUUSD";  // Your broker's gold symbol (XAUUSD, XAUUSDm, GOLD...)
+input string InpSymbol        = "XAUUSD";  // Your broker's gold symbol (found by itself if this one does not exist)
 input double InpRiskPct       = 1.0;       // Risk per signal (% of balance)
 input double InpMaxLot        = 1.0;       // Max total lot per signal
 input bool   InpScalping      = true;      // Copy Scalping signals
@@ -23,6 +23,10 @@ input bool   InpRecovery      = true;      // Copy Recovery setups (after a news
 input int    InpMaxSignals    = 3;         // Max signals open at the same time
 input int    InpMaxAgeMin     = 15;        // Skip market signals older than this (minutes)
 input bool   InpMinLotIfSmall = false;     // Use the minimum lot when the risk lot is too small
+input double InpBEPips        = 100;       // At this profit (pips): close half and SL to entry (0 = off)
+input double InpZoneTolPips   = 10;        // Entry allowed this far outside the zone (pips)
+input double InpMinSLPips     = 20;        // Don't enter when the SL is closer than this (pips)
+input bool   InpDrawZone      = true;      // Draw the zone with horizontal lines
 input int    InpPollSec       = 30;        // Check for signals every N seconds
 input long   InpMagic         = 771905;    // Magic number
 input int    InpSlippage      = 50;        // Max slippage (points)
@@ -31,6 +35,7 @@ input string InpUrl           = "https://euoqlrwlzxzszgzqhakv.supabase.co/functi
 CTrade trade;
 bool   g_hedging = true;
 string g_status  = "starting...";
+string g_sym     = "";   // the gold symbol actually traded
 
 struct Sig
   {
@@ -38,30 +43,61 @@ struct Sig
    int    dir, pending, tpHit;
    double entry, sl, tp1, tp2, tp3, slNow, expireH;
    long   time, filled;   // milliseconds (UTC)
+   double zLo, zHi, lifeH; // zone (0 = no zone) and how many hours the trade may stay open
   };
+Sig      g_sigs[];
+datetime g_fetched = 0;   // last time the feed was read (local clock)
+ulong    g_work    = 0;
+#define  PIP 0.1
 
+//+------------------------------------------------------------------+
+// The symbol from the Inputs; if the broker doesn't have it: the chart's symbol when it is XAUUSD with a suffix, else the first XAUUSD... symbol
+string FindGold()
+  {
+   string want = InpSymbol;
+   StringTrimLeft(want);
+   StringTrimRight(want);
+   if(want != "" && SymbolSelect(want, true))
+      return(want);
+   if(StringFind(_Symbol, "XAUUSD") == 0)
+      return(_Symbol);
+   for(int i = 0; i < SymbolsTotal(false); i++)
+     {
+      string n = SymbolName(i, false);
+      if(StringFind(n, "XAUUSD") == 0 && SymbolInfoInteger(n, SYMBOL_TRADE_MODE) == SYMBOL_TRADE_MODE_FULL && SymbolSelect(n, true))
+         return(n);
+     }
+   return("");
+  }
 //+------------------------------------------------------------------+
 int OnInit()
   {
    if(InpKey == "")
       Alert("MEEGO AI EA: paste your EA key in the Inputs (send /ea in the bot to get it).");
-   if(!SymbolSelect(InpSymbol, true))
+   g_sym = FindGold();
+   if(g_sym == "")
      {
       Alert("MEEGO AI EA: symbol '" + InpSymbol + "' not found. Set your broker's gold symbol in the Inputs.");
       return(INIT_PARAMETERS_INCORRECT);
      }
+   if(g_sym != InpSymbol)
+      Print("MEEGO AI EA: using gold symbol " + g_sym);
    g_hedging = (AccountInfoInteger(ACCOUNT_MARGIN_MODE) == ACCOUNT_MARGIN_MODE_RETAIL_HEDGING);
    if(!g_hedging)
       Print("MEEGO AI EA: netting account - each signal opens ONE position (TP2) instead of three.");
    trade.SetExpertMagicNumber(InpMagic);
    trade.SetDeviationInPoints(InpSlippage);
-   trade.SetTypeFillingBySymbol(InpSymbol);
+   trade.SetTypeFillingBySymbol(g_sym);
    EventSetTimer(MathMax(10, InpPollSec));
    OnTimer();
    return(INIT_SUCCEEDED);
   }
-void OnDeinit(const int reason) { EventKillTimer(); Comment(""); }
-void OnTick() {}
+void OnDeinit(const int reason) { EventKillTimer(); Comment(""); ObjectsDeleteAll(0, "MEEGO_Z"); }
+void OnTick()
+  {
+   if(g_sym == "" || GetTickCount64() - g_work < 1000) return;   // at most once a second
+   Work();
+  }
 
 //+------------------------------------------------------------------+
 bool ParseSig(string line, Sig &s)
@@ -88,6 +124,11 @@ bool ParseSig(string line, Sig &s)
    s.time    = StringToInteger(f[16]);
    s.expireH = StringToDouble(f[17]);
    s.filled  = StringToInteger(f[18]);
+   int nf    = ArraySize(f);
+   s.zLo     = nf > 20 ? StringToDouble(f[19]) : 0;
+   s.zHi     = nf > 20 ? StringToDouble(f[20]) : 0;
+   s.lifeH   = nf > 21 ? StringToDouble(f[21]) : 0;
+   if(s.zHi < s.zLo) { double z = s.zLo; s.zLo = s.zHi; s.zHi = z; }
    return(s.dir != 0 && s.entry > 0 && s.sl > 0 && s.tp1 > 0);
   }
 
@@ -105,7 +146,9 @@ bool Wanted(Sig &s)
 string Tag(string id8, int part) { return("MEEGO|" + id8 + "|" + IntegerToString(part)); }
 string IdOf(string comment)       { return(StringFind(comment, "MEEGO|") == 0 ? StringSubstr(comment, 6, 8) : ""); }
 string GvDone(string id8)         { return("MEEGO_" + id8); }
-string GvDelta(string id8)        { return("MEEGO_D_" + id8); }
+string GvBE(string id8)           { return("MEEGO_B_" + id8); }   // 1 = half closed, 2 = SL at entry too
+string GvEnd(string id8)          { return("MEEGO_E_" + id8); }   // server time when the trade must be closed
+bool   HasZone(Sig &s)            { return(s.zLo > 0 && s.zHi > s.zLo); }
 
 // How many different signals have open positions or pending orders
 int OpenSignalCount()
@@ -151,16 +194,16 @@ bool HasAny(string id8)
 // Lot for a stop distance (price units) so that a full SL loses InpRiskPct of the balance
 double RiskLot(double dist)
   {
-   double tv = SymbolInfoDouble(InpSymbol, SYMBOL_TRADE_TICK_VALUE_LOSS);
-   if(tv <= 0) tv = SymbolInfoDouble(InpSymbol, SYMBOL_TRADE_TICK_VALUE);
-   double ts = SymbolInfoDouble(InpSymbol, SYMBOL_TRADE_TICK_SIZE);
+   double tv = SymbolInfoDouble(g_sym, SYMBOL_TRADE_TICK_VALUE_LOSS);
+   if(tv <= 0) tv = SymbolInfoDouble(g_sym, SYMBOL_TRADE_TICK_VALUE);
+   double ts = SymbolInfoDouble(g_sym, SYMBOL_TRADE_TICK_SIZE);
    if(tv <= 0 || ts <= 0 || dist <= 0) return(0);
    double risk = AccountInfoDouble(ACCOUNT_BALANCE) * InpRiskPct / 100.0;
    return(MathMin(risk / (dist / ts * tv), InpMaxLot));
   }
 double NormLot(double v)
   {
-   double st = SymbolInfoDouble(InpSymbol, SYMBOL_VOLUME_STEP);
+   double st = SymbolInfoDouble(g_sym, SYMBOL_VOLUME_STEP);
    if(st <= 0) st = 0.01;
    return(NormalizeDouble(MathFloor(v / st + 1e-9) * st, 2));
   }
@@ -169,21 +212,23 @@ double NormLot(double v)
 // Open a new signal: 3 positions (TP1/TP2/TP3) or one, market or limit
 bool OpenSignal(Sig &s)
   {
-   int    dg  = (int)SymbolInfoInteger(InpSymbol, SYMBOL_DIGITS);
-   double ask = SymbolInfoDouble(InpSymbol, SYMBOL_ASK), bid = SymbolInfoDouble(InpSymbol, SYMBOL_BID);
+   int    dg  = (int)SymbolInfoInteger(g_sym, SYMBOL_DIGITS);
+   double ask = SymbolInfoDouble(g_sym, SYMBOL_ASK), bid = SymbolInfoDouble(g_sym, SYMBOL_BID);
    if(ask <= 0 || bid <= 0) return(false);
    bool limit = (s.order == "limit" && s.pending == 1);
    if(limit && ((s.dir > 0 && ask <= s.entry) || (s.dir < 0 && bid >= s.entry))) limit = false; // already at a better price
    double mkt = (s.dir > 0 ? ask : bid);
    // market signals keep the same distances from your broker's price; limit orders use the signal's prices
-   double delta = (limit || s.order == "limit") ? 0.0 : mkt - s.entry;
+   double delta = (limit || s.order == "limit" || HasZone(s)) ? 0.0 : mkt - s.entry;
    double sl = NormalizeDouble(s.sl + delta, dg);
    double ref = limit ? s.entry : mkt;
    if((ref - sl) * s.dir <= 0) { Print("MEEGO AI EA: skip ", s.id8, " - price already past the SL"); return(false); }
 
+   if(MathAbs(ref - sl) < InpMinSLPips * PIP) return(false);     // too close to the SL for now
+
    bool three = (s.tp2 > 0 && s.tp3 > 0);
    double total = RiskLot(MathAbs(ref - sl));
-   double minL = SymbolInfoDouble(InpSymbol, SYMBOL_VOLUME_MIN);
+   double minL = SymbolInfoDouble(g_sym, SYMBOL_VOLUME_MIN);
    double lots[3];
    double tps[3];
    int parts = 0;
@@ -222,60 +267,226 @@ bool OpenSignal(Sig &s)
       if(limit)
         {
          double price = NormalizeDouble(s.entry, dg);
-         r = (s.dir > 0) ? trade.BuyLimit(lots[i], price, InpSymbol, sl, tp, ORDER_TIME_GTC, 0, c)
-                         : trade.SellLimit(lots[i], price, InpSymbol, sl, tp, ORDER_TIME_GTC, 0, c);
+         r = (s.dir > 0) ? trade.BuyLimit(lots[i], price, g_sym, sl, tp, ORDER_TIME_GTC, 0, c)
+                         : trade.SellLimit(lots[i], price, g_sym, sl, tp, ORDER_TIME_GTC, 0, c);
         }
       else
-         r = (s.dir > 0) ? trade.Buy(lots[i], InpSymbol, 0, sl, tp, c)
-                         : trade.Sell(lots[i], InpSymbol, 0, sl, tp, c);
+         r = (s.dir > 0) ? trade.Buy(lots[i], g_sym, 0, sl, tp, c)
+                         : trade.Sell(lots[i], g_sym, 0, sl, tp, c);
       if(r && (trade.ResultRetcode() == TRADE_RETCODE_DONE || trade.ResultRetcode() == TRADE_RETCODE_PLACED || trade.ResultRetcode() == TRADE_RETCODE_DONE_PARTIAL)) ok++;
       else Print("MEEGO AI EA: order failed for ", s.id8, " part ", i + 1, ": ", trade.ResultRetcode(), " ", trade.ResultRetcodeDescription());
      }
    if(ok > 0)
      {
       GlobalVariableSet(GvDone(s.id8), 1);
-      GlobalVariableSet(GvDelta(s.id8), delta);
+      if(s.lifeH > 0 && !limit) GlobalVariableSet(GvEnd(s.id8), (double)TimeCurrent() + s.lifeH * 3600.0);
       Print("MEEGO AI EA: opened ", s.kind, " ", (s.dir > 0 ? "BUY" : "SELL"), (limit ? " LIMIT " : " "), s.id8, " parts ", ok);
      }
    return(ok > 0);
   }
 
 //+------------------------------------------------------------------+
-// Follow the signal: cancel/close when it ends, SL to entry after TP1, SL to TP1 after TP2
+// Follow the signal: remove pending orders when it ends; close positions only when it was closed by the time limit.
+// SL, TP and breakeven are handled here in MT5 (see ManageBE), not by the bot.
 void Manage(Sig &s)
   {
-   int    dg    = (int)SymbolInfoInteger(InpSymbol, SYMBOL_DIGITS);
-   double pt    = SymbolInfoDouble(InpSymbol, SYMBOL_POINT);
-   double delta = GlobalVariableCheck(GvDelta(s.id8)) ? GlobalVariableGet(GvDelta(s.id8)) : 0.0;
    bool ended   = (s.status != "running");
    bool expired = (s.pending == 1 && ((long)TimeGMT() - s.time / 1000) > (long)(s.expireH * 3600.0));
-
    for(int i = OrdersTotal() - 1; i >= 0; i--)
      {
       ulong t = OrderGetTicket(i);
       if(t == 0 || OrderGetInteger(ORDER_MAGIC) != InpMagic || IdOf(OrderGetString(ORDER_COMMENT)) != s.id8) continue;
       if(ended || expired) trade.OrderDelete(t);
      }
-
-   double bid = SymbolInfoDouble(InpSymbol, SYMBOL_BID), ask = SymbolInfoDouble(InpSymbol, SYMBOL_ASK);
-   bool   hasTps = (s.tp2 > 0 && s.tp3 > 0);
-   double tp1 = s.tp1 + delta, tp2 = s.tp2 + delta;
-   bool hit1 = hasTps && (s.tpHit >= 1 || (s.dir > 0 ? bid >= tp1 : ask <= tp1));
-   bool hit2 = hasTps && (s.tpHit >= 2 || (s.dir > 0 ? bid >= tp2 : ask <= tp2));
-
+   if(s.status != "closed" && s.status != "cancelled") return;
    for(int i = PositionsTotal() - 1; i >= 0; i--)
      {
       ulong t = PositionGetTicket(i);
-      if(t == 0 || PositionGetInteger(POSITION_MAGIC) != InpMagic || IdOf(PositionGetString(POSITION_COMMENT)) != s.id8) continue;
-      if(ended) { trade.PositionClose(t); continue; }
-      if(!hit1) continue;
-      double open = PositionGetDouble(POSITION_PRICE_OPEN);
-      double cur  = PositionGetDouble(POSITION_SL);
-      double tp   = PositionGetDouble(POSITION_TP);
-      double want = NormalizeDouble(hit2 ? tp1 : open, dg);
-      bool better = (cur == 0) || (s.dir > 0 ? want > cur + pt / 2 : want < cur - pt / 2);
-      bool valid  = (s.dir > 0 ? want < bid : want > ask);
-      if(better && valid) trade.PositionModify(t, want, tp);
+      if(t != 0 && PositionGetInteger(POSITION_MAGIC) == InpMagic && IdOf(PositionGetString(POSITION_COMMENT)) == s.id8) trade.PositionClose(t);
+     }
+  }
+
+// Positions of one signal, the nearest TP first
+int Tickets(string id8, ulong &tk[])
+  {
+   double d[];
+   ArrayResize(tk, 0);
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+     {
+      ulong t = PositionGetTicket(i);
+      if(t == 0 || PositionGetInteger(POSITION_MAGIC) != InpMagic || IdOf(PositionGetString(POSITION_COMMENT)) != id8) continue;
+      double dist = MathAbs(PositionGetDouble(POSITION_TP) - PositionGetDouble(POSITION_PRICE_OPEN));
+      int n = ArraySize(tk), k = n;
+      ArrayResize(tk, n + 1);
+      ArrayResize(d, n + 1);
+      while(k > 0 && d[k - 1] > dist) { tk[k] = tk[k - 1]; d[k] = d[k - 1]; k--; }
+      tk[k] = t;
+      d[k] = dist;
+     }
+   return(ArraySize(tk));
+  }
+
+// Half of what is open: half of every position when the lots allow it, otherwise whole positions with the nearest TP
+void CloseHalf(ulong &tk[])
+  {
+   double minL = SymbolInfoDouble(g_sym, SYMBOL_VOLUME_MIN), total = 0;
+   bool   each = true;
+   int    n = ArraySize(tk);
+   for(int i = 0; i < n; i++)
+      if(PositionSelectByTicket(tk[i]))
+        {
+         double v = PositionGetDouble(POSITION_VOLUME), h = NormLot(v / 2.0);
+         total += v;
+         if(h < minL || v - h < minL - 1e-9) each = false;
+        }
+   if(each)
+     {
+      for(int i = 0; i < n; i++)
+         if(PositionSelectByTicket(tk[i])) trade.PositionClosePartial(tk[i], NormLot(PositionGetDouble(POSITION_VOLUME) / 2.0));
+      return;
+     }
+   double left = total / 2.0 + 1e-9;
+   for(int i = 0; i < n - 1; i++)                 // always keep the last one
+      if(PositionSelectByTicket(tk[i]))
+        {
+         double v = PositionGetDouble(POSITION_VOLUME);
+         if(v > left) break;
+         if(trade.PositionClose(tk[i])) left -= v;
+        }
+  }
+
+// At +InpBEPips: close half and move the SL of the rest to entry. Also closes trades whose time is up.
+void ManageBE()
+  {
+   int    dg = (int)SymbolInfoInteger(g_sym, SYMBOL_DIGITS);
+   double pt = SymbolInfoDouble(g_sym, SYMBOL_POINT), bid = SymbolInfoDouble(g_sym, SYMBOL_BID), ask = SymbolInfoDouble(g_sym, SYMBOL_ASK);
+   string seen = "";
+   string ids[];
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+     {
+      ulong t = PositionGetTicket(i);
+      if(t == 0 || PositionGetInteger(POSITION_MAGIC) != InpMagic) continue;
+      string id = IdOf(PositionGetString(POSITION_COMMENT));
+      if(id == "" || StringFind(seen, id) >= 0) continue;
+      seen += id + ",";
+      int n = ArraySize(ids);
+      ArrayResize(ids, n + 1);
+      ids[n] = id;
+     }
+   for(int k = 0; k < ArraySize(ids); k++)
+     {
+      ulong tk[];
+      int n = Tickets(ids[k], tk);
+      if(n == 0) continue;
+      if(GlobalVariableCheck(GvEnd(ids[k])) && (double)TimeCurrent() >= GlobalVariableGet(GvEnd(ids[k])))
+        {
+         for(int i = 0; i < n; i++) trade.PositionClose(tk[i]);
+         Print("MEEGO AI EA: time limit, closed ", ids[k]);
+         continue;
+        }
+      if(InpBEPips <= 0 || !PositionSelectByTicket(tk[0])) continue;
+      int stage = GlobalVariableCheck(GvBE(ids[k])) ? (int)GlobalVariableGet(GvBE(ids[k])) : 0;
+      if(stage >= 2) continue;
+      bool   buy  = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY);
+      double open = PositionGetDouble(POSITION_PRICE_OPEN), gain = buy ? bid - open : open - ask;
+      if(stage == 0)
+        {
+         if(gain < InpBEPips * PIP || !TerminalInfoInteger(TERMINAL_TRADE_ALLOWED) || !MQLInfoInteger(MQL_TRADE_ALLOWED)) continue;
+         GlobalVariableSet(GvBE(ids[k]), 1);      // set first, so half is never closed twice
+         CloseHalf(tk);
+         Print("MEEGO AI EA: +", DoubleToString(gain / PIP, 0), " pips, closed half of ", ids[k]);
+         n = Tickets(ids[k], tk);
+        }
+      bool all = true;
+      for(int i = 0; i < n; i++)
+        {
+         if(!PositionSelectByTicket(tk[i])) continue;
+         double e = NormalizeDouble(PositionGetDouble(POSITION_PRICE_OPEN), dg), cur = PositionGetDouble(POSITION_SL), tp = PositionGetDouble(POSITION_TP);
+         if(cur != 0 && (buy ? cur >= e - pt / 2 : cur <= e + pt / 2)) continue;   // already at entry or better
+         if(!(buy ? e < bid : e > ask) || !trade.PositionModify(tk[i], e, tp)) all = false;
+        }
+      if(all) GlobalVariableSet(GvBE(ids[k]), 2);
+     }
+  }
+
+//+------------------------------------------------------------------+
+void DrawLine(string name, double price, color c, string text)
+  {
+   if(ObjectFind(0, name) < 0)
+     {
+      ObjectCreate(0, name, OBJ_HLINE, 0, 0, price);
+      ObjectSetInteger(0, name, OBJPROP_COLOR, c);
+      ObjectSetInteger(0, name, OBJPROP_STYLE, STYLE_DASH);
+      ObjectSetInteger(0, name, OBJPROP_WIDTH, 1);
+      ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+      ObjectSetString(0, name, OBJPROP_TEXT, text);
+      ObjectSetString(0, name, OBJPROP_TOOLTIP, text);
+     }
+   ObjectSetDouble(0, name, OBJPROP_PRICE, price);
+  }
+// Zone lines stay while the signal is running or its trade is open
+void DrawZones()
+  {
+   string keep = "";
+   if(InpDrawZone && _Symbol == g_sym)
+      for(int i = 0; i < ArraySize(g_sigs); i++)
+        {
+         if(!HasZone(g_sigs[i]) || !Wanted(g_sigs[i]) || (g_sigs[i].status != "running" && !HasAny(g_sigs[i].id8))) continue;
+         color  c = g_sigs[i].dir > 0 ? clrMediumSeaGreen : clrTomato;
+         string t = "MEEGO " + g_sigs[i].kind + (g_sigs[i].dir > 0 ? " demand" : " supply") + " zone";
+         DrawLine("MEEGO_ZT_" + g_sigs[i].id8, g_sigs[i].zHi, c, t + " top");
+         DrawLine("MEEGO_ZB_" + g_sigs[i].id8, g_sigs[i].zLo, c, t + " bottom");
+         keep += g_sigs[i].id8 + ",";
+        }
+   for(int i = ObjectsTotal(0) - 1; i >= 0; i--)
+     {
+      string nm = ObjectName(0, i);
+      if(StringFind(nm, "MEEGO_Z") == 0 && StringFind(keep, StringSubstr(nm, 9)) < 0) ObjectDelete(0, nm);
+     }
+   ChartRedraw();
+  }
+
+// May a zone signal be entered now? 1 = yes, 0 = wait, -1 = never (the move is over)
+int ZoneState(Sig &s)
+  {
+   double ask = SymbolInfoDouble(g_sym, SYMBOL_ASK), bid = SymbolInfoDouble(g_sym, SYMBOL_BID);
+   double p = s.dir > 0 ? ask : bid, tol = InpZoneTolPips * PIP;
+   if(p <= 0) return(0);
+   if(s.tpHit > 0 || (s.sl - p) * s.dir >= 0 || (p - s.tp1) * s.dir >= 0) return(-1);          // TP1 or SL already reached
+   if(s.lifeH > 0 && (double)TimeGMT() - s.time / 1000.0 > s.lifeH * 3600.0) return(-1);
+   // the zone, stretched to the signal's entry when the bot entered just outside it
+   double lo = MathMin(s.zLo, s.entry) - tol, hi = MathMax(s.zHi, s.entry) + tol;
+   return(p >= lo && p <= hi ? 1 : 0);
+  }
+
+// Entries and trade management, every second
+void Work()
+  {
+   g_work = GetTickCount64();
+   ManageBE();
+   if(TimeLocal() - g_fetched > 120) return;      // no fresh signals: manage only
+   int open = OpenSignalCount();
+   for(int i = 0; i < ArraySize(g_sigs); i++)
+     {
+      Sig s = g_sigs[i];
+      if(s.status != "running" || GlobalVariableCheck(GvDone(s.id8))) continue;
+      if(HasAny(s.id8)) { GlobalVariableSet(GvDone(s.id8), 1); continue; }
+      bool pendingLimit = (s.order == "limit" && s.pending == 1);
+      if(HasZone(s))
+        {
+         int z = ZoneState(s);
+         if(z < 0) { GlobalVariableSet(GvDone(s.id8), 2); continue; }
+         if(z == 0) continue;
+        }
+      else
+        {
+         long since = (s.filled > 0 ? s.filled : s.time) / 1000;
+         if(!pendingLimit && (long)TimeGMT() - since > InpMaxAgeMin * 60) { GlobalVariableSet(GvDone(s.id8), 2); continue; } // too late to copy
+        }
+      if(open >= InpMaxSignals || !TerminalInfoInteger(TERMINAL_TRADE_ALLOWED) || !MQLInfoInteger(MQL_TRADE_ALLOWED)) continue;
+      if(GlobalVariableCheck("MEEGO_T_" + s.id8) && TimeLocal() - (datetime)GlobalVariableGet("MEEGO_T_" + s.id8) < 20) continue; // failed order: try again in 20 s
+      if(OpenSignal(s)) open++;
+      else GlobalVariableSet("MEEGO_T_" + s.id8, (double)TimeLocal());
      }
   }
 
@@ -294,6 +505,7 @@ void OnTimer()
       g_status = (e == 4014) ? "Allow WebRequest: Tools > Options > Expert Advisors > add https://euoqlrwlzxzszgzqhakv.supabase.co"
                              : "connection error " + IntegerToString(e);
       Comment("MEEGO AI EA: " + g_status);
+      Work();
       return;
      }
    string body = CharArrayToString(res, 0, WHOLE_ARRAY, CP_UTF8);
@@ -302,28 +514,28 @@ void OnTimer()
    if(n < 1 || StringFind(lines[0], "OK|") != 0)
      {
       Comment("MEEGO AI EA: " + (n > 0 ? lines[0] : "no answer") + " (HTTP " + IntegerToString(code) + ")");
+      Work();
       return;
      }
-   int open = OpenSignalCount(), seen = 0, opened = 0;
-   long nowS = (long)TimeGMT();
+   ArrayResize(g_sigs, 0);
    for(int i = 1; i < n; i++)
      {
       string line = lines[i];
       StringTrimRight(line);
       Sig s;
       if(!ParseSig(line, s) || !Wanted(s)) continue;
-      seen++;
+      int k = ArraySize(g_sigs);
+      ArrayResize(g_sigs, k + 1);
+      g_sigs[k] = s;
       Manage(s);
-      if(s.status != "running") continue;
-      if(GlobalVariableCheck(GvDone(s.id8))) continue;
-      if(HasAny(s.id8)) { GlobalVariableSet(GvDone(s.id8), 1); continue; }
-      bool pendingLimit = (s.order == "limit" && s.pending == 1);
-      long since = (s.filled > 0 ? s.filled : s.time) / 1000;
-      if(!pendingLimit && nowS - since > InpMaxAgeMin * 60) { GlobalVariableSet(GvDone(s.id8), 2); continue; } // too late to copy
-      if(open >= InpMaxSignals) continue;
-      if(OpenSignal(s)) { open++; opened++; }
      }
-   g_status = "connected · " + IntegerToString(seen) + " signals in feed · " + IntegerToString(open) + " open · checked " + TimeToString(TimeLocal(), TIME_MINUTES | TIME_SECONDS);
-   Comment("MEEGO AI EA (" + InpSymbol + ", risk " + DoubleToString(InpRiskPct, 1) + "%): " + g_status);
+   g_fetched = TimeLocal();
+   Work();
+   DrawZones();
+   int waiting = 0;
+   for(int i = 0; i < ArraySize(g_sigs); i++)
+      if(g_sigs[i].status == "running" && !GlobalVariableCheck(GvDone(g_sigs[i].id8))) waiting++;
+   g_status = "connected - " + IntegerToString(ArraySize(g_sigs)) + " signals in feed - " + IntegerToString(waiting) + " waiting for entry - " + IntegerToString(OpenSignalCount()) + " open - checked " + TimeToString(TimeLocal(), TIME_MINUTES | TIME_SECONDS);
+   Comment("MEEGO AI EA (" + g_sym + ", risk " + DoubleToString(InpRiskPct, 2) + "%): " + g_status);
   }
 //+------------------------------------------------------------------+

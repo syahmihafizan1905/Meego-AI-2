@@ -1505,7 +1505,7 @@ async function eaFile(name) {
   if (!data?.b64) return null;
   return Uint8Array.from(atob(data.b64.replace(/\s/g, "")), (ch) => ch.charCodeAt(0));
 }
-// One line per signal: S|id|kind|news|sym|dir|order|status|pending|entry|sl|tp1|tp2|tp3|tpHit|slNow|time|expireH|filled
+// One line per signal: S|id|kind|news|sym|dir|order|status|pending|entry|sl|tp1|tp2|tp3|tpHit|slNow|time|expireH|filled|zoneLow|zoneHigh|lifeH
 async function eaFeed(key) {
   const txt = (body, status = 200) => new Response(body, { status, headers: { "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-store" } });
   if (!/^[a-f0-9]{32}$/.test(String(key || ""))) return txt("ERR|bad key", 403);
@@ -1518,7 +1518,7 @@ async function eaFeed(key) {
   const n = (v) => (Number.isFinite(Number(v)) ? String(Number(v)) : "0");
   const rows = (data ?? []).map((r) => ({ id: r.id, ...r.data })).filter((x) => x && x.sym && (x.status === "running" || (x.closedAt || x.time) >= since) && canSeeSignal(a, x));
   const lines = rows.map((x) => ["S", x.id, x.kind, x.news || "", x.sym, x.dir, x.order || "instant", x.status, x.pending ? 1 : 0, n(x.entry), n(x.sl0 ?? x.sl),
-    ...(x.tps ? x.tps.map(n) : [n(x.tp), "0", "0"]), x.tpHit || 0, n(x.sl), Math.round(x.time || 0), x.expire ?? LIMIT.expire, Math.round(x.filled || 0)].join("|"));
+    ...(x.tps ? x.tps.map(n) : [n(x.tp), "0", "0"]), x.tpHit || 0, n(x.sl), Math.round(x.time || 0), x.expire ?? LIMIT.expire, Math.round(x.filled || 0), n(x.zone?.[0]), n(x.zone?.[1]), n(x.life ?? AUTO[x.kind]?.life)].join("|"));
   return txt([`OK|${Date.now()}|${a.admin ? "ADMIN" : a.tier}`, ...lines].join("\n"));
 }
 async function sendFile(chatId, name, content, caption) {
