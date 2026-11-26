@@ -30,7 +30,8 @@ input double InpBEPips        = 100;       // At this profit (pips): close half 
 input double InpZoneTolPips   = 10;        // Entry allowed this far outside the zone (pips)
 input double InpMinSLPips     = 20;        // Don't enter when the SL is closer than this (pips)
 input bool   InpZoneLimit     = true;      // Price outside the zone: place limit orders at the zone
-input bool   InpDrawZone      = true;      // Draw the zone with horizontal lines
+input bool   InpDrawZone      = true;      // Draw the zone as a shaded box
+input int    InpZoneShade     = 30;        // Box strength (10 = faint, 100 = solid)
 input int    InpPollSec       = 30;        // Check for signals every N seconds
 input long   InpMagic         = 771905;    // Magic number
 input int    InpSlippage      = 50;        // Max slippage (points)
@@ -93,6 +94,8 @@ int OnInit()
    trade.SetExpertMagicNumber(InpMagic);
    trade.SetDeviationInPoints(InpSlippage);
    trade.SetTypeFillingBySymbol(g_sym);
+   ObjectsDeleteAll(0, "MEEGO_ZT_");   // zone lines of older versions
+   ObjectsDeleteAll(0, "MEEGO_ZB_");
    EventSetTimer(MathMax(10, InpPollSec));
    OnTimer();
    return(INIT_SUCCEEDED);
@@ -420,21 +423,33 @@ void ManageBE()
   }
 
 //+------------------------------------------------------------------+
-void DrawLine(string name, double price, color c, string text)
+// a and b mixed: k = 0 gives b, 1 gives a (looks see-through when b is the chart background)
+color Mix(color a, color b, double k)
   {
+   int r = (int)MathRound((a & 0xFF) * k + (b & 0xFF) * (1 - k)), g = (int)MathRound(((a >> 8) & 0xFF) * k + ((b >> 8) & 0xFF) * (1 - k)),
+       bl = (int)MathRound(((a >> 16) & 0xFF) * k + ((b >> 16) & 0xFF) * (1 - k));
+   return((color)(r | (g << 8) | (bl << 16)));
+  }
+// Filled box behind the candles, from the signal to a little past the last candle
+void DrawBox(string name, datetime t1, double lo, double hi, color c, string text)
+  {
+   datetime t2 = TimeCurrent() + 15 * PeriodSeconds();
    if(ObjectFind(0, name) < 0)
      {
-      ObjectCreate(0, name, OBJ_HLINE, 0, 0, price);
-      ObjectSetInteger(0, name, OBJPROP_COLOR, c);
-      ObjectSetInteger(0, name, OBJPROP_STYLE, STYLE_DASH);
-      ObjectSetInteger(0, name, OBJPROP_WIDTH, 1);
+      ObjectCreate(0, name, OBJ_RECTANGLE, 0, t1, hi, t2, lo);
+      ObjectSetInteger(0, name, OBJPROP_FILL, true);
+      ObjectSetInteger(0, name, OBJPROP_BACK, true);
       ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
-      ObjectSetString(0, name, OBJPROP_TEXT, text);
-      ObjectSetString(0, name, OBJPROP_TOOLTIP, text);
+      ObjectSetInteger(0, name, OBJPROP_HIDDEN, true);
      }
-   ObjectSetDouble(0, name, OBJPROP_PRICE, price);
+   double k = MathMax(10, MathMin(100, InpZoneShade)) / 100.0;
+   ObjectSetInteger(0, name, OBJPROP_COLOR, Mix(c, (color)ChartGetInteger(0, CHART_COLOR_BACKGROUND), k));
+   ObjectSetString(0, name, OBJPROP_TEXT, text);
+   ObjectSetString(0, name, OBJPROP_TOOLTIP, text);
+   ObjectMove(0, name, 0, t1, hi);
+   ObjectMove(0, name, 1, t2, lo);
   }
-// Zone lines stay while the zone is valid and the signal is running or its trade is open
+// The zone box stays while the zone is valid and the signal is running or its trade is open
 void DrawZones()
   {
    string keep = "";
@@ -443,9 +458,9 @@ void DrawZones()
         {
          if(!HasZone(g_sigs[i]) || !Wanted(g_sigs[i]) || (g_sigs[i].status != "running" && !HasAny(g_sigs[i].id8)) || !ZoneValid(g_sigs[i])) continue;
          color  c = g_sigs[i].dir > 0 ? clrMediumSeaGreen : clrTomato;
-         string t = "MEEGO " + g_sigs[i].kind + (g_sigs[i].dir > 0 ? " demand" : " supply") + " zone";
-         DrawLine("MEEGO_ZT_" + g_sigs[i].id8, g_sigs[i].zHi, c, t + " top");
-         DrawLine("MEEGO_ZB_" + g_sigs[i].id8, g_sigs[i].zLo, c, t + " bottom");
+         string t = "MEEGO " + g_sigs[i].kind + (g_sigs[i].dir > 0 ? " demand" : " supply") + " zone " + DoubleToString(g_sigs[i].zLo, 2) + " - " + DoubleToString(g_sigs[i].zHi, 2);
+         long   off = (long)MathRound(((double)TimeTradeServer() - (double)TimeGMT()) / 1800.0) * 1800;   // server clock - UTC
+         DrawBox("MEEGO_ZR_" + g_sigs[i].id8, (datetime)(g_sigs[i].time / 1000 + off), g_sigs[i].zLo, g_sigs[i].zHi, c, t);
          keep += g_sigs[i].id8 + ",";
         }
    for(int i = ObjectsTotal(0) - 1; i >= 0; i--)
@@ -489,7 +504,7 @@ datetime ZoneBroken(Sig &s)
          datetime at = r[i].time + sec;
          GlobalVariableSet(GvBroken(s.id8), (double)at);
          Print("MEEGO AI EA: ", s.kind, " ", (s.dir > 0 ? "demand" : "supply"), " zone ", DoubleToString(s.zLo, 2), "-", DoubleToString(s.zHi, 2), " of ", s.id8,
-               " is no longer valid since ", TimeToString(at, TIME_DATE | TIME_MINUTES), " (", EnumToString(tf), " closed ", (s.dir > 0 ? "below" : "above"), " it): lines removed, no new entry");
+               " is no longer valid since ", TimeToString(at, TIME_DATE | TIME_MINUTES), " (", EnumToString(tf), " closed ", (s.dir > 0 ? "below" : "above"), " it): box removed, no new entry");
          return(at);
         }
      }
