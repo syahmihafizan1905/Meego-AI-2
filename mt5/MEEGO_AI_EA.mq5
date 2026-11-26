@@ -4,9 +4,9 @@
 //|  Get your key by sending /ea to the bot.                          |
 //+------------------------------------------------------------------+
 #property copyright "MEEGO AI"
-#property version   "1.30"
+#property version   "1.31"
 #property description "Copies MEEGO AI gold signals into MT5: draws the zone, enters while price is in it, TP1/TP2/TP3,"
-#property description "closes half and moves SL to entry at +100 pips, lot size from your risk %."
+#property description "closes half and moves SL to entry at +100 pips, removes a zone once it is no longer valid."
 #property description "Tools > Options > Expert Advisors > Allow WebRequest for the MEEGO URL first."
 
 #include <Trade\Trade.mqh>
@@ -155,6 +155,7 @@ string IdOf(string comment)       { return(StringFind(comment, "MEEGO|") == 0 ? 
 string GvDone(string id8)         { return("MEEGO_" + id8); }
 string GvBE(string id8)           { return("MEEGO_B_" + id8); }   // 1 = half closed, 2 = SL at entry too
 string GvEnd(string id8)          { return("MEEGO_E_" + id8); }   // server time when the trade must be closed
+string GvBroken(string id8)       { return("MEEGO_X_" + id8); }   // server time when the zone stopped being valid
 bool   HasZone(Sig &s)            { return(s.zLo > 0 && s.zHi > s.zLo); }
 
 // How many different signals have open positions or pending orders
@@ -300,6 +301,7 @@ void Manage(Sig &s)
    double age   = (double)TimeGMT() - s.time / 1000.0;
    bool expired = (s.pending == 1 && age > s.expireH * 3600.0) || (s.lifeH > 0 && s.pending != 1 && age > s.lifeH * 3600.0);
    if(HasZone(s) && s.tpHit > 0) expired = true;                 // TP1 reached without us: the zone orders are too late
+   if(HasZone(s) && (s.status == "running" || HasAny(s.id8)) && ZoneBroken(s) > 0) expired = true;   // the zone is broken: no limit orders left in it
    for(int i = OrdersTotal() - 1; i >= 0; i--)
      {
       ulong t = OrderGetTicket(i);
@@ -432,14 +434,14 @@ void DrawLine(string name, double price, color c, string text)
      }
    ObjectSetDouble(0, name, OBJPROP_PRICE, price);
   }
-// Zone lines stay while the signal is running or its trade is open
+// Zone lines stay while the zone is valid and the signal is running or its trade is open
 void DrawZones()
   {
    string keep = "";
    if(InpDrawZone && _Symbol == g_sym)
       for(int i = 0; i < ArraySize(g_sigs); i++)
         {
-         if(!HasZone(g_sigs[i]) || !Wanted(g_sigs[i]) || (g_sigs[i].status != "running" && !HasAny(g_sigs[i].id8))) continue;
+         if(!HasZone(g_sigs[i]) || !Wanted(g_sigs[i]) || (g_sigs[i].status != "running" && !HasAny(g_sigs[i].id8)) || !ZoneValid(g_sigs[i])) continue;
          color  c = g_sigs[i].dir > 0 ? clrMediumSeaGreen : clrTomato;
          string t = "MEEGO " + g_sigs[i].kind + (g_sigs[i].dir > 0 ? " demand" : " supply") + " zone";
          DrawLine("MEEGO_ZT_" + g_sigs[i].id8, g_sigs[i].zHi, c, t + " top");
@@ -467,6 +469,41 @@ int ZoneState(Sig &s)
    return(p >= lo && p <= hi ? 1 : 0);
   }
 
+// When the zone stopped being valid (server time, 0 = still valid): a finished candle closed beyond its far edge after the signal.
+// Candles: M5 for Scalping, H1 for Swing, M15 for the rest.
+datetime ZoneBroken(Sig &s)
+  {
+   if(!HasZone(s)) return(0);
+   if(GlobalVariableCheck(GvBroken(s.id8))) return((datetime)GlobalVariableGet(GvBroken(s.id8)));
+   ENUM_TIMEFRAMES tf = s.kind == "Scalping" ? PERIOD_M5 : s.kind == "Swing" ? PERIOD_H1 : PERIOD_M15;
+   long off = (long)MathRound(((double)TimeTradeServer() - (double)TimeGMT()) / 1800.0) * 1800;   // server clock - UTC
+   datetime from = (datetime)(s.time / 1000 + off), now = TimeTradeServer();
+   double far = s.dir > 0 ? MathMin(s.zLo, s.entry) : MathMax(s.zHi, s.entry);   // the zone, stretched to the entry when the bot entered just outside it
+   MqlRates r[];
+   int n = CopyRates(g_sym, tf, from, now, r), sec = PeriodSeconds(tf);
+   for(int i = 0; i < n; i++)
+     {
+      if(r[i].time < from || r[i].time + sec > now) continue;          // before the signal, or not finished yet
+      if((r[i].close - far) * s.dir < 0)
+        {
+         datetime at = r[i].time + sec;
+         GlobalVariableSet(GvBroken(s.id8), (double)at);
+         Print("MEEGO AI EA: ", s.kind, " ", (s.dir > 0 ? "demand" : "supply"), " zone ", DoubleToString(s.zLo, 2), "-", DoubleToString(s.zHi, 2), " of ", s.id8,
+               " is no longer valid since ", TimeToString(at, TIME_DATE | TIME_MINUTES), " (", EnumToString(tf), " closed ", (s.dir > 0 ? "below" : "above"), " it): lines removed, no new entry");
+         return(at);
+        }
+     }
+   return(0);
+  }
+// Zone still worth showing: not broken, TP1 not reached, SL not reached, time not up
+bool ZoneValid(Sig &s)
+  {
+   if(ZoneBroken(s) > 0 || s.tpHit > 0) return(false);
+   if(s.lifeH > 0 && (double)TimeGMT() - s.time / 1000.0 > s.lifeH * 3600.0) return(false);
+   double p = s.dir > 0 ? SymbolInfoDouble(g_sym, SYMBOL_BID) : SymbolInfoDouble(g_sym, SYMBOL_ASK);
+   return(p <= 0 || (p - s.sl) * s.dir > 0);
+  }
+
 // Algo trading on, and no failed order in the last 20 seconds
 bool TradeOk(Sig &s)
   {
@@ -489,7 +526,7 @@ void Work()
       bool pendingLimit = (s.order == "limit" && s.pending == 1);
       if(HasZone(s) && !pendingLimit)
         {
-         int z = ZoneState(s);
+         int z = ZoneBroken(s) > 0 ? -1 : ZoneState(s);
          if(z < 0) { GlobalVariableSet(GvDone(s.id8), 2); continue; }
          if(z == 0)
            {
@@ -560,6 +597,6 @@ void OnTimer()
       if(g_sigs[i].status == "running" && !GlobalVariableCheck(GvDone(g_sigs[i].id8))) { waiting++; if(g_sigs[i].ready == 0) sopWait++; }
    g_status = "connected - " + IntegerToString(ArraySize(g_sigs)) + " signals in feed - " + IntegerToString(waiting) + " waiting for entry" + (sopWait > 0 ? " (" + IntegerToString(sopWait) + " PR SOP: dashboard not ready)" : "") + " - " + IntegerToString(OpenSignalCount()) + " open - checked " + TimeToString(TimeLocal(), TIME_MINUTES | TIME_SECONDS);
    string lotTxt = InpFixedLot > 0 ? IntegerToString(InpLayers) + " x " + DoubleToString(InpFixedLot, 2) + " lot" : "risk " + DoubleToString(InpRiskPct, 2) + "%";
-   Comment("MEEGO AI EA 1.30 (" + g_sym + ", " + lotTxt + (TerminalInfoInteger(TERMINAL_TRADE_ALLOWED) && MQLInfoInteger(MQL_TRADE_ALLOWED) ? "" : ", ALGO TRADING IS OFF") + "): " + g_status);
+   Comment("MEEGO AI EA 1.31 (" + g_sym + ", " + lotTxt + (TerminalInfoInteger(TERMINAL_TRADE_ALLOWED) && MQLInfoInteger(MQL_TRADE_ALLOWED) ? "" : ", ALGO TRADING IS OFF") + "): " + g_status);
   }
 //+------------------------------------------------------------------+
