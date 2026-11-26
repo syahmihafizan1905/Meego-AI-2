@@ -385,7 +385,7 @@ async function cmdHistory(chatId, a) {
     const t = s.closedAt || s.time, day = myDay(t, { weekday: "long", day: "numeric", month: "short", year: "numeric" }), p = sigPips(s);
     if (day !== lastDay) rows.push(...(rows.length ? [""] : []), `🗓 <b>${day}</b>`);
     lastDay = day;
-    rows.push(`${isWin(s) ? "✅" : p < 0 ? "❌" : "➖"}${s.tps ? ` TP${s.tpHit || 0}` : ""} ${new Date(t + 8 * 3600000).toISOString().slice(11, 16)} ${s.dir > 0 ? "BUY" : "SELL"} ${esc(s.sym)} · ${esc(s.setup === "SNR" ? "SNR Breakout" : s.kind)} <b>${p > 0 ? "+" : ""}${p}</b> pips`);
+    rows.push(`${isWin(s) ? "✅" : p < 0 ? "❌" : "➖"}${s.tps ? ` TP${s.tpHit || 0}` : ""} ${new Date(t + 8 * 3600000).toISOString().slice(11, 16)} ${s.dir > 0 ? "BUY" : "SELL"} ${esc(s.sym)} · ${esc(s.setup === "SNR" ? "SNR " + s.kind : s.kind)} <b>${p > 0 ? "+" : ""}${p}</b> pips`);
   }
   return send(chatId, [
     "📊 <b>MEEGO AI · Signal history</b> (Malaysia time)",
@@ -1207,70 +1207,80 @@ async function scalpTouch(sym, G, price, used) {
   const live = await livePrice(sym).catch(() => null);
   return live === null ? null : touchSetup(zones, live);
 }
-/* ---------- SNR breakout + retest (gold): H1 levels, M15 break, retest, confirmation ---------- */
-// 6 months of M15 gold (MT5, 3 pips spread), Intraday TPs, SL to entry after TP1: 56 signals, TP1 59%, +11.8R (Jun-Aug +9.2R, Sep-Nov +2.6R).
-// Posted as Intraday signals with setup "SNR", admin only (trial), with their own limits: 1 open, 1 h apart, 3 a day.
-// Level: 2+ H1 swing points within lv.tol x H1 ATR. Break: a strong M15 candle closes through a level price had been respecting.
-// Retest: price comes back to the level within `win` M15 candles without closing back through it; the last M15 candle confirms (closes away from the level).
-const SNRB = { look: 160, piv: 3, tol: 0.3, touches: 2, clean: 24, body: 0.5, beyond: 0.1, win: 16, near: 0.2, back: 0.15, far: 0.6, buf: 0.25, min: 30, max: 150 };
-function snrLevels(H) {
-  const x = H.slice(-SNRB.look), a = atr(x), p = pivots(x, SNRB.piv), pts = p.hi.concat(p.lo).map((q) => ({ v: q.v, t: x[q.i].t })).sort((u, w) => u.v - w.v), out = [];
+/* ---------- SNR breakout + retest (gold): levels on a higher timeframe, break, retest and confirmation on a lower one ---------- */
+// Level: 2+ swing points (level timeframe) within tol x ATR. Break: a strong candle (break timeframe) closes through a level price had been respecting.
+// Retest: price comes back to the level within `win` candles without closing back through it; the last candle confirms (closes away from the level).
+// Posted with setup "SNR" (admin only, trial) and their own limits per kind. Backtests, MT5 gold, 3 pips spread, the kind's own TPs, SL to entry after TP1:
+//   Scalping (M15 levels, M5 break), 6 months: 176 signals, TP1 57%, +23.4R (Jun-Aug +7.9R, Sep-Nov +16.5R)
+//   Intraday (H1 levels, M15 break), 6 months: 56 signals, TP1 59%, +11.8R (Jun-Aug +9.2R, Sep-Nov +2.6R)
+//   Swing (H4 levels, H1 break), 17 months: 36 signals, TP1 44%, +5.7R (weak: Mar-Nov 2026 +0.3R)
+const SNRB = { look: 160, piv: 3, tol: 0.3, touches: 2, clean: 24, body: 0.5, beyond: 0.1, win: 16, near: 0.2, back: 0.15, far: 0.6, buf: 0.25 };
+// lt: level timeframe, bt: break timeframe (minutes); min/max: stop in pips; open/cool(h)/day: limits; life: hours
+const SNRK = {
+  Scalping: { lt: 15, bt: 5, clean: 36, min: 20, max: 100, open: 1, cool: 0.5, day: 5, life: 3 },
+  Intraday: { lt: 60, bt: 15, min: 30, max: 150, open: 1, cool: 1, day: 3, life: 24 },
+  Swing: { lt: 240, bt: 60, min: 60, max: 300, open: 1, cool: 4, day: 2, life: 120 },
+};
+function snrLevels(H, P = SNRB) {
+  const x = H.slice(-P.look), a = atr(x), p = pivots(x, P.piv), pts = p.hi.concat(p.lo).map((q) => ({ v: q.v, t: x[q.i].t })).sort((u, w) => u.v - w.v), out = [];
   for (let i = 0; i < pts.length; ) {
     let j = i;
-    while (j + 1 < pts.length && pts[j + 1].v - pts[i].v <= SNRB.tol * a) j++;
-    if (j - i + 1 >= SNRB.touches) { const g = pts.slice(i, j + 1); out.push({ v: g.reduce((s, q) => s + q.v, 0) / g.length, n: g.length, last: Math.max(...g.map((q) => q.t)) }); }
+    while (j + 1 < pts.length && pts[j + 1].v - pts[i].v <= P.tol * a) j++;
+    if (j - i + 1 >= P.touches) { const g = pts.slice(i, j + 1); out.push({ v: g.reduce((s, q) => s + q.v, 0) / g.length, n: g.length, last: Math.max(...g.map((q) => q.t)) }); }
     i = j + 1;
   }
   return { levels: out, a };
 }
-function snrBreak(H, M, used) {
+function snrBreak(H, M, used, k) {
+  const P = { ...SNRB, ...k };
   if (H.length < 60 || M.length < 60) return null;
-  const { levels, a } = snrLevels(H), n = M.length, L = M[n - 1], strong = smStrong(H);
+  const { levels, a } = snrLevels(H, P), n = M.length, L = M[n - 1], strong = smStrong(H);
   if (!a) return null;
   let best = null;
   for (const lv of levels) {
     for (const dir of [1, -1]) {
-      if (strong === -dir) continue; // not against a strong H1 trend
-      // the break: a strong M15 close through the level, within the last `win` candles, after the level held for `clean` candles
+      if (strong === -dir) continue; // not against a strong trend on the level timeframe
+      // the break: a strong close through the level, within the last `win` candles, after the level held for `clean` candles
       let b = -1;
-      for (let i = n - 2; i >= Math.max(SNRB.clean, n - 1 - SNRB.win); i--) {
+      for (let i = n - 2; i >= Math.max(P.clean, n - 1 - P.win); i--) {
         const x = M[i], body = Math.abs(x.c - x.o);
-        if ((x.c - lv.v) * dir > SNRB.beyond * a && (M[i - 1].c - lv.v) * dir <= 0 && (x.c - x.o) * dir > 0 && body >= SNRB.body * (x.h - x.l)) { b = i; break; }
+        if ((x.c - lv.v) * dir > P.beyond * a && (M[i - 1].c - lv.v) * dir <= 0 && (x.c - x.o) * dir > 0 && body >= P.body * (x.h - x.l)) { b = i; break; }
       }
       if (b < 0 || lv.last >= M[b].t) continue;
-      if (M.slice(b - SNRB.clean, b).some((x) => (x.c - lv.v) * dir > 0)) continue; // it was a real level before the break
+      if (M.slice(b - P.clean, b).some((x) => (x.c - lv.v) * dir > 0)) continue; // it was a real level before the break
       const key = "B" + M[b].t + dir;
       if (used.has(key)) continue;
       const after = M.slice(b + 1);
-      if (after.some((x) => (x.c - lv.v) * dir < -SNRB.back * a)) continue; // closed back through: failed breakout
+      if (after.some((x) => (x.c - lv.v) * dir < -P.back * a)) continue; // closed back through: failed breakout
       // the retest: came back to the level after the break (in the last 3 candles), and the last candle closes away from it
-      const r = after.findIndex((x) => (dir > 0 ? x.l : x.h) * dir <= (lv.v + dir * SNRB.near * a) * dir);
+      const r = after.findIndex((x) => (dir > 0 ? x.l : x.h) * dir <= (lv.v + dir * P.near * a) * dir);
       if (r < 0 || after.length - r > 3) continue;
-      if ((L.c - L.o) * dir <= 0 || (L.c - lv.v) * dir <= 0 || (L.c - lv.v) * dir > SNRB.far * a) continue;
+      if ((L.c - L.o) * dir <= 0 || (L.c - lv.v) * dir <= 0 || (L.c - lv.v) * dir > P.far * a) continue;
       const ext = dir > 0 ? Math.min(...after.slice(r).map((x) => x.l)) : Math.max(...after.slice(r).map((x) => x.h));
-      const sl = (dir > 0 ? Math.min(ext, lv.v) : Math.max(ext, lv.v)) - dir * SNRB.buf * a, risk = Math.abs(L.c - sl), rp = risk / pip("XAUUSD");
-      if (rp < SNRB.min || rp > SNRB.max) continue;
+      const sl = (dir > 0 ? Math.min(ext, lv.v) : Math.max(ext, lv.v)) - dir * P.buf * a, risk = Math.abs(L.c - sl), rp = risk / pip("XAUUSD");
+      if (rp < P.min || rp > P.max) continue;
       if (!best || lv.n > best.lv.n) best = { dir, key, entry: L.c, sl, lv, a, bt: M[b].t };
     }
   }
   return best;
 }
-async function snrScan(sym, G, all) {
-  const mine = all.filter((s) => s.setup === "SNR" && s.sym === sym && !s.test);
-  if (mine.some((s) => s.status === "running")) return;
-  if (Date.now() - Math.max(0, ...mine.map((s) => s.closedAt || s.time)) < 3600000) return;
-  if (mine.filter((s) => s.time >= Date.now() - 86400000).length >= 3) return;
-  const b = snrBreak(G(60), G(15), new Set(mine.map((x) => x.zkey).filter(Boolean)));
+const TFN = (m) => (m >= 240 ? "H4" : m >= 60 ? "H1" : "M" + m);
+async function snrScan(sym, G, all, kind) {
+  const k = SNRK[kind], mine = all.filter((s) => s.setup === "SNR" && s.kind === kind && s.sym === sym && !s.test);
+  if (mine.filter((s) => s.status === "running").length >= k.open) return;
+  if (Date.now() - Math.max(0, ...mine.map((s) => s.closedAt || s.time)) < k.cool * 3600000) return;
+  if (mine.filter((s) => s.time >= Date.now() - 86400000).length >= k.day) return;
+  const b = snrBreak(G(k.lt), G(k.bt), new Set(mine.map((x) => x.zkey).filter(Boolean)), k);
   if (!b) return;
   const lo = b.lv.v - SNRB.near * b.a, hi = b.lv.v + SNRB.near * b.a, d = digits(sym);
-  const s = { dir: b.dir, entry: b.entry, sl: b.sl, zkey: b.key, zone: [Number(lo.toFixed(2)), Number(hi.toFixed(2))], order: "instant", setup: "SNR",
-    note: `🤖 MEEGO AI · SNR breakout + retest · H1 ${b.dir > 0 ? "resistance" : "support"} ${b.lv.v.toFixed(2)} (${b.lv.n} touches) broken on M15, retested and holding` };
+  const s = { dir: b.dir, entry: b.entry, sl: b.sl, zkey: b.key, zone: [Number(lo.toFixed(2)), Number(hi.toFixed(2))], order: "instant", setup: "SNR", life: k.life,
+    note: `🤖 MEEGO AI · SNR breakout + retest · ${TFN(k.lt)} ${b.dir > 0 ? "resistance" : "support"} ${b.lv.v.toFixed(2)} (${b.lv.n} touches) broken on ${TFN(k.bt)}, retested and holding` };
   if (!(await reprice(s, sym))) return;
   const rp = Math.abs(s.entry - s.sl) / pip(sym);
-  if (rp < SNRB.min || rp > SNRB.max) return;
-  for (const k of ["entry", "sl"]) s[k] = Number(s[k].toFixed(d));
-  Object.assign(s, tpPlan(sym, s.dir, s.entry, s.sl, INTRADAY_TP));
-  await db.from("signals").insert({ id: crypto.randomUUID(), data: { kind: "Intraday", sym, ...s, status: "running", auto: true, trial: true, time: Date.now(), closedAt: null } });
+  if (rp < k.min || rp > k.max) return;
+  for (const f of ["entry", "sl"]) s[f] = Number(s[f].toFixed(d));
+  Object.assign(s, tpPlan(sym, s.dir, s.entry, s.sl, kind === "Swing" ? SWING_TP : kind === "Intraday" ? INTRADAY_TP : TP_PLAN));
+  await db.from("signals").insert({ id: crypto.randomUUID(), data: { kind, sym, ...s, status: "running", auto: true, trial: true, time: Date.now(), closedAt: null } });
 }
 // Last saved copy of the candles (no API call); asks for new ones when it is over 20 minutes old
 async function savedCandles(sym, interval) {
@@ -1331,7 +1341,7 @@ async function autoScan() {
       Object.assign(s, tpPlan(sym, s.dir, s.entry, s.sl, own && kind === "Swing" ? SWING_TP : snd && kind === "Intraday" ? INTRADAY_TP : TP_PLAN));
       await db.from("signals").insert({ id: crypto.randomUUID(), data: { kind, sym, ...s, status: "running", auto: true, ...(TRIAL.includes(kind) ? { trial: true } : {}), time: Date.now(), closedAt: null } });
     }
-    if (snd) await snrScan(sym, sndG, all).catch((e) => console.error("SNR breakout failed", e));
+    if (snd) for (const kind of ["Swing", "Intraday", "Scalping"]) await snrScan(sym, sndG, all, kind).catch((e) => console.error("SNR breakout failed", kind, e));
   }
 }
 
@@ -2025,7 +2035,7 @@ async function signalChart(s) {
   if (list.length < 20) return null;
   const word = s.dir > 0 ? "BUY" : "SELL", my = new Date(s.time + 8 * 3600000), zt = Number((String(s.zkey || "").match(/^Z(\d{13})/) || [])[1] || 0);
   const why = String(s.note || "").replace(/^🤖 MEEGO AI · /, "").replace(/^(Demand|Supply) zone \S+ [\d.]+ - [\d.]+ · /, "");
-  const label = s.test ? "EA TEST" : s.setup === "SNR" ? "SNR BREAKOUT" : s.nine ? "9:59 AM SETUP" : s.news === "pre" ? "NEWS" : s.news === "recovery" ? "RECOVERY" : s.kind.toUpperCase();
+  const label = s.test ? "EA TEST" : s.setup === "SNR" ? "SNR " + s.kind.toUpperCase() : s.nine ? "9:59 AM SETUP" : s.news === "pre" ? "NEWS" : s.news === "recovery" ? "RECOVERY" : s.kind.toUpperCase();
   const opts = {
     candles: list, dir: s.dir, entry: s.entry, sl: s.sl0 ?? s.sl, tps: s.tps || [s.tp], zone: Array.isArray(s.zone) ? s.zone : null, zoneFrom: zt, tf: min, digits: digits(s.sym),
     title: `${label} ${word} ${s.sym}`, sub: `${min === 60 ? "H1" : "M15"} · ${my.toISOString().slice(0, 10).split("-").reverse().join("/")} ${my.toISOString().slice(11, 16)} MYT${why ? " · " + why.slice(0, 90) : ""}`,
@@ -2069,7 +2079,7 @@ async function onDbEvent(ev) {
     const chats = await audience(s.kind, !!s.trial);
     if (ev.op === "INSERT" && s.status === "running") {
       const sig = { id: ev.record.id, ...s };
-      const title = s.kind === "SOP" ? `🧪 PR SOP ${s.wait ? "· WAIT (EA waits)" : "· ENTRY NOW"}` : s.test ? "🧪 EA TEST (not a real setup)" : s.setup === "SNR" ? "🧪 SNR BREAKOUT TEST (admin only)" : s.trial ? `🧪 ${s.kind.toUpperCase()} TEST (admin only)` : s.nine ? "🕘 9:59 AM SETUP" : s.news === "pre" ? "📰 NEWS SIGNAL" : s.news === "recovery" ? "🔁 RECOVERY SETUP (after news spike)" : kindOf(s.kind).fresh;
+      const title = s.kind === "SOP" ? `🧪 PR SOP ${s.wait ? "· WAIT (EA waits)" : "· ENTRY NOW"}` : s.test ? "🧪 EA TEST (not a real setup)" : s.setup === "SNR" ? `🧪 SNR BREAKOUT ${s.kind.toUpperCase()} TEST (admin only)` : s.trial ? `🧪 ${s.kind.toUpperCase()} TEST (admin only)` : s.nine ? "🕘 9:59 AM SETUP" : s.news === "pre" ? "📰 NEWS SIGNAL" : s.news === "recovery" ? "🔁 RECOVERY SETUP (after news spike)" : kindOf(s.kind).fresh;
       for (const c of chats) { await sendLive(c, sig, title); await new Promise((r) => setTimeout(r, 60)); }
       await sendChart(chats, sig).catch((e) => console.error("signal chart failed", e));
       return;
