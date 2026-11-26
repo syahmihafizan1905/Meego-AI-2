@@ -77,7 +77,7 @@ async function account(chatId) {
 const canSee = (a, kind) => a.admin || (!!a.tier && (kind !== "Swing" || a.tier === "Ultimate"));
 // Auto signals of these kinds go to the admin only while they are being tested (news signals, the 9:59 AM setup and /post are not affected).
 // To send them to customers again, take the kind out of this list.
-const TRIAL = ["Scalping", "Intraday", "Swing", "SOP"];
+const TRIAL = ["Scalping", "Intraday", "Swing"];
 const off = (k) => TRIAL.includes(k);
 const trialText = TRIAL.join(", ").replace(/, ([^,]*)$/, " and $1");
 const canSeeSignal = (a, s) => canSee(a, s.kind) && (a.admin || !s.trial);
@@ -371,7 +371,7 @@ function historyStats(list, now = Date.now()) {
 }
 async function cmdHistory(chatId, a) {
   if (!a.admin && !a.tier) return send(chatId, noPlan(a));
-  const kinds = (canSee(a, "Swing") ? ["Swing", "Intraday", "Scalping"] : ["Intraday", "Scalping"]).concat(a.admin ? ["SOP"] : []);
+  const kinds = (canSee(a, "Swing") ? ["Swing", "Intraday", "Scalping"] : ["Intraday", "Scalping"]);
   const all = [];
   await Promise.all([
     (async () => { for (const k of kinds) all.push(...(await signalsOf(k)).filter((s) => canSeeSignal(a, s) && !s.test)); })(),
@@ -608,7 +608,6 @@ const SETUP_RULE = { Scalping: { zones: 1, snrHold: true }, Intraday: { zones: 2
 const AUTO = {
   Scalping: { tf: "m5", ema: 20, look: 3, need: ["m15"], bonus: ["m5", "h1"], min: 4, floor: 2, step: 2, buf: 0.2, rr: 1.5, life: 3, cool: 0.5, max: 5, open: 1, maxPips: 100 },
   Intraday: { tf: "m15", ema: 20, look: 3, need: ["h1"], bonus: ["m15", "h4"], min: 5, floor: 2, step: 3, buf: 0.2, rr: 2, life: 24, cool: 1, max: 3, open: 2 },
-  SOP: { life: 24, cool: 0, max: 8, open: 2 },
   Swing: { tf: "h1", ema: 50, look: 4, need: ["h4"], bonus: ["h1", "d1"], min: 6, floor: 2, step: 4, buf: 0.3, rr: 2, life: 72, cool: 4, max: 2, open: 2 },
 };
 // Limit entry: placed k of the way from price to the SL; cancelled if not reached within `expire` hours
@@ -872,7 +871,7 @@ async function watchSignals(list) {
     if (!m1.length) continue;
     let m15 = null;
     for (const s of sigs) {
-      if (s.wait) { if (Date.now() - s.time > SOP.wait * 60000) await setStatus(s, "cancelled"); continue; } // PR SOP waiting for the dashboard
+      if (s.wait) { await setStatus(s, "cancelled"); continue; } // an old PR SOP signal that was still waiting
       let path = m1.filter((x) => x.t >= s.time);
       if (m1[0].t > s.time) path = (m15 ??= await candles(sym, "15min")).filter((x) => x.t >= s.time);
       let hit = null, filled = s.pending ? null : s.filled || s.time;
@@ -1208,77 +1207,6 @@ async function scalpTouch(sym, G, price, used) {
   const live = await livePrice(sym).catch(() => null);
   return live === null ? null : touchSetup(zones, live);
 }
-/* ---------- PR SOP (the admin's PR PROJECT V3 rules) ---------- */
-// M15 BUY+ / SELL+ -> signal at once. Entry when the dashboard (EMA 3>8>21 on M1, M5, M15, M30, H1) is 4/5 or 5/5 the same way
-// AND the M5 ribbon is the same way; otherwise the signal waits (the EA doesn't enter) for up to 60 minutes.
-// Gold backtest, 4 pips spread: 66 days 170 trades -27.6R, 29 days 61 trades +7.6R (same as random entries). On trial.
-const SOP = { fast: 3, mid: 8, slow: 21, gapFast: 0.6, gapMid: 0.1, maxPlus: 10, need: 4, wait: 60, sl: 65 };
-const SOP_TP = [[0, 100, 100], [0, 200, 200], [0, 300, 300]];
-// EMA 3/8/21, the PR trend (changes only when the EMAs are far enough apart) and the EMA order of every candle
-function prSeries(c) {
-  const k = (n) => 2 / (n + 1);
-  let f = c[0]?.c, m = f, sl = f, a = c[0] ? c[0].h - c[0].l : 0, d = 0;
-  return c.map((x, i) => {
-    if (i) {
-      const pc = c[i - 1].c;
-      f += k(SOP.fast) * (x.c - f); m += k(SOP.mid) * (x.c - m); sl += k(SOP.slow) * (x.c - sl);
-      a += (Math.max(x.h, pc) - Math.min(x.l, pc) - a) / Math.min(i + 1, 14);
-      if (i >= SOP.slow) { if (f - sl > SOP.gapFast * a && m - sl > SOP.gapMid * a) d = 1; else if (sl - f > SOP.gapFast * a && sl - m > SOP.gapMid * a) d = -1; }
-    }
-    return { t: x.t, trend: d, fm: f > m ? 1 : f < m ? -1 : 0, align: f > m && m > sl ? 1 : f < m && m < sl ? -1 : 0 };
-  });
-}
-// BUY / SELL (trend flip) and BUY+ / SELL+ (trend continues, EMA 3 crosses EMA 8) of every candle
-function prMarks(c) {
-  const r = prSeries(c), out = [];
-  let plus = 0;
-  for (let i = 2; i < r.length; i++) {
-    const t = r[i].trend, p = r[i - 1].trend;
-    if (t !== p) plus = 0;
-    const st = (j, d) => r[j].trend === d && r[j - 1].trend === d && r[j].fm === d;
-    if (t === 1 && p === -1) out.push({ t: r[i].t, dir: 1, text: "BUY" });
-    else if (t === -1 && p === 1) out.push({ t: r[i].t, dir: -1, text: "SELL" });
-    else for (const d of [1, -1]) if (st(i, d) && !st(i - 1, d) && plus < SOP.maxPlus) { out.push({ t: r[i].t, dir: d, text: d > 0 ? "BUY+" : "SELL+" }); plus++; }
-  }
-  return { marks: out, series: r };
-}
-// Dashboard rows and the M5 ribbon, from finished candles
-function prDash(G, m1) {
-  const m30 = group(G(15), 30).filter((x) => x.t + 1800000 <= (G(15).at(-1)?.t ?? 0) + 900000);
-  const rows = [["M1", m1], ["M5", G(5)], ["M15", G(15)], ["M30", m30], ["H1", G(60)]].map(([n, c]) => [n, c.length > 30 ? prSeries(c.slice(-400)).at(-1).align : 0]);
-  const m5 = G(5), ribbon = m5.length > 30 ? prSeries(m5.slice(-400)).at(-1).trend : 0;
-  return { rows, ribbon, count: (dir) => rows.filter((r) => r[1] === dir).length };
-}
-const prReady = (d, dir) => d.count(dir) >= SOP.need && d.ribbon === dir;
-// A new signal when the last finished M15 candle is BUY+ / SELL+
-function sopSetup(G, m1, price, used) {
-  const c15 = G(15).slice(-400);
-  if (c15.length < 60) return null;
-  const { marks } = prMarks(c15), last = c15.at(-1), mk = marks.find((x) => x.t === last.t && x.text.endsWith("+"));
-  if (!mk || used.has("P" + mk.t + mk.dir)) return null;
-  const dash = prDash(G, m1), ready = prReady(dash, mk.dir), sl = price - mk.dir * SOP.sl * pip("XAUUSD");
-  const myT = new Date(mk.t + 8 * 3600000).toISOString().slice(11, 16);
-  return { dir: mk.dir, entry: price, sl, zkey: "P" + mk.t + mk.dir, sigT: mk.t, order: "instant", life: 24, wait: !ready, dash: dash.rows, ribbon: dash.ribbon,
-    note: `🤖 MEEGO AI · PR SOP: ${mk.text} M15 ${myT} · dashboard ${dash.count(mk.dir)}/5 ${mk.dir > 0 ? "BULLISH" : "BEARISH"} · ribbon M5 ${dash.ribbon === mk.dir ? "OK" : "not yet"} · ${ready ? "ENTRY NOW" : "WAIT: the EA enters when the dashboard is 4/5 and the ribbon agrees (60 min)"}` };
-}
-// Running PR SOP signals: start the trade when the dashboard lines up, close when the M15 trend turns against it
-async function sopWatch(all, G, m1, sym) {
-  const live = all.filter((x) => x.kind === "SOP" && x.sym === sym && x.status === "running");
-  if (!live.length) return;
-  const c15 = G(15).slice(-400), trend = c15.length > 30 ? prSeries(c15).at(-1).trend : 0, dash = prDash(G, m1);
-  for (const x of live) {
-    const { id, ...data } = x;
-    if (x.wait) {
-      if (!prReady(dash, x.dir)) continue;
-      const p = await livePrice(sym).catch(() => null);
-      if (p === null) continue;
-      const entry = Number(p.toFixed(digits(sym))), sl = Number((p - x.dir * SOP.sl * pip(sym)).toFixed(digits(sym)));
-      Object.assign(data, { wait: false, entry, sl, ...tpPlan(sym, x.dir, entry, sl, SOP_TP), filled: Date.now(), time: Date.now(), dash: dash.rows, ribbon: dash.ribbon,
-        note: String(x.note || "").replace(/ · WAIT:.*$/, "") + ` · ENTRY NOW (dashboard ${dash.count(x.dir)}/5)` });
-      await db.from("signals").update({ data, updated_at: new Date().toISOString() }).eq("id", id);
-    } else if (trend === -x.dir) await setStatus(x, "closed", await livePrice(sym).catch(() => m1.at(-1).c));
-  }
-}
 // Last saved copy of the candles (no API call); asks for new ones when it is over 20 minutes old
 async function savedCandles(sym, interval) {
   const { data } = await db.from("price_cache").select("data,fetched_at").eq("key", `${sym.slice(0, 3)}/${sym.slice(3)}|${interval}`).maybeSingle();
@@ -1311,8 +1239,7 @@ async function autoScan() {
     // finished candles only, for the Intraday setups: m1 is cached for up to 3 minutes, so "finished" is judged by its last candle
     const upTo = m1[m1.length - 1].t, up15 = m15.length ? m15[m15.length - 1].t : 0;
     const ix = { m5: group(m1.filter((x) => !/^XAU/.test(sym) || goldOpen(x.t)), 5).filter((x) => x.t + 300000 <= upTo), m15: m15.filter((x) => x.t < up15), m30: group(m15.filter((x) => x.t < up15), 30).filter((x) => x.t + 1800000 <= up15), h1: d.h1 };
-    if (snd) await sopWatch(all, sndG, m1.filter((x) => x.t + 60000 <= upTo + 60000).slice(0, -1), sym).catch((e) => console.error("PR SOP watch failed", e));
-    for (const kind of snd ? ["Swing", "Intraday", "Scalping", "SOP"] : ["Swing", "Intraday", "Scalping"]) {
+    for (const kind of ["Swing", "Intraday", "Scalping"]) {
       const mine = all.filter((s) => s.kind === kind && s.sym === sym && s.auto && !s.nine && !s.test);
       if (mine.filter((s) => s.status === "running").length >= AUTO[kind].open) continue;
       const lastEnd = Math.max(0, ...mine.map((s) => s.closedAt || s.time));
@@ -1323,7 +1250,7 @@ async function autoScan() {
       const quiet = (Date.now() - Math.max(dayStart, ...mine.map((s) => s.time))) / 3600000;
       const own = snd || (kind !== "Scalping" && /^XAU/.test(sym)), used = new Set(mine.map((x) => x.zkey).filter(Boolean));
       const touch = snd && kind === "Scalping"; // already priced at the live price
-      const s = kind === "SOP" ? sopSetup(sndG, m1.slice(0, -1), price, used) : touch ? await scalpTouch(sym, sndG, price, used) : snd ? sndSetup(kind, sndG, price, used) : !own ? findSetup(kind, d, price, relaxDrop(kind, quiet)) : kind === "Intraday" ? intradaySetup(ix, price, used) : swingSetup(d.h1, h1.length ? h1[h1.length - 1].t : 0, price, used);
+      const s = touch ? await scalpTouch(sym, sndG, price, used) : snd ? sndSetup(kind, sndG, price, used) : !own ? findSetup(kind, d, price, relaxDrop(kind, quiet)) : kind === "Intraday" ? intradaySetup(ix, price, used) : swingSetup(d.h1, h1.length ? h1[h1.length - 1].t : 0, price, used);
       if (!s || !(touch || (await reprice(s, sym)))) continue;
       const nowPips = Math.abs(s.entry - s.sl) / pip(sym);
       if (snd && nowPips < (KX[kind]?.min ?? 0)) continue;
@@ -1336,7 +1263,7 @@ async function autoScan() {
         Object.assign(s, { order: "limit", pending: true });
       } else s.order = "instant";
       for (const k of ["entry", "sl"]) s[k] = Number(s[k].toFixed(digits(sym)));
-      Object.assign(s, tpPlan(sym, s.dir, s.entry, s.sl, kind === "SOP" ? SOP_TP : own && kind === "Swing" ? SWING_TP : snd && kind === "Intraday" ? INTRADAY_TP : TP_PLAN));
+      Object.assign(s, tpPlan(sym, s.dir, s.entry, s.sl, own && kind === "Swing" ? SWING_TP : snd && kind === "Intraday" ? INTRADAY_TP : TP_PLAN));
       await db.from("signals").insert({ id: crypto.randomUUID(), data: { kind, sym, ...s, status: "running", auto: true, ...(TRIAL.includes(kind) ? { trial: true } : {}), time: Date.now(), closedAt: null } });
     }
   }
@@ -1637,21 +1564,6 @@ async function sendFile(chatId, name, content, caption) {
   const r = await fetch(`https://api.telegram.org/bot${TOKEN}/sendDocument`, { method: "POST", body: fd });
   return await r.json().catch(() => ({ ok: false }));
 }
-// /testsignal sop [buy|sell]: a PR SOP signal from the latest real M15 BUY+ / SELL+ and the dashboard as it is now (admin only, not counted)
-async function testSop(chatId, words) {
-  const live = marketOpen(new Date(), "XAUUSD") ? await livePrice("XAUUSD").catch(() => null) : null;
-  if (live === null) return send(chatId, "No gold price right now (market closed or price not available). Try again later.");
-  const [m1, m15, h1] = [await candles("XAUUSD", "1min"), await candles("XAUUSD", "15min"), await candles("XAUUSD", "1h")];
-  const G = sndCandles("XAUUSD", m1, m15, h1), want = words.includes("sell") ? -1 : words.includes("buy") ? 1 : 0;
-  const mk = prMarks(G(15).slice(-400)).marks.filter((m) => m.text.endsWith("+") && (!want || m.dir === want)).at(-1);
-  if (!mk) return send(chatId, `No ${want > 0 ? "BUY+" : want < 0 ? "SELL+" : "BUY+ / SELL+"} on M15 in the last few days.`);
-  const dash = prDash(G, m1.slice(0, -1)), ready = prReady(dash, mk.dir), r2 = (x) => Number(x.toFixed(2));
-  const entry = r2(live), sl = r2(live - mk.dir * SOP.sl * pip("XAUUSD")), at = new Date(mk.t + 8 * 3600000).toISOString().slice(11, 16), ago = Math.round((Date.now() - mk.t) / 3600000);
-  const { error } = await db.from("signals").insert({ id: crypto.randomUUID(), data: { kind: "SOP", sym: "XAUUSD", dir: mk.dir, entry, sl, ...tpPlan("XAUUSD", mk.dir, entry, sl, SOP_TP), zkey: "T" + mk.t + mk.dir, sigT: mk.t,
-    order: "instant", life: 1, wait: !ready, dash: dash.rows, ribbon: dash.ribbon, test: true, trial: true, auto: true, status: "running", time: Date.now(), closedAt: null,
-    note: `EA TEST · PR SOP: latest ${mk.text} M15 ${at}${ago >= 1 ? ` (${ago}h ago)` : ""} · dashboard ${dash.count(mk.dir)}/5 ${mk.dir > 0 ? "BULLISH" : "BEARISH"} · ribbon M5 ${dash.ribbon === mk.dir ? "OK" : "not yet"} · ${ready ? "ENTRY NOW" : "WAIT: the EA enters when the dashboard is 4/5 and the ribbon agrees (60 min)"}` } });
-  return send(chatId, error ? "Couldn't save the test signal: " + esc(error.message) : `🧪 Test PR SOP ${mk.dir > 0 ? "BUY" : "SELL"} sent (${mk.text} M15 ${at}, dashboard ${dash.count(mk.dir)}/5, ${ready ? "ENTRY NOW" : "WAIT"}). Send /testend to close it.`);
-}
 async function saveEaFile(chatId, msg) {
   const doc = msg.document, ext = doc.file_name.split(".").pop().toLowerCase(), name = "MEEGO_AI_EA." + ext, all = /\ball\b/i.test(String(msg.caption || ""));
   if (doc.file_size > 5 * 1024 * 1024) return send(chatId, "That file is too big for an EA.");
@@ -1841,7 +1753,7 @@ async function cmdAdmin(chatId, a, text) {
       "Post your own too:",
       "<code>/post BUY XAUUSD 4040 4080 3990</code> intraday signal (entry, TP, SL)",
       "<code>/post BUY XAUUSD 4040 4048 4034 scalp</code> scalping signal",
-      "<code>/testsignal buy|sell scalping|intraday|swing [limit]</code> or <code>/testsignal sop [buy|sell]</code> EA test signal (only you get it) · <code>/testend</code> closes it",
+      "<code>/testsignal buy|sell scalping|intraday|swing [limit]</code> EA test signal (only you get it) · <code>/testend</code> closes it",
       "<code>/post SELL XAUUSD 4129 4119 4140 swing Sell area, wait for price</code> swing (Ultimate only) with a note",
       "<code>/close tp</code> · <code>/close sl</code> · <code>/close be</code> closes the latest running signal (add a pair to choose: <code>/close tp XAUUSD</code>)",
       "",
@@ -1906,7 +1818,6 @@ async function cmdAdmin(chatId, a, text) {
   // A made-up signal at the current price, only for the admin, to check the EA (zone lines, entry, TPs). Not counted anywhere.
   if (cmd === "/testsignal") {
     const words = parts.slice(1).map((w) => w.toLowerCase()), dir = words.includes("sell") ? -1 : 1, limit = words.includes("limit");
-    if (words.includes("sop")) return testSop(chatId, words);
     const kind = words.some((w) => /^swing/.test(w)) ? "Swing" : words.some((w) => /^intra/.test(w)) ? "Intraday" : "Scalping";
     const live = marketOpen(new Date(), "XAUUSD") ? await livePrice("XAUUSD").catch(() => null) : null;
     if (live === null) return send(chatId, "No gold price right now (market closed or price not available). Try again later.");
@@ -2053,11 +1964,6 @@ async function signalChart(s) {
     candles: list, dir: s.dir, entry: s.entry, sl: s.sl0 ?? s.sl, tps: s.tps || [s.tp], zone: Array.isArray(s.zone) ? s.zone : null, zoneFrom: zt, tf: min, digits: digits(s.sym),
     title: `${label} ${word} ${s.sym}`, sub: `${min === 60 ? "H1" : "M15"} · ${my.toISOString().slice(0, 10).split("-").reverse().join("/")} ${my.toISOString().slice(11, 16)} MYT${why ? " · " + why.slice(0, 90) : ""}`,
   };
-  if (s.kind === "SOP") {
-    const all15 = (await candles(s.sym, "15min")).filter((x) => x.t <= s.time), { marks, series } = prMarks(all15.slice(-400)), from = list[0].t;
-    Object.assign(opts, { marks: marks.filter((m) => m.t >= from), ribbon: series.slice(-list.length).map((r) => r.trend), dash: s.dash || null,
-      vline: s.sigT ? { t: s.sigT + 900000, dir: s.dir, text: `${s.dir > 0 ? "BUY+" : "SELL+"} M15` } : null, title: `PR SOP ${word} ${s.sym}${s.wait ? " · WAIT" : " · ENTRY"}` });
-  }
   const svg = chartSvg(opts);
   const fontBuffers = await resvgFonts();
   return new Resvg(svg, { font: { fontBuffers, defaultFontFamily: "DejaVu Sans", loadSystemFonts: false }, fitTo: { mode: "width", value: 1000 } }).render().asPng();
