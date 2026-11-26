@@ -4,7 +4,7 @@
 //|  Get your key by sending /ea to the bot.                          |
 //+------------------------------------------------------------------+
 #property copyright "MEEGO AI"
-#property version   "1.20"
+#property version   "1.30"
 #property description "Copies MEEGO AI gold signals into MT5: draws the zone, enters while price is in it, TP1/TP2/TP3,"
 #property description "closes half and moves SL to entry at +100 pips, lot size from your risk %."
 #property description "Tools > Options > Expert Advisors > Allow WebRequest for the MEEGO URL first."
@@ -20,6 +20,7 @@ input double InpMaxLot        = 1.0;       // Max total lot per signal
 input bool   InpScalping      = true;      // Copy Scalping signals
 input bool   InpIntraday      = true;      // Copy Intraday signals
 input bool   InpSwing         = true;      // Copy Swing signals (Ultimate plan)
+input bool   InpSop           = true;      // Copy PR SOP signals (enters only when the dashboard is ready)
 input bool   InpNews          = true;      // Copy News signals
 input bool   InpRecovery      = true;      // Copy Recovery setups (after a news SL)
 input int    InpMaxSignals    = 3;         // Max signals open at the same time
@@ -47,6 +48,7 @@ struct Sig
    double entry, sl, tp1, tp2, tp3, slNow, expireH;
    long   time, filled;   // milliseconds (UTC)
    double zLo, zHi, lifeH; // zone (0 = no zone) and how many hours the trade may stay open
+   int    ready;           // 0 = the bot says wait (PR SOP dashboard not lined up yet)
   };
 Sig      g_sigs[];
 datetime g_fetched = 0;   // last time the feed was read (local clock)
@@ -131,6 +133,7 @@ bool ParseSig(string line, Sig &s)
    s.zLo     = nf > 20 ? StringToDouble(f[19]) : 0;
    s.zHi     = nf > 20 ? StringToDouble(f[20]) : 0;
    s.lifeH   = nf > 21 ? StringToDouble(f[21]) : 0;
+   s.ready   = nf > 22 ? (int)StringToInteger(f[22]) : 1;
    if(s.zHi < s.zLo) { double z = s.zLo; s.zLo = s.zHi; s.zHi = z; }
    return(s.dir != 0 && s.entry > 0 && s.sl > 0 && s.tp1 > 0);
   }
@@ -143,6 +146,7 @@ bool Wanted(Sig &s)
    if(s.kind == "Scalping")    return(InpScalping);
    if(s.kind == "Intraday")    return(InpIntraday);
    if(s.kind == "Swing")       return(InpSwing);
+   if(s.kind == "SOP")         return(InpSop);
    return(false);
   }
 
@@ -481,6 +485,7 @@ void Work()
       Sig s = g_sigs[i];
       if(s.status != "running" || GlobalVariableCheck(GvDone(s.id8))) continue;
       if(HasAny(s.id8)) { GlobalVariableSet(GvDone(s.id8), 1); continue; }
+      if(s.ready == 0) continue;                       // PR SOP: wait until the bot says the dashboard is ready
       bool pendingLimit = (s.order == "limit" && s.pending == 1);
       if(HasZone(s) && !pendingLimit)
         {
@@ -550,10 +555,11 @@ void OnTimer()
    Work();
    DrawZones();
    int waiting = 0;
+   int sopWait = 0;
    for(int i = 0; i < ArraySize(g_sigs); i++)
-      if(g_sigs[i].status == "running" && !GlobalVariableCheck(GvDone(g_sigs[i].id8))) waiting++;
-   g_status = "connected - " + IntegerToString(ArraySize(g_sigs)) + " signals in feed - " + IntegerToString(waiting) + " waiting for entry - " + IntegerToString(OpenSignalCount()) + " open - checked " + TimeToString(TimeLocal(), TIME_MINUTES | TIME_SECONDS);
+      if(g_sigs[i].status == "running" && !GlobalVariableCheck(GvDone(g_sigs[i].id8))) { waiting++; if(g_sigs[i].ready == 0) sopWait++; }
+   g_status = "connected - " + IntegerToString(ArraySize(g_sigs)) + " signals in feed - " + IntegerToString(waiting) + " waiting for entry" + (sopWait > 0 ? " (" + IntegerToString(sopWait) + " PR SOP: dashboard not ready)" : "") + " - " + IntegerToString(OpenSignalCount()) + " open - checked " + TimeToString(TimeLocal(), TIME_MINUTES | TIME_SECONDS);
    string lotTxt = InpFixedLot > 0 ? IntegerToString(InpLayers) + " x " + DoubleToString(InpFixedLot, 2) + " lot" : "risk " + DoubleToString(InpRiskPct, 2) + "%";
-   Comment("MEEGO AI EA 1.20 (" + g_sym + ", " + lotTxt + (TerminalInfoInteger(TERMINAL_TRADE_ALLOWED) && MQLInfoInteger(MQL_TRADE_ALLOWED) ? "" : ", ALGO TRADING IS OFF") + "): " + g_status);
+   Comment("MEEGO AI EA 1.30 (" + g_sym + ", " + lotTxt + (TerminalInfoInteger(TERMINAL_TRADE_ALLOWED) && MQLInfoInteger(MQL_TRADE_ALLOWED) ? "" : ", ALGO TRADING IS OFF") + "): " + g_status);
   }
 //+------------------------------------------------------------------+

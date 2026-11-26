@@ -29,6 +29,7 @@ const ADMIN_MENU = { keyboard: [[{ text: "➕ Add customer" }, { text: "👥 Cus
 const KIND = {
   Scalping: { title: "⚡ DAILY SIGNAL SCALPING", fresh: "📢 NEW SCALPING SIGNAL", label: "Scalping", none: "No scalping setup running right now. You'll get a message here as soon as one is posted." },
   Intraday: { title: "📈 DAILY SIGNAL INTRADAY", fresh: "📢 NEW DAILY SIGNAL INTRADAY", label: "Daily Intraday", none: "No intraday setup running right now. You'll get a message here as soon as one is posted." },
+  SOP: { title: "🧭 PR SOP SIGNAL", fresh: "📢 NEW PR SOP SIGNAL", label: "PR SOP", none: "No PR SOP signal right now." },
   Swing: { title: "⭐ PRIORITY SIGNAL SWING", fresh: "📢 NEW PRIORITY SIGNAL SWING", label: "Priority Swing", none: "No Priority Swing right now. It's posted only when a high-quality setup appears." },
 };
 const kindOf = (k) => KIND[k] ?? KIND.Intraday;
@@ -76,7 +77,7 @@ async function account(chatId) {
 const canSee = (a, kind) => a.admin || (!!a.tier && (kind !== "Swing" || a.tier === "Ultimate"));
 // Auto signals of these kinds go to the admin only while they are being tested (news signals, the 9:59 AM setup and /post are not affected).
 // To send them to customers again, take the kind out of this list.
-const TRIAL = ["Scalping", "Intraday", "Swing"];
+const TRIAL = ["Scalping", "Intraday", "Swing", "SOP"];
 const off = (k) => TRIAL.includes(k);
 const trialText = TRIAL.join(", ").replace(/, ([^,]*)$/, " and $1");
 const canSeeSignal = (a, s) => canSee(a, s.kind) && (a.admin || !s.trial);
@@ -114,7 +115,7 @@ function sigPips(s) {
 }
 const isWin = (s) => (s.tps ? (s.tpHit || 0) >= 1 : sigPips(s) > 0);
 function resultLine(s) {
-  if (s.status === "cancelled") return "🚫 <b>CANCELLED</b> · entry price not reached";
+  if (s.status === "cancelled") return s.kind === "SOP" ? "🚫 <b>CANCELLED</b> · dashboard didn't line up within 60 minutes" : "🚫 <b>CANCELLED</b> · entry price not reached";
   const p = sigPips(s), n = s.tpHit || 0;
   const head = s.tps && s.status !== "closed"
     ? (n >= 3 ? "🏆 <b>ALL TP HIT</b>" : n === 2 ? "✅ <b>TP2 HIT</b> · rest closed at TP1" : n === 1 ? "✅ <b>TP1 HIT</b> · rest closed at entry" : "❌ <b>HIT SL</b>")
@@ -370,7 +371,7 @@ function historyStats(list, now = Date.now()) {
 }
 async function cmdHistory(chatId, a) {
   if (!a.admin && !a.tier) return send(chatId, noPlan(a));
-  const kinds = canSee(a, "Swing") ? ["Swing", "Intraday", "Scalping"] : ["Intraday", "Scalping"];
+  const kinds = (canSee(a, "Swing") ? ["Swing", "Intraday", "Scalping"] : ["Intraday", "Scalping"]).concat(a.admin ? ["SOP"] : []);
   const all = [];
   await Promise.all([
     (async () => { for (const k of kinds) all.push(...(await signalsOf(k)).filter((s) => canSeeSignal(a, s) && !s.test)); })(),
@@ -607,6 +608,7 @@ const SETUP_RULE = { Scalping: { zones: 1, snrHold: true }, Intraday: { zones: 2
 const AUTO = {
   Scalping: { tf: "m5", ema: 20, look: 3, need: ["m15"], bonus: ["m5", "h1"], min: 4, floor: 2, step: 2, buf: 0.2, rr: 1.5, life: 3, cool: 0.5, max: 5, open: 1, maxPips: 100 },
   Intraday: { tf: "m15", ema: 20, look: 3, need: ["h1"], bonus: ["m15", "h4"], min: 5, floor: 2, step: 3, buf: 0.2, rr: 2, life: 24, cool: 1, max: 3, open: 2 },
+  SOP: { life: 24, cool: 0, max: 8, open: 2 },
   Swing: { tf: "h1", ema: 50, look: 4, need: ["h4"], bonus: ["h1", "d1"], min: 6, floor: 2, step: 4, buf: 0.3, rr: 2, life: 72, cool: 4, max: 2, open: 2 },
 };
 // Limit entry: placed k of the way from price to the SL; cancelled if not reached within `expire` hours
@@ -870,6 +872,7 @@ async function watchSignals(list) {
     if (!m1.length) continue;
     let m15 = null;
     for (const s of sigs) {
+      if (s.wait) { if (Date.now() - s.time > SOP.wait * 60000) await setStatus(s, "cancelled"); continue; } // PR SOP waiting for the dashboard
       let path = m1.filter((x) => x.t >= s.time);
       if (m1[0].t > s.time) path = (m15 ??= await candles(sym, "15min")).filter((x) => x.t >= s.time);
       let hit = null, filled = s.pending ? null : s.filled || s.time;
@@ -1205,6 +1208,77 @@ async function scalpTouch(sym, G, price, used) {
   const live = await livePrice(sym).catch(() => null);
   return live === null ? null : touchSetup(zones, live);
 }
+/* ---------- PR SOP (the admin's PR PROJECT V3 rules) ---------- */
+// M15 BUY+ / SELL+ -> signal at once. Entry when the dashboard (EMA 3>8>21 on M1, M5, M15, M30, H1) is 4/5 or 5/5 the same way
+// AND the M5 ribbon is the same way; otherwise the signal waits (the EA doesn't enter) for up to 60 minutes.
+// Gold backtest, 4 pips spread: 66 days 170 trades -27.6R, 29 days 61 trades +7.6R (same as random entries). On trial.
+const SOP = { fast: 3, mid: 8, slow: 21, gapFast: 0.6, gapMid: 0.1, maxPlus: 10, need: 4, wait: 60, sl: 65 };
+const SOP_TP = [[0, 100, 100], [0, 200, 200], [0, 300, 300]];
+// EMA 3/8/21, the PR trend (changes only when the EMAs are far enough apart) and the EMA order of every candle
+function prSeries(c) {
+  const k = (n) => 2 / (n + 1);
+  let f = c[0]?.c, m = f, sl = f, a = c[0] ? c[0].h - c[0].l : 0, d = 0;
+  return c.map((x, i) => {
+    if (i) {
+      const pc = c[i - 1].c;
+      f += k(SOP.fast) * (x.c - f); m += k(SOP.mid) * (x.c - m); sl += k(SOP.slow) * (x.c - sl);
+      a += (Math.max(x.h, pc) - Math.min(x.l, pc) - a) / Math.min(i + 1, 14);
+      if (i >= SOP.slow) { if (f - sl > SOP.gapFast * a && m - sl > SOP.gapMid * a) d = 1; else if (sl - f > SOP.gapFast * a && sl - m > SOP.gapMid * a) d = -1; }
+    }
+    return { t: x.t, trend: d, fm: f > m ? 1 : f < m ? -1 : 0, align: f > m && m > sl ? 1 : f < m && m < sl ? -1 : 0 };
+  });
+}
+// BUY / SELL (trend flip) and BUY+ / SELL+ (trend continues, EMA 3 crosses EMA 8) of every candle
+function prMarks(c) {
+  const r = prSeries(c), out = [];
+  let plus = 0;
+  for (let i = 2; i < r.length; i++) {
+    const t = r[i].trend, p = r[i - 1].trend;
+    if (t !== p) plus = 0;
+    const st = (j, d) => r[j].trend === d && r[j - 1].trend === d && r[j].fm === d;
+    if (t === 1 && p === -1) out.push({ t: r[i].t, dir: 1, text: "BUY" });
+    else if (t === -1 && p === 1) out.push({ t: r[i].t, dir: -1, text: "SELL" });
+    else for (const d of [1, -1]) if (st(i, d) && !st(i - 1, d) && plus < SOP.maxPlus) { out.push({ t: r[i].t, dir: d, text: d > 0 ? "BUY+" : "SELL+" }); plus++; }
+  }
+  return { marks: out, series: r };
+}
+// Dashboard rows and the M5 ribbon, from finished candles
+function prDash(G, m1) {
+  const m30 = group(G(15), 30).filter((x) => x.t + 1800000 <= (G(15).at(-1)?.t ?? 0) + 900000);
+  const rows = [["M1", m1], ["M5", G(5)], ["M15", G(15)], ["M30", m30], ["H1", G(60)]].map(([n, c]) => [n, c.length > 30 ? prSeries(c.slice(-400)).at(-1).align : 0]);
+  const m5 = G(5), ribbon = m5.length > 30 ? prSeries(m5.slice(-400)).at(-1).trend : 0;
+  return { rows, ribbon, count: (dir) => rows.filter((r) => r[1] === dir).length };
+}
+const prReady = (d, dir) => d.count(dir) >= SOP.need && d.ribbon === dir;
+// A new signal when the last finished M15 candle is BUY+ / SELL+
+function sopSetup(G, m1, price, used) {
+  const c15 = G(15).slice(-400);
+  if (c15.length < 60) return null;
+  const { marks } = prMarks(c15), last = c15.at(-1), mk = marks.find((x) => x.t === last.t && x.text.endsWith("+"));
+  if (!mk || used.has("P" + mk.t + mk.dir)) return null;
+  const dash = prDash(G, m1), ready = prReady(dash, mk.dir), sl = price - mk.dir * SOP.sl * pip("XAUUSD");
+  const myT = new Date(mk.t + 8 * 3600000).toISOString().slice(11, 16);
+  return { dir: mk.dir, entry: price, sl, zkey: "P" + mk.t + mk.dir, sigT: mk.t, order: "instant", life: 24, wait: !ready, dash: dash.rows, ribbon: dash.ribbon,
+    note: `🤖 MEEGO AI · PR SOP: ${mk.text} M15 ${myT} · dashboard ${dash.count(mk.dir)}/5 ${mk.dir > 0 ? "BULLISH" : "BEARISH"} · ribbon M5 ${dash.ribbon === mk.dir ? "OK" : "not yet"} · ${ready ? "ENTRY NOW" : "WAIT: the EA enters when the dashboard is 4/5 and the ribbon agrees (60 min)"}` };
+}
+// Running PR SOP signals: start the trade when the dashboard lines up, close when the M15 trend turns against it
+async function sopWatch(all, G, m1, sym) {
+  const live = all.filter((x) => x.kind === "SOP" && x.sym === sym && x.status === "running");
+  if (!live.length) return;
+  const c15 = G(15).slice(-400), trend = c15.length > 30 ? prSeries(c15).at(-1).trend : 0, dash = prDash(G, m1);
+  for (const x of live) {
+    const { id, ...data } = x;
+    if (x.wait) {
+      if (!prReady(dash, x.dir)) continue;
+      const p = await livePrice(sym).catch(() => null);
+      if (p === null) continue;
+      const entry = Number(p.toFixed(digits(sym))), sl = Number((p - x.dir * SOP.sl * pip(sym)).toFixed(digits(sym)));
+      Object.assign(data, { wait: false, entry, sl, ...tpPlan(sym, x.dir, entry, sl, SOP_TP), filled: Date.now(), time: Date.now(), dash: dash.rows, ribbon: dash.ribbon,
+        note: String(x.note || "").replace(/ · WAIT:.*$/, "") + ` · ENTRY NOW (dashboard ${dash.count(x.dir)}/5)` });
+      await db.from("signals").update({ data, updated_at: new Date().toISOString() }).eq("id", id);
+    } else if (trend === -x.dir) await setStatus(x, "closed", await livePrice(sym).catch(() => m1.at(-1).c));
+  }
+}
 // Last saved copy of the candles (no API call); asks for new ones when it is over 20 minutes old
 async function savedCandles(sym, interval) {
   const { data } = await db.from("price_cache").select("data,fetched_at").eq("key", `${sym.slice(0, 3)}/${sym.slice(3)}|${interval}`).maybeSingle();
@@ -1237,7 +1311,8 @@ async function autoScan() {
     // finished candles only, for the Intraday setups: m1 is cached for up to 3 minutes, so "finished" is judged by its last candle
     const upTo = m1[m1.length - 1].t, up15 = m15.length ? m15[m15.length - 1].t : 0;
     const ix = { m5: group(m1.filter((x) => !/^XAU/.test(sym) || goldOpen(x.t)), 5).filter((x) => x.t + 300000 <= upTo), m15: m15.filter((x) => x.t < up15), m30: group(m15.filter((x) => x.t < up15), 30).filter((x) => x.t + 1800000 <= up15), h1: d.h1 };
-    for (const kind of ["Swing", "Intraday", "Scalping"]) {
+    if (snd) await sopWatch(all, sndG, m1.filter((x) => x.t + 60000 <= upTo + 60000).slice(0, -1), sym).catch((e) => console.error("PR SOP watch failed", e));
+    for (const kind of snd ? ["Swing", "Intraday", "Scalping", "SOP"] : ["Swing", "Intraday", "Scalping"]) {
       const mine = all.filter((s) => s.kind === kind && s.sym === sym && s.auto && !s.nine && !s.test);
       if (mine.filter((s) => s.status === "running").length >= AUTO[kind].open) continue;
       const lastEnd = Math.max(0, ...mine.map((s) => s.closedAt || s.time));
@@ -1248,10 +1323,10 @@ async function autoScan() {
       const quiet = (Date.now() - Math.max(dayStart, ...mine.map((s) => s.time))) / 3600000;
       const own = snd || (kind !== "Scalping" && /^XAU/.test(sym)), used = new Set(mine.map((x) => x.zkey).filter(Boolean));
       const touch = snd && kind === "Scalping"; // already priced at the live price
-      const s = touch ? await scalpTouch(sym, sndG, price, used) : snd ? sndSetup(kind, sndG, price, used) : !own ? findSetup(kind, d, price, relaxDrop(kind, quiet)) : kind === "Intraday" ? intradaySetup(ix, price, used) : swingSetup(d.h1, h1.length ? h1[h1.length - 1].t : 0, price, used);
+      const s = kind === "SOP" ? sopSetup(sndG, m1.slice(0, -1), price, used) : touch ? await scalpTouch(sym, sndG, price, used) : snd ? sndSetup(kind, sndG, price, used) : !own ? findSetup(kind, d, price, relaxDrop(kind, quiet)) : kind === "Intraday" ? intradaySetup(ix, price, used) : swingSetup(d.h1, h1.length ? h1[h1.length - 1].t : 0, price, used);
       if (!s || !(touch || (await reprice(s, sym)))) continue;
       const nowPips = Math.abs(s.entry - s.sl) / pip(sym);
-      if (snd && nowPips < KX[kind].min) continue;
+      if (snd && nowPips < (KX[kind]?.min ?? 0)) continue;
       if (/^XAU/.test(sym) && nowPips > (kind === "Scalping" ? AUTO.Scalping.maxPips : kind === "Intraday" ? IX.maxPips : SX.maxPips)) continue; // the stop must still be within its limit
       // Sharp entry: when the stop is far (gold Intraday/Swing over LIMIT.pips), wait for a pullback with a limit order
       const risk = Math.abs(s.entry - s.sl);
@@ -1261,7 +1336,7 @@ async function autoScan() {
         Object.assign(s, { order: "limit", pending: true });
       } else s.order = "instant";
       for (const k of ["entry", "sl"]) s[k] = Number(s[k].toFixed(digits(sym)));
-      Object.assign(s, tpPlan(sym, s.dir, s.entry, s.sl, own && kind === "Swing" ? SWING_TP : snd && kind === "Intraday" ? INTRADAY_TP : TP_PLAN));
+      Object.assign(s, tpPlan(sym, s.dir, s.entry, s.sl, kind === "SOP" ? SOP_TP : own && kind === "Swing" ? SWING_TP : snd && kind === "Intraday" ? INTRADAY_TP : TP_PLAN));
       await db.from("signals").insert({ id: crypto.randomUUID(), data: { kind, sym, ...s, status: "running", auto: true, ...(TRIAL.includes(kind) ? { trial: true } : {}), time: Date.now(), closedAt: null } });
     }
   }
@@ -1538,7 +1613,7 @@ async function eaFile(name) {
   if (!data?.b64) return null;
   return Uint8Array.from(atob(data.b64.replace(/\s/g, "")), (ch) => ch.charCodeAt(0));
 }
-// One line per signal: S|id|kind|news|sym|dir|order|status|pending|entry|sl|tp1|tp2|tp3|tpHit|slNow|time|expireH|filled|zoneLow|zoneHigh|lifeH
+// One line per signal: S|id|kind|news|sym|dir|order|status|pending|entry|sl|tp1|tp2|tp3|tpHit|slNow|time|expireH|filled|zoneLow|zoneHigh|lifeH|ready
 async function eaFeed(key) {
   const txt = (body, status = 200) => new Response(body, { status, headers: { "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-store" } });
   if (!/^[a-f0-9]{32}$/.test(String(key || ""))) return txt("ERR|bad key", 403);
@@ -1551,7 +1626,7 @@ async function eaFeed(key) {
   const n = (v) => (Number.isFinite(Number(v)) ? String(Number(v)) : "0");
   const rows = (data ?? []).map((r) => ({ id: r.id, ...r.data })).filter((x) => x && x.sym && (x.status === "running" || (x.closedAt || x.time) >= since) && canSeeSignal(a, x));
   const lines = rows.map((x) => ["S", x.id, x.kind, x.news || "", x.sym, x.dir, x.order || "instant", x.status, x.pending ? 1 : 0, n(x.entry), n(x.sl0 ?? x.sl),
-    ...(x.tps ? x.tps.map(n) : [n(x.tp), "0", "0"]), x.tpHit || 0, n(x.sl), Math.round(x.time || 0), x.expire ?? LIMIT.expire, Math.round(x.filled || 0), n(x.zone?.[0]), n(x.zone?.[1]), n(x.life ?? AUTO[x.kind]?.life)].join("|"));
+    ...(x.tps ? x.tps.map(n) : [n(x.tp), "0", "0"]), x.tpHit || 0, n(x.sl), Math.round(x.time || 0), x.expire ?? LIMIT.expire, Math.round(x.filled || 0), n(x.zone?.[0]), n(x.zone?.[1]), n(x.life ?? AUTO[x.kind]?.life), x.wait ? 0 : 1].join("|"));
   return txt([`OK|${Date.now()}|${a.admin ? "ADMIN" : a.tier}`, ...lines].join("\n"));
 }
 async function sendFile(chatId, name, content, caption) {
@@ -1859,13 +1934,14 @@ async function cmdAdmin(chatId, a, text) {
 // Signal chart as SVG: candles, zone, entry, SL, TPs (Malaysia time)
 // Signal chart as SVG: candles, zone, entry, SL, TPs (Malaysia time)
 function chartSvg(o) {
-  const { candles, title, sub, dir, entry, sl, tps = [], zone = null, zoneFrom = 0, tf = 15, digits = 2, signalT = 0 } = o;
+  const { candles, title, sub, dir, entry, sl, tps = [], zone = null, zoneFrom = 0, tf = 15, digits = 2, signalT = 0, marks = [], ribbon = null, dash = null, vline = null } = o;
   const baseI = zoneFrom ? candles.findIndex((c) => c.t === zoneFrom) : -1;
   const W = 1000, H = 600, L = 14, R = 112, T = 62, B = 46, n = candles.length;
   const C = { bg: "#0f1115", grid: "#20242c", text: "#c9ced8", mut: "#7c8492", up: "#26a69a", dn: "#ef5350", zone: dir > 0 ? "#26a69a" : "#ef5350", entry: "#e6e8ee", sl: "#ef5350", tp: "#26a69a" };
   const vals = candles.flatMap((x) => [x.h, x.l]).concat([entry, sl], tps.length ? [tps[0]] : [], zone || []);
   let hi = Math.max(...vals), lo = Math.min(...vals); const pad = (hi - lo) * 0.06 || 1; hi += pad; lo -= pad;
-  const pw = W - L - R, ph = H - T - B, step = pw / Math.max(n, 1), y = (v) => T + ((hi - v) / (hi - lo)) * ph, x = (i) => L + i * step + step / 2;
+  const RB = ribbon ? 14 : 0;
+  const pw = W - L - R, ph = H - T - B - RB, step = pw / Math.max(n, 1), y = (v) => T + ((hi - v) / (hi - lo)) * ph, x = (i) => L + i * step + step / 2;
   const f = (v) => Number(v).toFixed(digits), esc = (s) => String(s).replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" })[c]);
   const my = (t) => new Date(t + 8 * 3600000), hm = (t) => my(t).toISOString().slice(11, 16), dm = (t) => my(t).toISOString().slice(5, 10).split("-").reverse().join("/");
   let s = `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" font-family="DejaVu Sans"><rect width="${W}" height="${H}" fill="${C.bg}"/>`;
@@ -1873,7 +1949,7 @@ function chartSvg(o) {
   const raw = (hi - lo) / 6, mag = Math.pow(10, Math.floor(Math.log10(raw))), gs = [1, 2, 5, 10].map((k) => k * mag).find((k) => k >= raw);
   for (let v = Math.ceil(lo / gs) * gs; v <= hi; v += gs) s += `<line x1="${L}" x2="${W - R}" y1="${y(v)}" y2="${y(v)}" stroke="${C.grid}"/><text x="${W - R + 8}" y="${y(v) + 4}" font-size="12" fill="${C.mut}">${f(v)}</text>`;
   // time labels
-  const every = Math.max(1, Math.round(n / 6));
+  const every = Math.max(1, Math.round(n / 6)); // (time labels stay under the ribbon)
   for (let i = 0; i < n; i += every) s += `<line x1="${x(i)}" x2="${x(i)}" y1="${T}" y2="${H - B}" stroke="${C.grid}"/><text x="${x(i)}" y="${H - B + 18}" font-size="12" fill="${C.mut}" text-anchor="middle">${hm(candles[i].t)}</text><text x="${x(i)}" y="${H - B + 33}" font-size="11" fill="${C.mut}" text-anchor="middle">${dm(candles[i].t)}</text>`;
   // zone (its label is drawn last, over the lines)
   let zl = "";
@@ -1890,6 +1966,15 @@ function chartSvg(o) {
     s += `<rect x="${x(baseI) - step * 0.7}" y="${y(b.h) - 4}" width="${step * 1.4}" height="${y(b.l) - y(b.h) + 8}" fill="none" stroke="#f5c542" stroke-width="2"/>`;
     if (mv.length) s += `<path d="M${x(baseI)} ${dir > 0 ? y(b.l) + 18 : y(b.h) - 18} L${x(j)} ${dir > 0 ? y(far) - 10 : y(far) + 10}" stroke="#f5c542" stroke-width="2" stroke-dasharray="5 4" fill="none"/>`;
     zl += `<text x="${Math.max(L + 2, x(baseI) - 18)}" y="${dir > 0 ? y(b.l) + 34 : y(b.h) - 24}" font-size="12" fill="#f5c542">BASE</text>`;
+  }
+  // PR SOP: ribbon (trend of every candle), vertical line on the candle after the signal, BUY/SELL/BUY+/SELL+ labels
+  if (ribbon) for (let i = 0; i < n; i++) s += `<rect x="${x(i) - step / 2}" y="${H - B - RB + 2}" width="${step + 0.5}" height="${RB - 4}" fill="${ribbon[i] > 0 ? C.up : ribbon[i] < 0 ? C.dn : C.mut}"/>`;
+  if (vline) { const vi = candles.findIndex((c) => c.t >= vline.t); if (vi >= 0) s += `<line x1="${x(vi)}" x2="${x(vi)}" y1="${T}" y2="${H - B}" stroke="${vline.dir > 0 ? "#29b6f6" : "#ff9800"}" stroke-width="1.5" stroke-dasharray="7 5"/><text x="${x(vi) > W - R - 120 ? x(vi) - 6 : x(vi) + 6}" y="${T + 14}" font-size="12" fill="${vline.dir > 0 ? "#29b6f6" : "#ff9800"}" text-anchor="${x(vi) > W - R - 120 ? "end" : "start"}">${esc(vline.text)}</text>`; }
+  for (const mk of marks) {
+    const i = candles.findIndex((c) => c.t === mk.t); if (i < 0) continue;
+    const c = candles[i], up = mk.dir > 0, plus = mk.text.endsWith("+"), bg = up ? (plus ? "#0e6b7d" : "#1b6e2a") : plus ? "#a3580f" : "#8e1c1c", tw = mk.text.length * 8 + 12;
+    const yy = up ? y(c.l) + 10 : y(c.h) - 10 - 20;
+    s += `<rect x="${x(i) - tw / 2}" y="${yy}" width="${tw}" height="20" rx="3" fill="${bg}"/><text x="${x(i)}" y="${yy + 14}" font-size="12" font-weight="bold" fill="#ffffff" text-anchor="middle">${esc(mk.text)}</text>`;
   }
   // candles
   const w = Math.max(1.5, step * 0.66);
@@ -1909,6 +1994,11 @@ function chartSvg(o) {
   const tip = dir > 0 ? y(candles[k].l) + 8 : y(candles[k].h) - 8, d = dir > 0 ? 12 : -12;
   s += `<path d="M${x(k)} ${tip} L${x(k) - 7} ${tip + d} L${x(k) + 7} ${tip + d} Z" fill="${dir > 0 ? C.up : C.dn}" stroke="${C.entry}" stroke-width="1"/>`;
   s += zl;
+  if (dash) { // MTF dashboard, bottom left
+    const bx = L + 6, by = H - B - RB - 18 * (dash.length + 1) - 8;
+    s += `<rect x="${bx}" y="${by}" width="168" height="${18 * (dash.length + 1) + 4}" rx="4" fill="#1c1d21" stroke="#363a45"/><text x="${bx + 8}" y="${by + 14}" font-size="12" fill="${C.text}">Timeframe</text><text x="${bx + 84}" y="${by + 14}" font-size="12" fill="${C.text}">Trend</text>`;
+    dash.forEach(([name, d], k) => { const yy = by + 18 * (k + 1) + 2; s += `<text x="${bx + 8}" y="${yy + 13}" font-size="12" fill="${C.text}">${name}</text><rect x="${bx + 80}" y="${yy}" width="82" height="16" rx="2" fill="${d > 0 ? "#459948" : d < 0 ? "#d42e3e" : "#5f5e5a"}"/><text x="${bx + 121}" y="${yy + 12}" font-size="11" fill="#ffffff" text-anchor="middle">${d > 0 ? "BULLISH" : d < 0 ? "BEARISH" : "NEUTRAL"}</text>`; });
+  }
   s += `<text x="${L}" y="26" font-size="20" font-weight="bold" fill="${dir > 0 ? C.up : C.dn}">${esc(title)}</text><text x="${L}" y="48" font-size="13" fill="${C.text}">${esc(sub.length > 112 ? sub.slice(0, 110) + "…" : sub)}</text>`;
   s += `<text x="${W - R}" y="26" font-size="13" fill="${C.mut}" text-anchor="end">MEEGO AI</text></svg>`;
   return s;
@@ -1930,10 +2020,16 @@ async function signalChart(s) {
   const word = s.dir > 0 ? "BUY" : "SELL", my = new Date(s.time + 8 * 3600000), zt = Number((String(s.zkey || "").match(/^Z(\d{13})/) || [])[1] || 0);
   const why = String(s.note || "").replace(/^🤖 MEEGO AI · /, "").replace(/^(Demand|Supply) zone \S+ [\d.]+ - [\d.]+ · /, "");
   const label = s.test ? "EA TEST" : s.nine ? "9:59 AM SETUP" : s.news === "pre" ? "NEWS" : s.news === "recovery" ? "RECOVERY" : s.kind.toUpperCase();
-  const svg = chartSvg({
+  const opts = {
     candles: list, dir: s.dir, entry: s.entry, sl: s.sl0 ?? s.sl, tps: s.tps || [s.tp], zone: Array.isArray(s.zone) ? s.zone : null, zoneFrom: zt, tf: min, digits: digits(s.sym),
     title: `${label} ${word} ${s.sym}`, sub: `${min === 60 ? "H1" : "M15"} · ${my.toISOString().slice(0, 10).split("-").reverse().join("/")} ${my.toISOString().slice(11, 16)} MYT${why ? " · " + why.slice(0, 90) : ""}`,
-  });
+  };
+  if (s.kind === "SOP") {
+    const all15 = (await candles(s.sym, "15min")).filter((x) => x.t <= s.time), { marks, series } = prMarks(all15.slice(-400)), from = list[0].t;
+    Object.assign(opts, { marks: marks.filter((m) => m.t >= from), ribbon: series.slice(-list.length).map((r) => r.trend), dash: s.dash || null,
+      vline: s.sigT ? { t: s.sigT + 900000, dir: s.dir, text: `${s.dir > 0 ? "BUY+" : "SELL+"} M15` } : null, title: `PR SOP ${word} ${s.sym}${s.wait ? " · WAIT" : " · ENTRY"}` });
+  }
+  const svg = chartSvg(opts);
   const fontBuffers = await resvgFonts();
   return new Resvg(svg, { font: { fontBuffers, defaultFontFamily: "DejaVu Sans", loadSystemFonts: false }, fitTo: { mode: "width", value: 1000 } }).render().asPng();
 }
@@ -1972,12 +2068,18 @@ async function onDbEvent(ev) {
     const chats = await audience(s.kind, !!s.trial);
     if (ev.op === "INSERT" && s.status === "running") {
       const sig = { id: ev.record.id, ...s };
-      const title = s.test ? "🧪 EA TEST (not a real setup)" : s.trial ? `🧪 ${s.kind.toUpperCase()} TEST (admin only)` : s.nine ? "🕘 9:59 AM SETUP" : s.news === "pre" ? "📰 NEWS SIGNAL" : s.news === "recovery" ? "🔁 RECOVERY SETUP (after news spike)" : kindOf(s.kind).fresh;
+      const title = s.kind === "SOP" ? `🧪 PR SOP ${s.wait ? "· WAIT (EA waits)" : "· ENTRY NOW"}` : s.test ? "🧪 EA TEST (not a real setup)" : s.trial ? `🧪 ${s.kind.toUpperCase()} TEST (admin only)` : s.nine ? "🕘 9:59 AM SETUP" : s.news === "pre" ? "📰 NEWS SIGNAL" : s.news === "recovery" ? "🔁 RECOVERY SETUP (after news spike)" : kindOf(s.kind).fresh;
       for (const c of chats) { await sendLive(c, sig, title); await new Promise((r) => setTimeout(r, 60)); }
       await sendChart(chats, sig).catch((e) => console.error("signal chart failed", e));
       return;
     }
     const label = `${s.trial ? "🧪 " : ""}${s.dir > 0 ? "BUY" : "SELL"}${s.order === "limit" ? " LIMIT" : ""} <b>${esc(s.sym)}</b>`;
+    if (ev.op === "UPDATE" && old?.wait && !s.wait && s.status === "running") {
+      const sig = { id: ev.record.id, ...s }, title = "✅ PR SOP · ENTRY NOW (dashboard ready)";
+      for (const c of chats) { await sendLive(c, sig, title); await new Promise((r) => setTimeout(r, 60)); }
+      await sendChart(chats, sig).catch((e) => console.error("signal chart failed", e));
+      return refreshLive();
+    }
     if (ev.op === "UPDATE" && old?.pending && s.status === "running" && !s.pending) {
       // the full signal card again (entry, zone, TPs, SL, lot guide), kept live like a new signal
       const sig = { id: ev.record.id, ...s }, title = `⚡ ENTRY TRIGGERED · ${kindOf(s.kind).title.replace(/^\S+\s/, "")}`;
@@ -1985,7 +2087,7 @@ async function onDbEvent(ev) {
       return refreshLive();
     }
     if (ev.op === "UPDATE" && old && old.status !== s.status && s.status === "cancelled") {
-      await broadcast(chats, `🚫 <b>CANCELLED</b> · ${label}\n${kindOf(s.kind).label} · entry price not reached`);
+      await broadcast(chats, `🚫 <b>CANCELLED</b> · ${label}\n${kindOf(s.kind).label} · ${s.kind === "SOP" ? "dashboard didn't line up within 60 minutes" : "entry price not reached"}`);
       return refreshLive();
     }
     if (ev.op === "UPDATE" && old && s.status === "running" && s.tps && (s.tpHit || 0) > (old.tpHit || 0)) {
