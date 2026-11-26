@@ -15,6 +15,7 @@ input string InpKey           = "";        // MEEGO EA key (send /ea in the bot)
 input string InpSymbol        = "XAUUSD";  // Your broker's gold symbol (found by itself if this one does not exist)
 input double InpFixedLot      = 0.01;      // Lot of every layer, whatever the balance (0 = use the risk % instead)
 input int    InpLayers        = 3;         // Layers per signal (1-10), TP1/TP2/TP3 in turn
+input double InpLayerStepPips = 10;        // Zone signals: each next layer this many pips deeper in the zone (limit order, 0 = all at once)
 input double InpRiskPct       = 1.0;       // Risk per signal (% of balance), only when the fixed lot is 0
 input double InpMaxLot        = 1.0;       // Max total lot per signal
 input bool   InpScalping      = true;      // Copy Scalping signals
@@ -271,16 +272,28 @@ bool OpenSignal(Sig &s, double zoneLimit = 0)
       tps[i] = !three ? s.tp1 : (k == 0 ? s.tp1 : k == 1 ? s.tp2 : s.tp3);
      }
 
+   // zone signals: the first layer at the price, the next ones as limit orders InpLayerStepPips apart, deeper in the zone
+   bool   spread = HasZone(s) && InpLayerStepPips > 0 && parts > 1;
+   double far = s.dir > 0 ? MathMin(s.zLo, s.entry) : MathMax(s.zHi, s.entry);
    int ok = 0;
    for(int i = 0; i < parts; i++)
      {
+      bool   lim = limit;
+      double at = ref;
+      if(spread && i > 0)
+        {
+         at = ref - s.dir * i * InpLayerStepPips * PIP;
+         if((at - far) * s.dir < 0) at = far;                      // not past the far edge of the zone
+         if(MathAbs(at - sl) < InpMinSLPips * PIP) continue;      // too close to the SL
+         lim = MathAbs(at - ref) >= 1 * PIP || limit;            // at the price already: like the first layer
+        }
       double tp = NormalizeDouble(tps[i] + delta, dg);
-      if((tp - ref) * s.dir <= 0) continue; // this TP is already behind the price
+      if((tp - at) * s.dir <= 0) continue; // this TP is already behind the price
       string c = Tag(s.id8, i + 1);
       bool r;
-      if(limit)
+      if(lim)
         {
-         double price = NormalizeDouble(lp, dg);
+         double price = NormalizeDouble(at, dg);
          r = (s.dir > 0) ? trade.BuyLimit(lots[i], price, g_sym, sl, tp, ORDER_TIME_GTC, 0, c)
                          : trade.SellLimit(lots[i], price, g_sym, sl, tp, ORDER_TIME_GTC, 0, c);
         }
