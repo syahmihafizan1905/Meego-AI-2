@@ -6,7 +6,7 @@
 #property copyright "MEEGO AI"
 #property version   "1.31"
 #property description "Copies MEEGO AI gold signals into MT5: draws the zone, enters while price is in it, TP1/TP2/TP3,"
-#property description "closes half and moves SL to entry at +100 pips, removes a zone once it is no longer valid."
+#property description "locks profit (+50 pips: SL +20, +100 pips: closes half, SL +50), removes a zone once it is no longer valid."
 #property description "Tools > Options > Expert Advisors > Allow WebRequest for the MEEGO URL first."
 
 #include <Trade\Trade.mqh>
@@ -26,7 +26,11 @@ input bool   InpRecovery      = true;      // Copy Recovery setups (after a news
 input int    InpMaxSignals    = 3;         // Max signals open at the same time
 input int    InpMaxAgeMin     = 15;        // Skip market signals older than this (minutes)
 input bool   InpMinLotIfSmall = false;     // Use the minimum lot when the risk lot is too small
-input double InpBEPips        = 100;       // At this profit (pips): close half and SL to entry (0 = off)
+input double InpBEPips        = 100;       // At this profit (pips): close half (0 = off)
+input double InpLock1At       = 50;        // At this profit (pips) ...
+input double InpLock1         = 20;        // ... move the SL to lock this profit (pips, 0 = off)
+input double InpLock2At       = 100;       // At this profit (pips) ...
+input double InpLock2         = 50;        // ... move the SL to lock this profit (pips, 0 = off)
 input double InpZoneTolPips   = 10;        // Entry allowed this far outside the zone (pips)
 input double InpMinSLPips     = 20;        // Don't enter when the SL is closer than this (pips)
 input bool   InpZoneLimit     = true;      // Price outside the zone: place limit orders at the zone
@@ -156,7 +160,7 @@ bool Wanted(Sig &s)
 string Tag(string id8, int part) { return("MEEGO|" + id8 + "|" + IntegerToString(part)); }
 string IdOf(string comment)       { return(StringFind(comment, "MEEGO|") == 0 ? StringSubstr(comment, 6, 8) : ""); }
 string GvDone(string id8)         { return("MEEGO_" + id8); }
-string GvBE(string id8)           { return("MEEGO_B_" + id8); }   // 1 = half closed, 2 = SL at entry too
+string GvBE(string id8)           { return("MEEGO_B_" + id8); }   // 1 = half closed
 string GvEnd(string id8)          { return("MEEGO_E_" + id8); }   // server time when the trade must be closed
 string GvBroken(string id8)       { return("MEEGO_X_" + id8); }   // server time when the zone stopped being valid
 bool   HasZone(Sig &s)            { return(s.zLo > 0 && s.zHi > s.zLo); }
@@ -368,11 +372,14 @@ void CloseHalf(ulong &tk[])
         }
   }
 
-// At +InpBEPips: close half and move the SL of the rest to entry. Also closes trades whose time is up.
+// At +InpBEPips: close half. At +InpLock1At / +InpLock2At: SL moves into profit by InpLock1 / InpLock2 pips (never back).
+// Also closes trades whose time is up.
 void ManageBE()
   {
    int    dg = (int)SymbolInfoInteger(g_sym, SYMBOL_DIGITS);
-   double pt = SymbolInfoDouble(g_sym, SYMBOL_POINT), bid = SymbolInfoDouble(g_sym, SYMBOL_BID), ask = SymbolInfoDouble(g_sym, SYMBOL_ASK);
+   double pt = SymbolInfoDouble(g_sym, SYMBOL_POINT);
+   double gap = MathMax(5 * PIP, (SymbolInfoInteger(g_sym, SYMBOL_TRADE_STOPS_LEVEL) + 5) * pt);   // the SL must stay this far from the price
+   bool   canTrade = TerminalInfoInteger(TERMINAL_TRADE_ALLOWED) && MQLInfoInteger(MQL_TRADE_ALLOWED);
    string seen = "";
    string ids[];
    for(int i = PositionsTotal() - 1; i >= 0; i--)
@@ -397,28 +404,31 @@ void ManageBE()
          Print("MEEGO AI EA: time limit, closed ", ids[k]);
          continue;
         }
-      if(InpBEPips <= 0 || !PositionSelectByTicket(tk[0])) continue;
-      int stage = GlobalVariableCheck(GvBE(ids[k])) ? (int)GlobalVariableGet(GvBE(ids[k])) : 0;
-      if(stage >= 2) continue;
-      bool   buy  = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY);
-      double open = PositionGetDouble(POSITION_PRICE_OPEN), gain = buy ? bid - open : open - ask;
-      if(stage == 0)
+      if(!canTrade || !PositionSelectByTicket(tk[0])) continue;
+      double bid = SymbolInfoDouble(g_sym, SYMBOL_BID), ask = SymbolInfoDouble(g_sym, SYMBOL_ASK);
+      bool   buy = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY);
+      double gain = (buy ? bid - PositionGetDouble(POSITION_PRICE_OPEN) : PositionGetDouble(POSITION_PRICE_OPEN) - ask) / PIP;
+      if(InpBEPips > 0 && gain >= InpBEPips && !GlobalVariableCheck(GvBE(ids[k])))
         {
-         if(gain < InpBEPips * PIP || !TerminalInfoInteger(TERMINAL_TRADE_ALLOWED) || !MQLInfoInteger(MQL_TRADE_ALLOWED)) continue;
          GlobalVariableSet(GvBE(ids[k]), 1);      // set first, so half is never closed twice
          CloseHalf(tk);
-         Print("MEEGO AI EA: +", DoubleToString(gain / PIP, 0), " pips, closed half of ", ids[k]);
+         Print("MEEGO AI EA: +", DoubleToString(gain, 0), " pips, closed half of ", ids[k]);
          n = Tickets(ids[k], tk);
         }
-      bool all = true;
+      double lock = -1;
+      if(InpLock2 > 0 && gain >= InpLock2At)      lock = InpLock2;
+      else if(InpLock1 > 0 && gain >= InpLock1At) lock = InpLock1;
+      if(lock < 0) continue;
       for(int i = 0; i < n; i++)
         {
          if(!PositionSelectByTicket(tk[i])) continue;
-         double e = NormalizeDouble(PositionGetDouble(POSITION_PRICE_OPEN), dg), cur = PositionGetDouble(POSITION_SL), tp = PositionGetDouble(POSITION_TP);
-         if(cur != 0 && (buy ? cur >= e - pt / 2 : cur <= e + pt / 2)) continue;   // already at entry or better
-         if(!(buy ? e < bid : e > ask) || !trade.PositionModify(tk[i], e, tp)) all = false;
+         double open = PositionGetDouble(POSITION_PRICE_OPEN), cur = PositionGetDouble(POSITION_SL), tp = PositionGetDouble(POSITION_TP);
+         double sl = NormalizeDouble(open + (buy ? lock : -lock) * PIP, dg);
+         if(cur != 0 && (buy ? cur >= sl - pt / 2 : cur <= sl + pt / 2)) continue;   // already there or better
+         if(buy ? sl > bid - gap : sl < ask + gap) continue;                       // too close to the price for now
+         if(trade.PositionModify(tk[i], sl, tp))
+            Print("MEEGO AI EA: +", DoubleToString(gain, 0), " pips, SL of ", ids[k], " to ", DoubleToString(sl, dg), " (locks +", DoubleToString(lock, 0), " pips)");
         }
-      if(all) GlobalVariableSet(GvBE(ids[k]), 2);
      }
   }
 
