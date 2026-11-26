@@ -3,6 +3,7 @@
 // "Verify JWT" must be OFF for this function. Open the function URL once in a browser to connect the bot.
 import Anthropic from "npm:@anthropic-ai/sdk";
 import { createClient } from "npm:@supabase/supabase-js@2";
+import { Resvg, initWasm } from "npm:@resvg/resvg-wasm@2.6.2";
 
 const TOKEN = Deno.env.get("TELEGRAM_BOT_TOKEN") ?? "";
 const SB_URL = Deno.env.get("SUPABASE_URL");
@@ -123,6 +124,10 @@ function resultLine(s) {
 // Entry zone: from the entry toward the SL (a better price), at most 40 pips and never more than 30% of the risk
 const ZONE_PIPS = 40;
 function entryZone(s) {
+  if (Array.isArray(s.zone) && s.zone.length === 2) {
+    const lo = Math.min(s.zone[0], s.entry), hi = Math.max(s.zone[1], s.entry);
+    return `Entry zone: <code>${px(lo, s.sym)}</code> – <code>${px(hi, s.sym)}</code> (${pipsBetween(hi, lo, s.sym)} pips)`;
+  }
   const w = Math.min(ZONE_PIPS * pip(s.sym), 0.3 * Math.abs(s.entry - (s.sl0 ?? s.sl)));
   const far = s.entry - s.dir * w;
   const [lo, hi] = [Math.min(s.entry, far), Math.max(s.entry, far)];
@@ -1275,6 +1280,17 @@ function parseJSON(t) {
   if (a >= 0 && b > a) { try { return JSON.parse(t.slice(a, b + 1)); } catch (_) { /* fall through */ } }
   return null;
 }
+// Entry zone of a chart scan: the AI's own zone when it makes sense, else 30% of the way from entry towards the SL
+function scanZone(r, dir, sym) {
+  let lo = Number(r.zone_low), hi = Number(r.zone_high);
+  if (lo > hi) [lo, hi] = [hi, lo];
+  const e = Number(r.entry), sl = Number(r.sl);
+  if (!(Number.isFinite(lo) && Number.isFinite(hi) && lo <= e && e <= hi && (dir > 0 ? lo > sl : hi < sl))) {
+    const far = e - dir * 0.3 * Math.abs(e - sl);
+    [lo, hi] = [Math.min(e, far), Math.max(e, far)];
+  }
+  return `Entry zone: <code>${px(lo, sym)}</code> – <code>${px(hi, sym)}</code>`;
+}
 async function scanPhoto(chatId, a, msg) {
   if (!a.admin && !a.tier) return send(chatId, noPlan(a));
   if (!a.admin) {
@@ -1291,9 +1307,10 @@ async function scanPhoto(chatId, a, msg) {
   const prompt = `You are a professional price-action trader. The image is a trading chart screenshot${pairHint ? ` (the user says ${pairHint}, but trust the ticker shown on the chart)` : ""}.
 Read the price axis carefully to get real price levels. Identify the pair and timeframe if visible, the trend, structure, key support and resistance, and momentum.
 Give ONE trade idea only if risk-to-reward is at least 1.5, otherwise direction "WAIT".
+Also give the entry zone (zone_low, zone_high): the price area where entering still makes sense, usually the supply/demand or support/resistance area around the entry; it must contain the entry and stay on the entry side of the SL.
 Reply with ONLY one JSON object:
 "pair" must be ONLY the short ticker read from the chart itself, e.g. "XAUUSD", "BTCUSD", "EURUSD" (no spaces, no explanation). If the user's caption names a different pair than the chart shows, silently use the chart's ticker. Do not mention the caption or any mismatch anywhere.
-{"pair":"TICKER or null","direction":"BUY|SELL|WAIT","confidence":0-100,"timeframe":"text or null","entry":number|null,"sl":number|null,"tp":number|null,"reason":"2-4 sentences in English","invalidation":"text"}
+{"pair":"TICKER or null","direction":"BUY|SELL|WAIT","confidence":0-100,"timeframe":"text or null","entry":number|null,"zone_low":number|null,"zone_high":number|null,"sl":number|null,"tp":number|null,"reason":"2-4 sentences in English","invalidation":"text"}
 If the image is not a price chart, reply {"pair":null,"direction":"WAIT","confidence":0,"timeframe":null,"entry":null,"sl":null,"tp":null,"reason":"This doesn't look like a price chart.","invalidation":""}`;
   const content = [
     { type: "image", source: { type: "base64", media_type: "image/jpeg", data: toBase64(img) } },
@@ -1325,7 +1342,7 @@ If the image is not a price chart, reply {"pair":null,"direction":"WAIT","confid
   if (ok) {
     const rr = Math.abs(r.tp - r.entry) / Math.abs(r.entry - r.sl);
     lines.push(`${d === "BUY" ? "🟢" : "🔴"} <b>${d} ${esc(sym)}</b> · confidence ${Math.round(Number(r.confidence) || 0)}%`, "",
-      `Entry: <code>${px(r.entry, sym)}</code>`, `TP: <code>${px(r.tp, sym)}</code>`, `SL: <code>${px(r.sl, sym)}</code>`, `Risk-to-reward 1:${rr.toFixed(2)}`);
+      `Entry: <code>${px(r.entry, sym)}</code>`, scanZone(r, d === "BUY" ? 1 : -1, sym), `TP: <code>${px(r.tp, sym)}</code>`, `SL: <code>${px(r.sl, sym)}</code>`, `Risk-to-reward 1:${rr.toFixed(2)}`);
   } else {
     lines.push(`⚪ <b>WAIT</b>${sym !== "PAIR" ? ` ${esc(sym)}` : ""} · no clean setup right now`);
   }
@@ -1834,6 +1851,96 @@ async function cmdAdmin(chatId, a, text) {
   return send(chatId, "Unknown admin command. Send /admin for the list.");
 }
 
+/* ---------- signal chart picture: candles, zone, entry, SL, TPs ---------- */
+// Signal chart as SVG: candles, zone, entry, SL, TPs (Malaysia time)
+function chartSvg(o) {
+  const { candles, title, sub, dir, entry, sl, tps = [], zone = null, zoneFrom = 0, tf = 15, digits = 2 } = o;
+  const W = 1000, H = 600, L = 14, R = 112, T = 62, B = 46, n = candles.length;
+  const C = { bg: "#0f1115", grid: "#20242c", text: "#c9ced8", mut: "#7c8492", up: "#26a69a", dn: "#ef5350", zone: dir > 0 ? "#26a69a" : "#ef5350", entry: "#e6e8ee", sl: "#ef5350", tp: "#26a69a" };
+  const vals = candles.flatMap((x) => [x.h, x.l]).concat([entry, sl], tps.length ? [tps[0]] : [], zone || []);
+  let hi = Math.max(...vals), lo = Math.min(...vals); const pad = (hi - lo) * 0.06 || 1; hi += pad; lo -= pad;
+  const pw = W - L - R, ph = H - T - B, step = pw / Math.max(n, 1), y = (v) => T + ((hi - v) / (hi - lo)) * ph, x = (i) => L + i * step + step / 2;
+  const f = (v) => Number(v).toFixed(digits), esc = (s) => String(s).replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" })[c]);
+  const my = (t) => new Date(t + 8 * 3600000), hm = (t) => my(t).toISOString().slice(11, 16), dm = (t) => my(t).toISOString().slice(5, 10).split("-").reverse().join("/");
+  let s = `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" font-family="DejaVu Sans"><rect width="${W}" height="${H}" fill="${C.bg}"/>`;
+  // price grid
+  const raw = (hi - lo) / 6, mag = Math.pow(10, Math.floor(Math.log10(raw))), gs = [1, 2, 5, 10].map((k) => k * mag).find((k) => k >= raw);
+  for (let v = Math.ceil(lo / gs) * gs; v <= hi; v += gs) s += `<line x1="${L}" x2="${W - R}" y1="${y(v)}" y2="${y(v)}" stroke="${C.grid}"/><text x="${W - R + 8}" y="${y(v) + 4}" font-size="12" fill="${C.mut}">${f(v)}</text>`;
+  // time labels
+  const every = Math.max(1, Math.round(n / 6));
+  for (let i = 0; i < n; i += every) s += `<line x1="${x(i)}" x2="${x(i)}" y1="${T}" y2="${H - B}" stroke="${C.grid}"/><text x="${x(i)}" y="${H - B + 18}" font-size="12" fill="${C.mut}" text-anchor="middle">${hm(candles[i].t)}</text><text x="${x(i)}" y="${H - B + 33}" font-size="11" fill="${C.mut}" text-anchor="middle">${dm(candles[i].t)}</text>`;
+  // zone (its label is drawn last, over the lines)
+  let zl = "";
+  if (zone) {
+    let i0 = candles.findIndex((c) => c.t >= zoneFrom); if (i0 < 0 || !zoneFrom) i0 = 0;
+    const zx = x(i0) - step / 2, zy = y(Math.max(...zone)), zh = Math.max(2, y(Math.min(...zone)) - zy);
+    s += `<rect x="${zx}" y="${zy}" width="${W - R - zx}" height="${zh}" fill="${C.zone}" fill-opacity="0.16" stroke="${C.zone}" stroke-opacity="0.7"/>`;
+    const zt = `${dir > 0 ? "DEMAND ZONE" : "SUPPLY ZONE"} ${f(Math.min(...zone))} - ${f(Math.max(...zone))}`, tw = zt.length * 7.6, tx = Math.min(zx + 4, W - R - tw - 6), ty = dir > 0 ? zy + zh + 17 : zy - 7;
+    zl = `<rect x="${tx - 3}" y="${ty - 13}" width="${tw + 6}" height="18" rx="3" fill="${C.bg}" fill-opacity="0.85"/><text x="${tx}" y="${ty}" font-size="13" fill="${C.zone}">${zt}</text>`;
+  }
+  // candles
+  const w = Math.max(1.5, step * 0.66);
+  for (let i = 0; i < n; i++) {
+    const c = candles[i], col = c.c >= c.o ? C.up : C.dn;
+    s += `<line x1="${x(i)}" x2="${x(i)}" y1="${y(c.h)}" y2="${y(c.l)}" stroke="${col}"/><rect x="${x(i) - w / 2}" y="${Math.min(y(c.o), y(c.c))}" width="${w}" height="${Math.max(1, Math.abs(y(c.o) - y(c.c)))}" fill="${col}"/>`;
+  }
+  // levels, labels on the right
+  const lv = [[entry, "ENTRY", C.entry, ""], [sl, "SL", C.sl, "6 4"], ...tps.map((t, i) => [t, "TP" + (i + 1), C.tp, "6 4"])].filter(([v]) => v >= lo && v <= hi);
+  const lab = lv.map(([v, name, col, dash]) => { s += `<line x1="${L}" x2="${W - R}" y1="${y(v)}" y2="${y(v)}" stroke="${col}" stroke-width="1.6"${dash ? ` stroke-dasharray="${dash}"` : ""}/>`; return { yy: y(v), v, name, col }; }).sort((a, b) => a.yy - b.yy);
+  for (let i = 1; i < lab.length; i++) if (lab[i].yy - lab[i - 1].yy < 20) lab[i].yy = lab[i - 1].yy + 20;
+  for (const l of lab) s += `<rect x="${W - R + 2}" y="${l.yy - 10}" width="${R - 4}" height="20" rx="3" fill="${l.col}"/><text x="${W - R + 7}" y="${l.yy + 5}" font-size="12" font-weight="bold" fill="${C.bg}">${l.name} ${f(l.v)}</text>`;
+  // the signal candle: a triangle under it (BUY) or over it (SELL)
+  const k = n - 1, tip = dir > 0 ? y(candles[k].l) + 8 : y(candles[k].h) - 8, d = dir > 0 ? 12 : -12;
+  s += `<path d="M${x(k)} ${tip} L${x(k) - 7} ${tip + d} L${x(k) + 7} ${tip + d} Z" fill="${dir > 0 ? C.up : C.dn}" stroke="${C.entry}" stroke-width="1"/>`;
+  s += zl;
+  s += `<text x="${L}" y="26" font-size="20" font-weight="bold" fill="${dir > 0 ? C.up : C.dn}">${esc(title)}</text><text x="${L}" y="48" font-size="13" fill="${C.text}">${esc(sub)}</text>`;
+  s += `<text x="${W - R}" y="26" font-size="13" fill="${C.mut}" text-anchor="end">MEEGO AI</text></svg>`;
+  return s;
+}
+const RESVG_WASM = "https://cdn.jsdelivr.net/npm/@resvg/resvg-wasm@2.6.2/index_bg.wasm";
+const FONTS = ["DejaVuSans.ttf", "DejaVuSans-Bold.ttf"].map((f) => `https://cdn.jsdelivr.net/npm/dejavu-fonts-ttf@2.37.3/ttf/${f}`);
+let resvgReady = null;
+function resvgFonts() {
+  resvgReady ??= (async () => {
+    await initWasm(fetch(RESVG_WASM));
+    return await Promise.all(FONTS.map(async (u) => new Uint8Array(await (await fetch(u)).arrayBuffer())));
+  })().catch((e) => { resvgReady = null; throw e; });
+  return resvgReady;
+}
+async function signalChart(s) {
+  const tf = s.kind === "Swing" ? "1h" : "15min", min = tf === "1h" ? 60 : 15;
+  const list = (await candles(s.sym, tf)).filter((x) => x.t <= s.time).slice(-70);
+  if (list.length < 20) return null;
+  const word = s.dir > 0 ? "BUY" : "SELL", my = new Date(s.time + 8 * 3600000), zt = Number((String(s.zkey || "").match(/^Z(\d{13})/) || [])[1] || 0);
+  const why = String(s.note || "").replace(/^🤖 MEEGO AI · /, "").replace(/^(Demand|Supply) zone \S+ [\d.]+ - [\d.]+ · /, "");
+  const label = s.test ? "EA TEST" : s.nine ? "9:59 AM SETUP" : s.news === "pre" ? "NEWS" : s.news === "recovery" ? "RECOVERY" : s.kind.toUpperCase();
+  const svg = chartSvg({
+    candles: list, dir: s.dir, entry: s.entry, sl: s.sl0 ?? s.sl, tps: s.tps || [s.tp], zone: Array.isArray(s.zone) ? s.zone : null, zoneFrom: zt, tf: min, digits: digits(s.sym),
+    title: `${label} ${word} ${s.sym}`, sub: `${min === 60 ? "H1" : "M15"} · ${my.toISOString().slice(0, 10).split("-").reverse().join("/")} ${my.toISOString().slice(11, 16)} MYT${why ? " · " + why.slice(0, 90) : ""}`,
+  });
+  const fontBuffers = await resvgFonts();
+  return new Resvg(svg, { font: { fontBuffers, defaultFontFamily: "DejaVu Sans", loadSystemFonts: false }, fitTo: { mode: "width", value: 1000 } }).render().asPng();
+}
+// Sends the chart to every chat: uploaded once, then re-sent by file_id
+async function sendChart(chats, s) {
+  if (!chats.length) return;
+  const png = await signalChart(s);
+  if (!png) return;
+  const caption = `📈 ${s.dir > 0 ? "BUY" : "SELL"} ${esc(s.sym)} · ${esc(s.kind)} · entry <code>${px(s.entry, s.sym)}</code>`;
+  let fileId = null;
+  for (const c of chats) {
+    if (fileId) await tg("sendPhoto", { chat_id: c, photo: fileId, caption, parse_mode: "HTML" });
+    else {
+      const fd = new FormData();
+      fd.append("chat_id", String(c)); fd.append("caption", caption); fd.append("parse_mode", "HTML");
+      fd.append("photo", new Blob([png], { type: "image/png" }), "signal.png");
+      const r = await (await fetch(`https://api.telegram.org/bot${TOKEN}/sendPhoto`, { method: "POST", body: fd })).json().catch(() => ({}));
+      fileId = r.result?.photo?.at(-1)?.file_id ?? null;
+    }
+    await new Promise((r) => setTimeout(r, 60));
+  }
+}
+
 /* ---------- broadcasts (new signal, Hit TP/SL, daily reminders) ---------- */
 async function audience(kind, trial = false) {
   const { data } = await db.from("telegram_users").select("*");
@@ -1851,6 +1958,7 @@ async function onDbEvent(ev) {
       const sig = { id: ev.record.id, ...s };
       const title = s.test ? "🧪 EA TEST (not a real setup)" : s.trial ? `🧪 ${s.kind.toUpperCase()} TEST (admin only)` : s.nine ? "🕘 9:59 AM SETUP" : s.news === "pre" ? "📰 NEWS SIGNAL" : s.news === "recovery" ? "🔁 RECOVERY SETUP (after news spike)" : kindOf(s.kind).fresh;
       for (const c of chats) { await sendLive(c, sig, title); await new Promise((r) => setTimeout(r, 60)); }
+      await sendChart(chats, sig).catch((e) => console.error("signal chart failed", e));
       return;
     }
     const label = `${s.trial ? "🧪 " : ""}${s.dir > 0 ? "BUY" : "SELL"}${s.order === "limit" ? " LIMIT" : ""} <b>${esc(s.sym)}</b>`;
