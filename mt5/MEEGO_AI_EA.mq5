@@ -15,7 +15,7 @@ input string InpKey           = "";        // MEEGO EA key (send /ea in the bot)
 input string InpSymbol        = "XAUUSD";  // Your broker's gold symbol (found by itself if this one does not exist)
 input double InpFixedLot      = 0.01;      // Lot of every layer, whatever the balance (0 = use the risk % instead)
 input int    InpLayers        = 3;         // Layers per signal (1-10), TP1/TP2/TP3 in turn
-input double InpLayerStepPips = 10;        // Zone signals: each next layer this many pips deeper in the zone (limit order, 0 = all at once)
+input double InpLayerStepPips = 10;        // Zone signals: each next layer this many pips deeper in the zone (0 = all at once)
 input double InpRiskPct       = 1.0;       // Risk per signal (% of balance), only when the fixed lot is 0
 input double InpMaxLot        = 1.0;       // Max total lot per signal
 input bool   InpScalping      = true;      // Copy Scalping signals
@@ -163,6 +163,7 @@ string IdOf(string comment)       { return(StringFind(comment, "MEEGO|") == 0 ? 
 string GvDone(string id8)         { return("MEEGO_" + id8); }
 string GvBE(string id8)           { return("MEEGO_B_" + id8); }   // 1 = half closed
 string GvEnd(string id8)          { return("MEEGO_E_" + id8); }   // server time when the trade must be closed
+string GvLay(string id8, string w) { return("MEEGO_" + w + "_" + id8); }   // instant zone ladder: N layers done, P last price, M layers wanted, Q lot
 string GvBroken(string id8)       { return("MEEGO_X_" + id8); }   // server time when the zone stopped being valid
 bool   HasZone(Sig &s)            { return(s.zLo > 0 && s.zHi > s.zLo); }
 
@@ -272,11 +273,13 @@ bool OpenSignal(Sig &s, double zoneLimit = 0)
       tps[i] = !three ? s.tp1 : (k == 0 ? s.tp1 : k == 1 ? s.tp2 : s.tp3);
      }
 
-   // zone signals: the first layer at the price, the next ones as limit orders InpLayerStepPips apart, deeper in the zone
-   bool   spread = HasZone(s) && InpLayerStepPips > 0 && parts > 1;
+   // zone signals with limit orders: one limit order every InpLayerStepPips, deeper in the zone.
+   // instant zone signals: one layer now at the market, the next ones at market each time the price goes InpLayerStepPips deeper (AddLayers)
+   bool   spread = HasZone(s) && InpLayerStepPips > 0 && parts > 1 && limit;
+   bool   ladder = HasZone(s) && InpLayerStepPips > 0 && parts > 1 && !limit;
    double far = s.dir > 0 ? MathMin(s.zLo, s.entry) : MathMax(s.zHi, s.entry);
    int ok = 0;
-   for(int i = 0; i < parts; i++)
+   for(int i = 0; i < (ladder ? 1 : parts); i++)
      {
       bool   lim = limit;
       double at = ref;
@@ -307,6 +310,13 @@ bool OpenSignal(Sig &s, double zoneLimit = 0)
      {
       GlobalVariableSet(GvDone(s.id8), 1);
       if(s.lifeH > 0) GlobalVariableSet(GvEnd(s.id8), (double)TimeCurrent() + s.lifeH * 3600.0);
+      if(ladder)
+        {
+         GlobalVariableSet(GvLay(s.id8, "N"), 1);
+         GlobalVariableSet(GvLay(s.id8, "P"), mkt);
+         GlobalVariableSet(GvLay(s.id8, "M"), parts);
+         GlobalVariableSet(GvLay(s.id8, "Q"), part);
+        }
       Print("MEEGO AI EA: opened ", s.kind, " ", (s.dir > 0 ? "BUY" : "SELL"), (limit ? " LIMIT " : " "), s.id8, " parts ", ok);
      }
    return(ok > 0);
@@ -542,6 +552,44 @@ bool ZoneValid(Sig &s)
    return(p <= 0 || (p - s.sl) * s.dir > 0);
   }
 
+// Instant zone signals: one more layer at market each time the price is InpLayerStepPips deeper than the last layer, while still in the zone
+void AddLayers()
+  {
+   if(!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED) || !MQLInfoInteger(MQL_TRADE_ALLOWED)) return;
+   int dg = (int)SymbolInfoInteger(g_sym, SYMBOL_DIGITS);
+   for(int i = 0; i < ArraySize(g_sigs); i++)
+     {
+      Sig s = g_sigs[i];
+      if(s.status != "running" || !GlobalVariableCheck(GvLay(s.id8, "N"))) continue;
+      int n = (int)GlobalVariableGet(GvLay(s.id8, "N")), m = (int)GlobalVariableGet(GvLay(s.id8, "M"));
+      if(n >= m || !ZoneValid(s)) continue;
+      ulong tk[];
+      if(Tickets(s.id8, tk) == 0) continue;                                   // nothing open any more
+      double p = s.dir > 0 ? SymbolInfoDouble(g_sym, SYMBOL_ASK) : SymbolInfoDouble(g_sym, SYMBOL_BID);
+      double last = GlobalVariableGet(GvLay(s.id8, "P")), far = s.dir > 0 ? MathMin(s.zLo, s.entry) : MathMax(s.zHi, s.entry);
+      if(p <= 0 || (last - p) * s.dir < InpLayerStepPips * PIP) continue;      // not deep enough yet
+      if((p - far) * s.dir < 0) continue;                                     // out of the zone
+      if((p - s.sl) * s.dir < InpMinSLPips * PIP) continue;                   // too close to the SL
+      int k = n % 3;
+      double tp = (s.tp2 > 0 && s.tp3 > 0) ? (k == 0 ? s.tp1 : k == 1 ? s.tp2 : s.tp3) : s.tp1;
+      if((tp - p) * s.dir <= 0) continue;
+      double lot = GlobalVariableGet(GvLay(s.id8, "Q")), sl = NormalizeDouble(s.sl, dg);
+      string c = Tag(s.id8, n + 1);
+      bool r = s.dir > 0 ? trade.Buy(lot, g_sym, 0, sl, NormalizeDouble(tp, dg), c) : trade.Sell(lot, g_sym, 0, sl, NormalizeDouble(tp, dg), c);
+      if(r && (trade.ResultRetcode() == TRADE_RETCODE_DONE || trade.ResultRetcode() == TRADE_RETCODE_DONE_PARTIAL))
+        {
+         GlobalVariableSet(GvLay(s.id8, "N"), n + 1);
+         GlobalVariableSet(GvLay(s.id8, "P"), p);
+         Print("MEEGO AI EA: layer ", n + 1, " of ", m, " for ", s.id8, " at ", DoubleToString(p, dg), " (", DoubleToString(InpLayerStepPips, 0), " pips deeper)");
+        }
+      else
+        {
+         GlobalVariableSet(GvLay(s.id8, "N"), m);                             // stop trying for this signal
+         Print("MEEGO AI EA: layer ", n + 1, " failed for ", s.id8, ": ", trade.ResultRetcode(), " ", trade.ResultRetcodeDescription());
+        }
+     }
+  }
+
 // Algo trading on, and no failed order in the last 20 seconds
 bool TradeOk(Sig &s)
   {
@@ -554,6 +602,7 @@ void Work()
    g_work = GetTickCount64();
    ManageBE();
    if(TimeLocal() - g_fetched > 120) return;      // no fresh signals: manage only
+   AddLayers();
    int open = OpenSignalCount();
    for(int i = 0; i < ArraySize(g_sigs); i++)
      {
