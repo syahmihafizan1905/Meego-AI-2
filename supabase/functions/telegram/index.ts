@@ -1637,6 +1637,19 @@ async function sendFile(chatId, name, content, caption) {
   const r = await fetch(`https://api.telegram.org/bot${TOKEN}/sendDocument`, { method: "POST", body: fd });
   return await r.json().catch(() => ({ ok: false }));
 }
+async function saveEaFile(chatId, msg) {
+  const doc = msg.document, ext = doc.file_name.split(".").pop().toLowerCase(), name = "MEEGO_AI_EA." + ext, all = /\ball\b/i.test(String(msg.caption || ""));
+  if (doc.file_size > 5 * 1024 * 1024) return send(chatId, "That file is too big for an EA.");
+  const f = await tg("getFile", { file_id: doc.file_id });
+  if (!f.ok) return send(chatId, "Couldn't download that file. Try sending it again.");
+  const bytes = new Uint8Array(await (await fetch(`https://api.telegram.org/file/bot${TOKEN}/${f.result.file_path}`)).arrayBuffer());
+  if (ext === "ex5" && bytes.length < 1000) return send(chatId, "That doesn't look like a compiled EA (.ex5).");
+  const b64 = toBase64(bytes), version = ext === "mq5" ? (new TextDecoder().decode(bytes).match(/#property\s+version\s+"([^"]+)"/) || [])[1] : null;
+  const rows = [{ name: "admin/" + name, b64, updated_at: new Date().toISOString() }].concat(all ? [{ name, b64, updated_at: new Date().toISOString() }] : []);
+  const { error } = await db.from("ea_files").upsert(rows);
+  if (error) return send(chatId, "Couldn't save the EA file: " + esc(error.message));
+  return send(chatId, `✅ <b>${name}</b> saved${version ? ` (version ${esc(version)})` : ""}, ${Math.round(bytes.length / 1024)} KB.\n${all ? "Everyone now gets this file from 🤖 MT5 EA / /ea." : "Only you get it from 🤖 MT5 EA / /ea. Send it again with the caption <b>all</b> to give it to customers too."}`);
+}
 async function cmdEA(chatId, a, text) {
   if (!a.admin && !a.tier) return showPlans(chatId);
   let key = a.ea_key;
@@ -1661,12 +1674,12 @@ async function cmdEA(chatId, a, text) {
     "⚠️ Test on a <b>DEMO</b> account first. Use a <b>hedging</b> account (3 TPs = 3 positions).",
     "New key: <code>/ea reset</code> (the old key stops working).",
   ].join("\n"), kb(a));
-  const bin = await eaFile("MEEGO_AI_EA.ex5").catch(() => null);
+  const bin = (a.admin ? await eaFile("admin/MEEGO_AI_EA.ex5").catch(() => null) : null) ?? (await eaFile("MEEGO_AI_EA.ex5").catch(() => null));
   if (!bin) return send(chatId, "Couldn't attach the EA file right now. Try /ea again in a minute.");
   await sendFile(chatId, "MEEGO_AI_EA.ex5", bin, "📎 <b>MEEGO_AI_EA.ex5</b> · put it in MQL5 → Experts");
   if (!a.admin) return;
   // Admin only: the editable source code (customers get the compiled .ex5 only)
-  const src = await eaFile("MEEGO_AI_EA.mq5").catch(() => null);
+  const src = (await eaFile("admin/MEEGO_AI_EA.mq5").catch(() => null)) ?? (await eaFile("MEEGO_AI_EA.mq5").catch(() => null));
   if (src) return sendFile(chatId, "MEEGO_AI_EA.mq5", src, "🛠 <b>Admin only · MEEGO_AI_EA.mq5</b> (source code)\nEdit it in MetaEditor (F4) and press Compile (F7). Customers only ever get the .ex5.");
 }
 
@@ -2151,6 +2164,8 @@ async function onMessage(msg) {
     return send(chatId, "👑 You're now the <b>MEEGO admin</b>. Tap <b>➕ Add customer</b> to give someone a plan.", { reply_markup: ADMIN_MENU });
   }
 
+  // Admin: a new EA file sent to the bot (MEEGO_AI_EA.ex5 or .mq5). Kept for the admin only, unless the caption says "all".
+  if (a.admin && /^MEEGO_AI_EA\.(ex5|mq5)$/i.test(String(msg.document?.file_name || ""))) return saveEaFile(chatId, msg);
   // Admin: button flows (no typing commands)
   if (a.admin) {
     const st = await getState(chatId);
