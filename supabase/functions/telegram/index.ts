@@ -1806,13 +1806,17 @@ async function cmdAdmin(chatId, a, text) {
     const kind = words.some((w) => /^swing/.test(w)) ? "Swing" : words.some((w) => /^intra/.test(w)) ? "Intraday" : "Scalping";
     const live = marketOpen(new Date(), "XAUUSD") ? await livePrice("XAUUSD").catch(() => null) : null;
     if (live === null) return send(chatId, "No gold price right now (market closed or price not available). Try again later.");
-    // stop 60 / 100 / 200 pips; a limit order waits 30 pips away from the price
-    const stop = kind === "Swing" ? 20 : kind === "Intraday" ? 10 : 6, e = limit ? live - dir * 3 : live, r2 = (x) => Number(x.toFixed(2));
-    const entry = r2(e), sl = r2(e - dir * stop), z = [e - dir * stop * 0.65, e + dir * (limit ? 0 : 1)].map(r2).sort((x, y) => x - y);
-    const { error } = await db.from("signals").insert({ id: crypto.randomUUID(), data: { kind, sym: "XAUUSD", dir, entry, sl, ...tpPlan("XAUUSD", dir, entry, sl, kind === "Swing" ? SWING_TP : kind === "Intraday" ? INTRADAY_TP : TP_PLAN), zone: z,
-      order: limit ? "limit" : "instant", ...(limit ? { pending: true, expire: 1 } : {}), life: 1, test: true, trial: true, auto: true,
-      note: `EA TEST, not a real setup · test zone ${z[0].toFixed(2)} - ${z[1].toFixed(2)} · closes after 1 hour`, status: "running", time: Date.now(), closedAt: null } });
-    return send(chatId, error ? "Couldn't save the test signal: " + esc(error.message) : `🧪 Test ${kind} ${dir > 0 ? "BUY" : "SELL"}${limit ? " LIMIT" : ""} sent. The EA should react within about 30 seconds. Send /testend to close it.`);
+    // the nearest real S&D zone on the chart (M15, Swing H1) that price hasn't broken: inside it = instant entry, away from it = limit at its edge
+    const tf = kind === "Swing" ? "1h" : "15min", Z = (await candles("XAUUSD", tf)).slice(0, -1).slice(-400), a = atr(Z), r2 = (x) => Number(x.toFixed(2));
+    const zs = Z.length > 60 && a ? smZones(Z, dir).filter((q) => (dir > 0 ? q.bot < live : q.top > live)).sort((x, y) => Math.abs((dir > 0 ? x.top : x.bot) - live) - Math.abs((dir > 0 ? y.top : y.bot) - live)) : [];
+    const zq = zs[0];
+    if (!zq) return send(chatId, `No unbroken ${dir > 0 ? "demand" : "supply"} zone on ${tf === "1h" ? "H1" : "M15"} right now. Try ${dir > 0 ? "sell" : "buy"} or another type.`);
+    const inZone = live >= zq.bot && live <= zq.top, useLimit = limit || !inZone, edge = dir > 0 ? zq.top : zq.bot;
+    const e = useLimit ? edge : live, entry = r2(e), sl = r2((dir > 0 ? zq.bot : zq.top) - dir * 0.25 * a), z = [r2(zq.bot), r2(zq.top)], zkey = "Z" + zq.t + dir;
+    const { error } = await db.from("signals").insert({ id: crypto.randomUUID(), data: { kind, sym: "XAUUSD", dir, entry, sl, ...tpPlan("XAUUSD", dir, entry, sl, kind === "Swing" ? SWING_TP : kind === "Intraday" ? INTRADAY_TP : TP_PLAN), zone: z, zkey,
+      order: useLimit ? "limit" : "instant", ...(useLimit ? { pending: true, expire: 1 } : {}), life: 1, test: true, trial: true, auto: true,
+      note: `EA TEST · real ${dir > 0 ? "demand" : "supply"} zone ${tf === "1h" ? "H1" : "M15"} ${z[0].toFixed(2)} - ${z[1].toFixed(2)} (price left it by ${((Math.max(...Z.slice(Z.findIndex((x) => x.t === zq.t) + 1, Z.findIndex((x) => x.t === zq.t) + 5).map((x) => (x.c - Z.find((y) => y.t === zq.t).c) * dir))) / a).toFixed(1)}x ATR) · not a full setup, no confirmation · closes after 1 hour`, status: "running", time: Date.now(), closedAt: null } });
+    return send(chatId, error ? "Couldn't save the test signal: " + esc(error.message) : `🧪 Test ${kind} ${dir > 0 ? "BUY" : "SELL"}${useLimit ? " LIMIT" : ""} sent on a real zone ${z[0]} - ${z[1]}. The EA should react within about 30 seconds. Send /testend to close it.`);
   }
   if (cmd === "/testend") {
     const { data } = await db.from("signals").select("id,data").order("updated_at", { ascending: false }).limit(100);
@@ -1853,8 +1857,10 @@ async function cmdAdmin(chatId, a, text) {
 
 /* ---------- signal chart picture: candles, zone, entry, SL, TPs ---------- */
 // Signal chart as SVG: candles, zone, entry, SL, TPs (Malaysia time)
+// Signal chart as SVG: candles, zone, entry, SL, TPs (Malaysia time)
 function chartSvg(o) {
-  const { candles, title, sub, dir, entry, sl, tps = [], zone = null, zoneFrom = 0, tf = 15, digits = 2 } = o;
+  const { candles, title, sub, dir, entry, sl, tps = [], zone = null, zoneFrom = 0, tf = 15, digits = 2, signalT = 0 } = o;
+  const baseI = zoneFrom ? candles.findIndex((c) => c.t === zoneFrom) : -1;
   const W = 1000, H = 600, L = 14, R = 112, T = 62, B = 46, n = candles.length;
   const C = { bg: "#0f1115", grid: "#20242c", text: "#c9ced8", mut: "#7c8492", up: "#26a69a", dn: "#ef5350", zone: dir > 0 ? "#26a69a" : "#ef5350", entry: "#e6e8ee", sl: "#ef5350", tp: "#26a69a" };
   const vals = candles.flatMap((x) => [x.h, x.l]).concat([entry, sl], tps.length ? [tps[0]] : [], zone || []);
@@ -1878,6 +1884,13 @@ function chartSvg(o) {
     const zt = `${dir > 0 ? "DEMAND ZONE" : "SUPPLY ZONE"} ${f(Math.min(...zone))} - ${f(Math.max(...zone))}`, tw = zt.length * 7.6, tx = Math.min(zx + 4, W - R - tw - 6), ty = dir > 0 ? zy + zh + 17 : zy - 7;
     zl = `<rect x="${tx - 3}" y="${ty - 13}" width="${tw + 6}" height="18" rx="3" fill="${C.bg}" fill-opacity="0.85"/><text x="${tx}" y="${ty}" font-size="13" fill="${C.zone}">${zt}</text>`;
   }
+  // the base candle of the zone and the strong move away from it
+  if (baseI >= 0) {
+    const b = candles[baseI], mv = candles.slice(baseI + 1, baseI + 5), far = dir > 0 ? Math.max(...mv.map((c) => c.h)) : Math.min(...mv.map((c) => c.l)), j = baseI + 1 + mv.findIndex((c) => (dir > 0 ? c.h : c.l) === far);
+    s += `<rect x="${x(baseI) - step * 0.7}" y="${y(b.h) - 4}" width="${step * 1.4}" height="${y(b.l) - y(b.h) + 8}" fill="none" stroke="#f5c542" stroke-width="2"/>`;
+    if (mv.length) s += `<path d="M${x(baseI)} ${dir > 0 ? y(b.l) + 18 : y(b.h) - 18} L${x(j)} ${dir > 0 ? y(far) - 10 : y(far) + 10}" stroke="#f5c542" stroke-width="2" stroke-dasharray="5 4" fill="none"/>`;
+    zl += `<text x="${Math.max(L + 2, x(baseI) - 18)}" y="${dir > 0 ? y(b.l) + 34 : y(b.h) - 24}" font-size="12" fill="#f5c542">BASE</text>`;
+  }
   // candles
   const w = Math.max(1.5, step * 0.66);
   for (let i = 0; i < n; i++) {
@@ -1890,10 +1903,13 @@ function chartSvg(o) {
   for (let i = 1; i < lab.length; i++) if (lab[i].yy - lab[i - 1].yy < 20) lab[i].yy = lab[i - 1].yy + 20;
   for (const l of lab) s += `<rect x="${W - R + 2}" y="${l.yy - 10}" width="${R - 4}" height="20" rx="3" fill="${l.col}"/><text x="${W - R + 7}" y="${l.yy + 5}" font-size="12" font-weight="bold" fill="${C.bg}">${l.name} ${f(l.v)}</text>`;
   // the signal candle: a triangle under it (BUY) or over it (SELL)
-  const k = n - 1, tip = dir > 0 ? y(candles[k].l) + 8 : y(candles[k].h) - 8, d = dir > 0 ? 12 : -12;
+  let k = n - 1;
+  if (signalT) { k = candles.findLastIndex((c) => c.t <= signalT); if (k < 0) k = n - 1; }
+  if (k < n - 1) s += `<line x1="${x(k)}" x2="${x(k)}" y1="${T}" y2="${H - B}" stroke="${C.entry}" stroke-opacity="0.5" stroke-dasharray="3 4"/><text x="${x(k) + 5}" y="${T + 14}" font-size="12" fill="${C.text}">SIGNAL</text>`;
+  const tip = dir > 0 ? y(candles[k].l) + 8 : y(candles[k].h) - 8, d = dir > 0 ? 12 : -12;
   s += `<path d="M${x(k)} ${tip} L${x(k) - 7} ${tip + d} L${x(k) + 7} ${tip + d} Z" fill="${dir > 0 ? C.up : C.dn}" stroke="${C.entry}" stroke-width="1"/>`;
   s += zl;
-  s += `<text x="${L}" y="26" font-size="20" font-weight="bold" fill="${dir > 0 ? C.up : C.dn}">${esc(title)}</text><text x="${L}" y="48" font-size="13" fill="${C.text}">${esc(sub)}</text>`;
+  s += `<text x="${L}" y="26" font-size="20" font-weight="bold" fill="${dir > 0 ? C.up : C.dn}">${esc(title)}</text><text x="${L}" y="48" font-size="13" fill="${C.text}">${esc(sub.length > 112 ? sub.slice(0, 110) + "…" : sub)}</text>`;
   s += `<text x="${W - R}" y="26" font-size="13" fill="${C.mut}" text-anchor="end">MEEGO AI</text></svg>`;
   return s;
 }
