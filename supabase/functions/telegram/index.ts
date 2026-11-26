@@ -1637,6 +1637,21 @@ async function sendFile(chatId, name, content, caption) {
   const r = await fetch(`https://api.telegram.org/bot${TOKEN}/sendDocument`, { method: "POST", body: fd });
   return await r.json().catch(() => ({ ok: false }));
 }
+// /testsignal sop [buy|sell]: a PR SOP signal from the latest real M15 BUY+ / SELL+ and the dashboard as it is now (admin only, not counted)
+async function testSop(chatId, words) {
+  const live = marketOpen(new Date(), "XAUUSD") ? await livePrice("XAUUSD").catch(() => null) : null;
+  if (live === null) return send(chatId, "No gold price right now (market closed or price not available). Try again later.");
+  const [m1, m15, h1] = [await candles("XAUUSD", "1min"), await candles("XAUUSD", "15min"), await candles("XAUUSD", "1h")];
+  const G = sndCandles("XAUUSD", m1, m15, h1), want = words.includes("sell") ? -1 : words.includes("buy") ? 1 : 0;
+  const mk = prMarks(G(15).slice(-400)).marks.filter((m) => m.text.endsWith("+") && (!want || m.dir === want)).at(-1);
+  if (!mk) return send(chatId, `No ${want > 0 ? "BUY+" : want < 0 ? "SELL+" : "BUY+ / SELL+"} on M15 in the last few days.`);
+  const dash = prDash(G, m1.slice(0, -1)), ready = prReady(dash, mk.dir), r2 = (x) => Number(x.toFixed(2));
+  const entry = r2(live), sl = r2(live - mk.dir * SOP.sl * pip("XAUUSD")), at = new Date(mk.t + 8 * 3600000).toISOString().slice(11, 16), ago = Math.round((Date.now() - mk.t) / 3600000);
+  const { error } = await db.from("signals").insert({ id: crypto.randomUUID(), data: { kind: "SOP", sym: "XAUUSD", dir: mk.dir, entry, sl, ...tpPlan("XAUUSD", mk.dir, entry, sl, SOP_TP), zkey: "T" + mk.t + mk.dir, sigT: mk.t,
+    order: "instant", life: 1, wait: !ready, dash: dash.rows, ribbon: dash.ribbon, test: true, trial: true, auto: true, status: "running", time: Date.now(), closedAt: null,
+    note: `EA TEST · PR SOP: latest ${mk.text} M15 ${at}${ago >= 1 ? ` (${ago}h ago)` : ""} · dashboard ${dash.count(mk.dir)}/5 ${mk.dir > 0 ? "BULLISH" : "BEARISH"} · ribbon M5 ${dash.ribbon === mk.dir ? "OK" : "not yet"} · ${ready ? "ENTRY NOW" : "WAIT: the EA enters when the dashboard is 4/5 and the ribbon agrees (60 min)"}` } });
+  return send(chatId, error ? "Couldn't save the test signal: " + esc(error.message) : `🧪 Test PR SOP ${mk.dir > 0 ? "BUY" : "SELL"} sent (${mk.text} M15 ${at}, dashboard ${dash.count(mk.dir)}/5, ${ready ? "ENTRY NOW" : "WAIT"}). Send /testend to close it.`);
+}
 async function saveEaFile(chatId, msg) {
   const doc = msg.document, ext = doc.file_name.split(".").pop().toLowerCase(), name = "MEEGO_AI_EA." + ext, all = /\ball\b/i.test(String(msg.caption || ""));
   if (doc.file_size > 5 * 1024 * 1024) return send(chatId, "That file is too big for an EA.");
@@ -1826,7 +1841,7 @@ async function cmdAdmin(chatId, a, text) {
       "Post your own too:",
       "<code>/post BUY XAUUSD 4040 4080 3990</code> intraday signal (entry, TP, SL)",
       "<code>/post BUY XAUUSD 4040 4048 4034 scalp</code> scalping signal",
-      "<code>/testsignal buy|sell scalping|intraday|swing [limit]</code> EA test signal (only you get it) · <code>/testend</code> closes it",
+      "<code>/testsignal buy|sell scalping|intraday|swing [limit]</code> or <code>/testsignal sop [buy|sell]</code> EA test signal (only you get it) · <code>/testend</code> closes it",
       "<code>/post SELL XAUUSD 4129 4119 4140 swing Sell area, wait for price</code> swing (Ultimate only) with a note",
       "<code>/close tp</code> · <code>/close sl</code> · <code>/close be</code> closes the latest running signal (add a pair to choose: <code>/close tp XAUUSD</code>)",
       "",
@@ -1891,6 +1906,7 @@ async function cmdAdmin(chatId, a, text) {
   // A made-up signal at the current price, only for the admin, to check the EA (zone lines, entry, TPs). Not counted anywhere.
   if (cmd === "/testsignal") {
     const words = parts.slice(1).map((w) => w.toLowerCase()), dir = words.includes("sell") ? -1 : 1, limit = words.includes("limit");
+    if (words.includes("sop")) return testSop(chatId, words);
     const kind = words.some((w) => /^swing/.test(w)) ? "Swing" : words.some((w) => /^intra/.test(w)) ? "Intraday" : "Scalping";
     const live = marketOpen(new Date(), "XAUUSD") ? await livePrice("XAUUSD").catch(() => null) : null;
     if (live === null) return send(chatId, "No gold price right now (market closed or price not available). Try again later.");
