@@ -25,7 +25,7 @@ async function tg(method, body) {
   return await r.json().catch(() => ({ ok: false }));
 }
 const MENU = { keyboard: [[{ text: "⚡ Scalping" }, { text: "📈 Intraday" }, { text: "⭐ Swing" }], [{ text: "🧭 Direction" }, { text: "🖼 Chart Scanner" }], [{ text: "📊 History" }, { text: "📰 News" }], [{ text: "👤 My plan" }, { text: "🤖 MT5 EA" }, { text: "❓ Help" }]], resize_keyboard: true };
-const ADMIN_MENU = { keyboard: [[{ text: "➕ Add customer" }, { text: "👥 Customers" }], [{ text: "⚡ Scalping" }, { text: "📈 Intraday" }, { text: "⭐ Swing" }], [{ text: "🧭 Direction" }, { text: "🖼 Chart Scanner" }], [{ text: "📊 History" }, { text: "📰 News" }], [{ text: "🤖 MT5 EA" }, { text: "❓ Help" }]], resize_keyboard: true };
+const ADMIN_MENU = { keyboard: [[{ text: "➕ Add customer" }, { text: "👥 Customers" }], [{ text: "⚡ Scalping" }, { text: "📈 Intraday" }, { text: "⭐ Swing" }], [{ text: "🧭 Direction" }, { text: "🖼 Chart Scanner" }], [{ text: "📊 History" }, { text: "📰 News" }], [{ text: "🧠 Strategy" }, { text: "🤖 MT5 EA" }, { text: "❓ Help" }]], resize_keyboard: true };
 const KIND = {
   Scalping: { title: "⚡ DAILY SIGNAL SCALPING", fresh: "📢 NEW SCALPING SIGNAL", label: "Scalping", none: "No scalping setup running right now. You'll get a message here as soon as one is posted." },
   Intraday: { title: "📈 DAILY SIGNAL INTRADAY", fresh: "📢 NEW DAILY SIGNAL INTRADAY", label: "Daily Intraday", none: "No intraday setup running right now. You'll get a message here as soon as one is posted." },
@@ -368,6 +368,71 @@ function historyStats(list, now = Date.now()) {
     block("🗓 This week", weekStart, `${myDay(weekStart, { weekday: "short", day: "numeric", month: "short" })} – ${myDay(weekStart + 6 * 86400000).replace(",", "")}`),
     block("📆 This month", monthStart, myDay(monthStart, { month: "long", year: "numeric" })),
   ].join("\n\n");
+}
+// Admin only: every strategy the bot uses and how (kept in step with the code: news, 9:59, S&D = KX/SM/TOUCH, SNR = SNRB/SNRK, EA 1.31)
+async function cmdStrategy(chatId) {
+  const k = (n) => SNRK[n], NL = String.fromCharCode(10);
+  await send(chatId, [
+    "🧠 <b>STRATEGY MEEGO AI</b> (admin sahaja)",
+    "Semua untuk gold XAUUSD. Bot scan sendiri setiap beberapa minit, guna candle yang dah tutup sahaja.",
+    "",
+    "<b>👥 Pergi ke customer</b>",
+    "",
+    "<b>1. 📰 News signal</b>",
+    "• Hanya untuk 🔴 news USD.",
+    "• ~1 jam sebelum: 🔮 early prediction. ~2 minit sebelum: final call + signal.",
+    "• Arah: forecast vs previous (USD kuat = gold turun). Kalau seri, ikut trend H1.",
+    "• Kalau arah lawan trend H1 → skip (dalam backtest ni yang paling banyak kalah).",
+    "• SL 1.2× ATR M15 · TP ikut plan Scalping.",
+    "",
+    "<b>2. 🔁 Recovery</b>",
+    "• Bila news signal kena SL: ikut arah spike, entry limit di pullback 38%.",
+    "• Lot sama, jangan besarkan.",
+    "",
+    "<b>3. 🕘 9:59 AM setup</b>",
+    "• 9:55 pagi: heads-up. 9:59 pagi: signal.",
+    "• Candle 9–10 pagi (Malaysia) mesti sama arah dengan trend H1, dan dah bergerak ≥ 0.3× ATR H1.",
+    "• Backtest ~2 tahun: 132 trade, 66% kena TP1, +30.7R.",
+    "",
+    "<b>4. 📢 /post</b>: signal manual yang kau hantar sendiri.",
+    "",
+    "<b>🛠 Tools customer</b>",
+    "• 🧭 Direction: trend setiap timeframe.",
+    "• 🖼 Chart Scanner: AI baca screenshot chart → arah, entry, SL, TP.",
+  ].join(NL), { reply_markup: ADMIN_MENU });
+  await send(chatId, [
+    "<b>🧪 TRIAL (kau sahaja, belum ke customer)</b>",
+    "",
+    "<b>5. S&amp;D zone (Supply &amp; Demand)</b>",
+    "• Zone = candle base kecil, lepas tu harga lari kuat (≥ 1.3× ATR dalam 1–3 candle). Zone mesti belum ditembus (close).",
+    "• Tak boleh lawan trend kuat (struktur HH/HL + EMA50).",
+    "• ⚡ <b>Scalping</b>: zone M15 yang kuat (lari ≥ 2× ATR) dan fresh → entry terus bila harga sentuh zone. SL 20–100 pips.",
+    "• 📈 <b>Intraday</b>: zone M15 + candle pengesahan M5 (engulfing, rejection atau CHoCH) + ruang ≥ 1.5R ke swing seterusnya. SL 30–200 pips.",
+    "• ⭐ <b>Swing</b>: zone H1, trend H4. SL 60–600 pips.",
+    "• Tanda bonus dalam signal: Sweep, CHoCH, BOS, Engulfing, Rejection, FVG, SNR.",
+    "",
+    "<b>6. SNR breakout · RBS / SBR</b>",
+    "• Level = sekurang-kurangnya 2 swing high/low yang dekat sama (dalam 0.3× ATR).",
+    "• Breakout = candle kuat (badan ≥ 50%) tutup tembus level yang harga hormat sebelum ni.",
+    "• Retest = harga datang balik ke level dalam 3 candle terakhir.",
+    "• MSnR rule: kalau ada candle tutup balik tembus level → RBS/SBR gagal, tiada signal.",
+    "• Entry = candle terakhir tutup menjauhi level. SL di belakang level / wick retest.",
+    `• ⚡ Scalping: level ${TFN(k("Scalping").lt)}, break ${TFN(k("Scalping").bt)}, SL ${k("Scalping").min}–${k("Scalping").max} pips · backtest 6 bulan +32.6R (TP1 60%)`,
+    `• 📈 Intraday: level ${TFN(k("Intraday").lt)}, break ${TFN(k("Intraday").bt)}, SL ${k("Intraday").min}–${k("Intraday").max} pips · +9.3R (TP1 57%)`,
+    `• ⭐ Swing: level ${TFN(k("Swing").lt)}, break ${TFN(k("Swing").bt)}, SL ${k("Swing").min}–${k("Swing").max} pips · 17 bulan +5.5R (lemah sejak Mac)`,
+    "",
+    "<b>🎯 TP &amp; pengurusan</b>",
+    "• ⚡ Scalping: TP1 50–100, TP2 100–200, TP3 200–500 pips.",
+    "• 📈 Intraday: TP1 ≥ 100, TP2 ≥ 150, TP3 ≥ 200 pips.",
+    "• ⭐ Swing: TP1 1.5R (≥ 100 pips), TP2 2R, TP3 3R.",
+    "• Bot kira: tutup 1/3 setiap TP, SL ke entry lepas TP1.",
+    "• Had: Scalping 5/hari, Intraday 3/hari, Swing 2/hari, satu running setiap jenis.",
+    "",
+    "<b>🤖 EA 1.31</b>",
+    "• Layer dalam zone: limit setiap 10 pips (setup limit), atau tambah layer bila harga 10 pips lebih dalam (setup instant).",
+    "• +50 pips: SL kunci +20. +100 pips: tutup separuh, SL kunci +50.",
+    "• Zone dipadam bila candle tutup tembus zone, atau TP1/SL/masa dah sampai.",
+  ].join(NL), { reply_markup: ADMIN_MENU });
 }
 async function cmdHistory(chatId, a) {
   if (!a.admin && !a.tier) return send(chatId, noPlan(a));
@@ -2248,6 +2313,7 @@ async function onMessage(msg) {
     if (!a.admin && !a.tier) return send(chatId, noPlan(a));
     return send(chatId, "🖼 <b>MEEGO AI · Chart Scanner</b>\n\nSend a <b>screenshot of your chart</b> here (MT4/MT5/TradingView).\n\nTips for the best result:\n• Show the price scale on the right\n• One pair, one timeframe\n• Add the pair in the caption, e.g. <code>XAUUSD M15</code>\n\nMEEGO AI will read it and reply with direction, entry, TP and SL.", kb(a));
   }
+  if (a.admin && (t.startsWith("/strategy") || t.includes("strategy"))) return cmdStrategy(chatId);
   if (t.startsWith("/scalp") || t.includes("scalp")) return cmdSignal(chatId, a, "Scalping");
   if (t.startsWith("/intraday") || t.startsWith("/signal") || t.includes("intraday") || (t.includes("signal") && !t.includes("swing"))) return cmdSignal(chatId, a, "Intraday");
   if (t.startsWith("/swing") || t.includes("swing")) return cmdSignal(chatId, a, "Swing");
