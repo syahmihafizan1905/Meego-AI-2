@@ -1803,9 +1803,21 @@ async function eaFeed(key) {
   const lines = rows.map((x) => ["S", x.id, x.kind, x.news || "", x.sym, x.dir, x.order || "instant", x.status, x.pending ? 1 : 0, n(x.entry), n(x.sl0 ?? x.sl),
     ...(x.tps ? x.tps.map(n) : [n(x.tp), "0", "0"]), x.tpHit || 0, n(x.sl), Math.round(x.time || 0), x.expire ?? LIMIT.expire, Math.round(x.filled || 0), n(x.zone?.[0]), n(x.zone?.[1]), n(x.life ?? AUTO[x.kind]?.life), x.wait ? 0 : 1, x.setup || "", n(x.level ?? (x.setup === "SNR" && x.zone ? (x.zone[0] + x.zone[1]) / 2 : 0)), Math.round(x.bt || 0), Math.round(x.lvFrom || 0)].join("|"));
   // the zone map (S&D zones and SNR levels) for the EA to draw: Z|tf|dir|bottom|top|start ms|touched, L|tf|price|touches|start ms
-  let mp = null;
-  try { mp = JSON.parse((await settings())["map_XAUUSD"] || "null"); } catch { mp = null; }
-  const extra = mp && Date.now() - mp.t < 30 * 60000 ? [...mp.zones.map((z) => ["Z", ...z].join("|")), ...mp.levels.map((l) => ["L", ...l].join("|"))] : [];
+  // Admin only for now. Only the kind the admin last tapped (Scalping / Intraday / Swing, default Scalping), and only the 2 nearest
+  // zones and the 2 nearest SNR lines on each side of price, so the chart stays clean.
+  let extra = [];
+  if (a.admin) {
+    const cfg = await settings();
+    let mp = null;
+    try { mp = JSON.parse(cfg["map_XAUUSD"] || "null"); } catch { mp = null; }
+    if (mp && Date.now() - mp.t < 30 * 60000) {
+      const k = MAPK[cfg.map_view] || MAPK.Scalping, P = mp.price, near = (arr, side, val) => arr.filter((x) => side(x)).sort((x, y) => Math.abs(val(x) - P) - Math.abs(val(y) - P)).slice(0, MAP_NEAR);
+      const zs = mp.zones.filter((z) => k.z.includes(z[0])), ls = mp.levels.filter((l) => k.l.includes(l[0]));
+      const zones = [...near(zs, (z) => z[1] > 0, (z) => z[3]), ...near(zs, (z) => z[1] < 0, (z) => z[2])];
+      const levels = [...near(ls, (l) => l[1] > P, (l) => l[1]), ...near(ls, (l) => l[1] < P, (l) => l[1])];
+      extra = [...zones.map((z) => ["Z", ...z].join("|")), ...levels.map((l) => ["L", ...l].join("|"))];
+    }
+  }
   return txt([`OK|${Date.now()}|${a.admin ? "ADMIN" : a.tier}`, ...lines, ...extra].join("\n"));
 }
 async function sendFile(chatId, name, content, caption) {
@@ -2281,6 +2293,7 @@ async function sendChart(chats, s) {
 // Same map the EA draws (app_settings map_XAUUSD, saved every scan). Per kind: Scalping M15 zones + M15 lines, Intraday M15/H1 zones + M15/H1 lines,
 // Swing H1/H4 zones + H4/D1 lines. Chart: M15 (Swing H1), last 70 candles plus room on the right.
 const MAPK = { Scalping: { z: [15], l: [15], tf: "15min", m: 15 }, Intraday: { z: [15, 60], l: [15, 60], tf: "15min", m: 15 }, Swing: { z: [60, 240], l: [240, 1440], tf: "1h", m: 60 } };
+const MAP_NEAR = 2; // zones and SNR lines shown on each side of price (Telegram map and EA)
 const MTF = (m) => (m >= 1440 ? "D1" : m >= 60 ? "H" + m / 60 : "M" + m);
 function mapChartSvg(candles, zones, levels, price, title, sub) {
   const W = 1000, H = 600, L = 14, R = 112, T = 62, B = 46, n = candles.length, slots = n + 22;
@@ -2322,8 +2335,8 @@ async function sendMap(chatId, kind) {
   const zones = mp.zones.filter((z) => k.z.includes(z[0])).map(([tf, dir, lo, hi, t]) => ({ tf, dir, lo, hi, t }));
   const levels = mp.levels.filter((l) => k.l.includes(l[0])).map(([tf, v, n, t]) => ({ tf, v, n, t }));
   const price = (await livePrice("XAUUSD").catch(() => null)) ?? mp.price, p = pip("XAUUSD"), d = (v) => Math.round(Math.abs(v - price) / p);
-  const dz = zones.filter((z) => z.dir > 0).sort((a, b) => b.hi - a.hi), sz = zones.filter((z) => z.dir < 0).sort((a, b) => a.lo - b.lo);
-  const up = levels.filter((l) => l.v > price).sort((a, b) => a.v - b.v).slice(0, 4), dn = levels.filter((l) => l.v < price).sort((a, b) => b.v - a.v).slice(0, 4);
+  const dz = zones.filter((z) => z.dir > 0).sort((a, b) => b.hi - a.hi).slice(0, MAP_NEAR), sz = zones.filter((z) => z.dir < 0).sort((a, b) => a.lo - b.lo).slice(0, MAP_NEAR);
+  const up = levels.filter((l) => l.v > price).sort((a, b) => a.v - b.v).slice(0, MAP_NEAR), dn = levels.filter((l) => l.v < price).sort((a, b) => b.v - a.v).slice(0, MAP_NEAR);
   const text = [
     `🗺 <b>${kind.toUpperCase()} · ZONE MAP</b> (admin only)`,
     `Belum ada setup ${kind.toLowerCase()}. Ni zone dan line yang bot tengah tunggu · XAUUSD <code>${px(price, "XAUUSD")}</code>`,
@@ -2339,9 +2352,10 @@ async function sendMap(chatId, kind) {
     "EA 1.32 tanda zone dan line ni dalam MT5. Signal keluar sendiri bila harga sampai dan setup lengkap.",
   ].join(NL);
   await send(chatId, text, { reply_markup: ADMIN_MENU });
+  await db.from("app_settings").upsert({ key: "map_view", value: kind }); // the EA now shows this kind's map
   const list = (await candles("XAUUSD", k.tf)).slice(-70);
   if (list.length < 20) return;
-  const svg = mapChartSvg(list, zones, levels, price, `${kind.toUpperCase()} ZONE MAP XAUUSD`, `${MTF(k.m)} · zones ${k.z.map(MTF).join("/")} · SNR ${k.l.map(MTF).join("/")} · waiting for a setup`);
+  const svg = mapChartSvg(list, [...dz, ...sz], [...up, ...dn], price, `${kind.toUpperCase()} ZONE MAP XAUUSD`, `${MTF(k.m)} · zones ${k.z.map(MTF).join("/")} · SNR ${k.l.map(MTF).join("/")} · waiting for a setup`);
   const fontBuffers = await resvgFonts();
   const png = new Resvg(svg, { font: { fontBuffers, defaultFontFamily: "DejaVu Sans", loadSystemFonts: false }, fitTo: { mode: "width", value: 1000 } }).render().asPng();
   const fd = new FormData();
