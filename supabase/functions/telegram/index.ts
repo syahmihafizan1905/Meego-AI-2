@@ -389,12 +389,7 @@ async function cmdStrategy(chatId) {
     "• Bila news signal kena SL: ikut arah spike, entry limit di pullback 38%.",
     "• Lot sama, jangan besarkan.",
     "",
-    "<b>3. 🕘 9:59 AM setup</b>",
-    "• 9:55 pagi: heads-up. 9:59 pagi: signal.",
-    "• Candle 9–10 pagi (Malaysia) mesti sama arah dengan trend H1, dan dah bergerak ≥ 0.3× ATR H1.",
-    "• Backtest ~2 tahun: 132 trade, 66% kena TP1, +30.7R.",
-    "",
-    "<b>4. 📢 /post</b>: signal manual yang kau hantar sendiri.",
+    "<b>3. 📢 /post</b>: signal manual yang kau hantar sendiri.",
     "",
     "<b>🛠 Tools customer</b>",
     "• 🧭 Direction: trend setiap timeframe.",
@@ -402,6 +397,12 @@ async function cmdStrategy(chatId) {
   ].join(NL), { reply_markup: ADMIN_MENU });
   await send(chatId, [
     "<b>🧪 TRIAL (kau sahaja, belum ke customer)</b>",
+    "",
+    "<b>4. 🕘 9:59 AM setup</b> (baru, 27 Nov)",
+    "• 9:55 pagi: heads-up. 9:59 pagi: semak candle H1 9–10 pagi (Malaysia).",
+    "• Badan candle ≥ 0.3× purata range H1, dan harga sebelah trend (atas MA50 H1 = BUY, bawah = SELL).",
+    "• Entry terus. SL 150 pips, TP 150 / 300 / 450 pips, tutup selepas 12 jam.",
+    "• Backtest 17 bulan: 172 trade, TP1 56%, +31.3R. Cara video (candle 8–9 pagi) rugi −55R.",
     "",
     "<b>5. S&amp;D zone (Supply &amp; Demand)</b>",
     "• Zone = candle base kecil, lepas tu harga lari kuat (≥ 1.3× ATR dalam 1–3 candle). Zone mesti belum ditembus (close).",
@@ -1088,10 +1089,13 @@ async function newsRecovery() {
       status: "running", auto: true, time: Date.now(), closedAt: null } });
   }
 }
-/* ---------- 9:59 AM setup (Malaysia): follow the 9-10 AM candle when it agrees with the H1 trend ---------- */
-// About 2 years of hourly gold futures (4 pips spread): 132 trades, 66% reached TP1, +30.7R. Same rule at other hours did far worse.
-// Checked every minute by the "news" cron: 9:55 heads-up, 9:59 signal.
-const NINE = { body: 0.3, sl: 0.8, min: 3, max: 15, life: 6 };
+/* ---------- 9:59 AM setup (Malaysia): follow the 9-10 AM H1 candle when it is big enough and on the trend side of the H1 MA50 ---------- */
+// Rebuilt 27 Nov 2026 (the old rule never fired). MT5 gold, 3 pips spread, entry at 10:00, SL 150 pips, TP 1R/2R/3R, SL to entry after TP1, closed after 12 h:
+//   17 months (H1): 172 trades, TP1 56%, +31.3R (both halves positive) · last 6 months (M5): 61 trades, TP1 64%, +16.6R.
+//   Following the 8-9 AM candle at 9:00 (the TikTok "close candle jam 9" idea) lost: 391 trades, -55R.
+// Admin-only trial for now (trial: true). Checked every minute by the "news" cron: 9:55 heads-up, 9:59 signal.
+const NINE = { body: 0.3, ma: 50, sl: 150, life: 12 };
+const NINE_TP = [[1, 0, Infinity], [2, 0, Infinity], [3, 0, Infinity]];
 async function nineSetup(now = Date.now()) {
   const d = new Date(now), day = d.getUTCDay(), min = d.getUTCHours() * 60 + d.getUTCMinutes();
   if (day < 1 || day > 5) return;
@@ -1104,38 +1108,36 @@ async function nineSetup(now = Date.now()) {
   const [m1, h1] = [await candles("XAUUSD", "1min"), await candles("XAUUSD", "1h")];
   const hour = m1.filter((x) => x.t >= open && x.t < open + 3600000), past = h1.filter((x) => x.t + 3600000 <= open);
   if (hour.length < 30 || hour[0].t - open > 5 * 60000 || hour[hour.length - 1].t < open + (early ? 50 : 57) * 60000) return; // prices missing or late (cached up to 3 min): try again next minute
-  if (past.length < 60 || open - past[past.length - 1].t > 3 * 3600000) return;
-  const a = atr(past), trend1 = tfTrend(past) || 0, price = hour[hour.length - 1].c, move = price - hour[0].o;
-  if (!a) return;
-  const dir = trend1 && Math.sign(move) === trend1 && Math.abs(move) >= NINE.body * a ? trend1 : 0;
+  if (past.length < NINE.ma || open - past[past.length - 1].t > 3 * 3600000) return;
+  const rng = past.slice(-15).reduce((s, x) => s + x.h - x.l, 0) / 15, ma = past.slice(-NINE.ma).reduce((s, x) => s + x.c, 0) / NINE.ma;
+  const price = hour[hour.length - 1].c, move = price - hour[0].o, cdir = Math.sign(move), side = Math.sign(price - ma);
+  const big = Math.abs(move) >= NINE.body * rng, dir = cdir && big && side === cdir ? cdir : 0;
   await db.from("app_settings").upsert({ key: early ? "nine_early" : "nine_done", value: key });
-  const chats = await audience("Intraday");
+  const chats = await audience("Intraday", true); // admin only while on trial
+  const pipsOf = (v) => Math.round(Math.abs(v) / pip("XAUUSD"));
   if (early) {
-    if (!trend1) return;
     return broadcast(chats, [
-      "⏰ <b>9:59 AM SETUP · heads-up</b>",
+      "🧪 ⏰ <b>9:59 AM SETUP TEST · heads-up</b> (admin only)",
       "",
-      `H1 trend: ${biasTxt(trend1)}`,
-      `9-10 AM candle so far: ${biasTxt(Math.sign(move))} (${Math.round(Math.abs(move) / pip("XAUUSD"))} pips)`,
-      dir ? `Possible ${callTxt(dir)}` : "They don't line up yet, so there may be no setup today.",
-      "",
-      "Don't enter yet. The signal comes at 9:59 AM only if the candle agrees with the trend.",
+      `Trend H1 (MA50): ${biasTxt(side)}`,
+      `Candle 9-10 AM setakat ni: ${biasTxt(cdir)} (${pipsOf(move)} pips, perlu ≥ ${pipsOf(NINE.body * rng)})`,
+      dir ? `Kemungkinan ${callTxt(dir)} pukul 9:59` : "Belum selari, mungkin tiada setup hari ni.",
     ].join("\n"));
   }
   if (!dir) {
-    if (cfg.nine_early === key && trend1) await broadcast(chats, "⏰ <b>9:59 AM SETUP</b>\nNo setup today: the 9-10 AM candle doesn't agree with the H1 trend.");
-    return;
+    const why = !cdir ? "candle 9-10 AM tak bergerak" : !big ? `candle 9-10 AM terlalu kecil (${pipsOf(move)} pips)` : "candle 9-10 AM lawan trend H1";
+    return broadcast(chats, `🧪 ⏰ <b>9:59 AM SETUP TEST</b>\nTiada setup hari ni: ${why}.`);
   }
-  const dg = digits("XAUUSD"), risk = Math.min(NINE.max, Math.max(NINE.min, NINE.sl * a));
+  const dg = digits("XAUUSD"), risk = NINE.sl * pip("XAUUSD");
   const last = await livePrice("XAUUSD").catch(() => null);
   if (last === null || Math.abs(last - price) > MAX_SLIP * risk) {
     console.log("9:59 signal skipped, price moved or unavailable", price, last);
-    return broadcast(chats, "⏰ <b>9:59 AM SETUP</b>\nNo entry today: price has already moved too far from the setup.");
+    return broadcast(chats, "🧪 ⏰ <b>9:59 AM SETUP TEST</b>\nTiada entry hari ni: harga dah lari jauh dari setup.");
   }
   const entry = Number(last.toFixed(dg)), sl = Number((last - dir * risk).toFixed(dg));
   await db.from("signals").insert({ id: crypto.randomUUID(), data: {
-    kind: "Intraday", sym: "XAUUSD", dir, entry, sl, ...tpPlan("XAUUSD", dir, entry, sl, INTRADAY_TP), order: "instant", nine: true, life: NINE.life,
-    note: "🤖 MEEGO AI · 9:59 AM setup: the 9-10 AM candle and the H1 trend agree · closes after 6 hours",
+    kind: "Intraday", sym: "XAUUSD", dir, entry, sl, ...tpPlan("XAUUSD", dir, entry, sl, NINE_TP), order: "instant", nine: true, trial: true, life: NINE.life,
+    note: `🤖 MEEGO AI · 9:59 AM setup: candle 9-10 AM ${dir > 0 ? "bullish" : "bearish"} ${pipsOf(move)} pips, searah trend H1 (MA50) · tutup selepas ${NINE.life} jam`,
     status: "running", auto: true, time: Date.now(), closedAt: null } });
 }
 /* ---------- S&D setup for Scalping, Intraday and Swing (gold), the admin's rules ---------- */
@@ -1525,7 +1527,7 @@ async function showPlans(chatId, intro) {
     "",
     ...TIERS.map((t) => `${t === "Ultimate" ? "⭐" : "•"} <b>${t}</b> · RM${pr[t].rm} for ${pr[t].days} days`),
     "",
-    `All plans: ${off("Scalping") ? "" : "⚡ Scalping, "}${off("Intraday") ? "" : "📈 Intraday, "}📰 News signals, 🕘 9:59 AM setup, 🧭 Direction, 🖼 Chart Scanner, 📊 History.`,
+    `All plans: ${off("Scalping") ? "" : "⚡ Scalping, "}${off("Intraday") ? "" : "📈 Intraday, "}📰 News signals, 🧭 Direction, 🖼 Chart Scanner, 📊 History.`,
     ...(off("Swing") ? [] : ["⭐ <b>Priority Swing</b> signals are for <b>Ultimate</b> only."]),
     ...(TRIAL.length ? [`🧪 Auto ${trialText} signals are being re-tested, so they're not included right now.`] : []),
     "",
@@ -2185,7 +2187,7 @@ async function onDbEvent(ev) {
     const chats = await audience(s.kind, !!s.trial);
     if (ev.op === "INSERT" && s.status === "running") {
       const sig = { id: ev.record.id, ...s };
-      const title = s.kind === "SOP" ? `🧪 PR SOP ${s.wait ? "· WAIT (EA waits)" : "· ENTRY NOW"}` : s.test ? "🧪 EA TEST (not a real setup)" : s.setup === "SNR" ? `🧪 SNR BREAKOUT ${s.kind.toUpperCase()} TEST (admin only)` : s.trial ? `🧪 ${s.kind.toUpperCase()} TEST (admin only)` : s.nine ? "🕘 9:59 AM SETUP" : s.news === "pre" ? "📰 NEWS SIGNAL" : s.news === "recovery" ? "🔁 RECOVERY SETUP (after news spike)" : kindOf(s.kind).fresh;
+      const title = s.kind === "SOP" ? `🧪 PR SOP ${s.wait ? "· WAIT (EA waits)" : "· ENTRY NOW"}` : s.test ? "🧪 EA TEST (not a real setup)" : s.setup === "SNR" ? `🧪 SNR BREAKOUT ${s.kind.toUpperCase()} TEST (admin only)` : s.nine && s.trial ? "🧪 9:59 AM SETUP TEST (admin only)" : s.trial ? `🧪 ${s.kind.toUpperCase()} TEST (admin only)` : s.nine ? "🕘 9:59 AM SETUP" : s.news === "pre" ? "📰 NEWS SIGNAL" : s.news === "recovery" ? "🔁 RECOVERY SETUP (after news spike)" : kindOf(s.kind).fresh;
       for (const c of chats) { await sendLive(c, sig, title); await new Promise((r) => setTimeout(r, 60)); }
       await sendChart(chats, sig).catch((e) => console.error("signal chart failed", e));
       return;
