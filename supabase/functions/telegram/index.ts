@@ -1276,7 +1276,7 @@ async function snrScan(sym, G, all, kind) {
   // the broken level (now support for a BUY, resistance for a SELL) and the other levels, for the chart and the EA
   const lvls = snrLevels(G(k.lt), { ...SNRB, ...k }).levels.map((l) => [Number(l.v.toFixed(d)), l.n]);
   const s = { dir: b.dir, entry: b.entry, sl: b.sl, zkey: b.key, zone: [Number(lo.toFixed(2)), Number(hi.toFixed(2))], order: "instant", setup: "SNR", life: k.life, level: Number(b.lv.v.toFixed(d)), levels: lvls,
-    note: `🤖 MEEGO AI · SNR breakout + retest · ${TFN(k.lt)} ${b.dir > 0 ? "resistance" : "support"} ${b.lv.v.toFixed(2)} (${b.lv.n} touches) broken on ${TFN(k.bt)} → ${b.dir > 0 ? "RBS (resistance became support)" : "SBR (support became resistance)"}, retested and holding` };
+    note: `🤖 MEEGO AI · SNR breakout + retest · ${TFN(k.lt)} ${b.dir > 0 ? "resistance" : "support"} ${b.lv.v.toFixed(2)} (${b.lv.n} touches) broken on ${TFN(k.bt)}, price came back to retest it and holds → ${b.dir > 0 ? "RBS" : "SBR"}` };
   if (!(await reprice(s, sym))) return;
   const rp = Math.abs(s.entry - s.sl) / pip(sym);
   if (rp < k.min || rp > k.max) return;
@@ -1990,7 +1990,7 @@ function chartSvg(o) {
       s += `<line x1="${L}" x2="${W - R}" y1="${y(v)}" y2="${y(v)}" stroke="${col}" stroke-width="1.2" stroke-opacity="0.8" stroke-dasharray="10 5"/>`;
       zl += `<text x="${L + 4}" y="${y(v) - 4}" font-size="11" fill="${col}">${v > entry ? "RESISTANCE" : "SUPPORT"} ${f(v)} (${nT}x)</text>`;
     }
-    const col = dir > 0 ? BLUE : RED, kt = `${dir > 0 ? "RBS" : "SBR"} ${f(snr.key)} · ${dir > 0 ? "resistance became support" : "support became resistance"}`, tw = kt.length * 7.6;
+    const col = dir > 0 ? BLUE : RED, kt = `${dir > 0 ? "RBS" : "SBR"} ${f(snr.key)} · ${dir > 0 ? "resistance broken, back to retest it" : "support broken, back to retest it"}`, tw = kt.length * 7.6;
     s += `<line x1="${L}" x2="${W - R}" y1="${y(snr.key)}" y2="${y(snr.key)}" stroke="${col}" stroke-width="3"/>`;
     const ty = dir > 0 ? y(snr.key) + 18 : y(snr.key) - 8;
     zl += `<rect x="${L + 1}" y="${ty - 13}" width="${tw + 6}" height="18" rx="3" fill="${C.bg}" fill-opacity="0.85"/><text x="${L + 4}" y="${ty}" font-size="13" font-weight="bold" fill="${col}">${kt}</text>`;
