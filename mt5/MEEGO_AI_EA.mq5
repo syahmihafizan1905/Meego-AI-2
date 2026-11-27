@@ -4,7 +4,7 @@
 //|  Get your key by sending /ea to the bot.                          |
 //+------------------------------------------------------------------+
 #property copyright "MEEGO AI"
-#property version   "1.32"
+#property version   "1.33"
 #property description "Copies MEEGO AI gold signals into MT5: draws the zone, enters while price is in it, TP1/TP2/TP3,"
 #property description "locks profit (+50 pips: SL +20, +100 pips: closes half, SL +50), removes a zone once it is no longer valid."
 #property description "Tools > Options > Expert Advisors > Allow WebRequest for the MEEGO URL first."
@@ -602,9 +602,16 @@ void DrawMap()
          bool   res = (bid > 0 && g_ml[i].v > bid);
          color  c = res ? clrRed : clrDodgerBlue;
          string nm = "MEEGO_M_L" + IntegerToString(i), t = "SNR " + TfName(g_ml[i].tf) + (res ? " resistance " : " support ") + DoubleToString(g_ml[i].v, 2) + " (" + IntegerToString(g_ml[i].n) + "x)";
-         datetime t1 = (datetime)(g_ml[i].t / 1000 + off);
-         DrawRay(nm, t1, g_ml[i].v, c, g_ml[i].tf >= 240 ? 2 : 1, g_ml[i].tf >= 60 ? STYLE_DASH : STYLE_DOT, t);
-         DrawLabel("MEEGO_M_N" + IntegerToString(i), t1, g_ml[i].v, c, TfName(g_ml[i].tf) + " " + (res ? "R " : "S ") + DoubleToString(g_ml[i].v, 2), !res);
+         // a full-width horizontal line: its price shows on the price scale, the hover text says what it is
+         ObjectCreate(0, nm, OBJ_HLINE, 0, 0, g_ml[i].v);
+         ObjectSetInteger(0, nm, OBJPROP_COLOR, c);
+         ObjectSetInteger(0, nm, OBJPROP_STYLE, STYLE_DASH);
+         ObjectSetInteger(0, nm, OBJPROP_WIDTH, g_ml[i].tf >= 60 ? 2 : 1);
+         ObjectSetInteger(0, nm, OBJPROP_BACK, true);
+         ObjectSetInteger(0, nm, OBJPROP_SELECTABLE, false);
+         ObjectSetInteger(0, nm, OBJPROP_HIDDEN, true);
+         ObjectSetString(0, nm, OBJPROP_TEXT, TfName(g_ml[i].tf) + (res ? " R" : " S"));
+         ObjectSetString(0, nm, OBJPROP_TOOLTIP, t);
         }
    ChartRedraw();
   }
@@ -809,6 +816,6 @@ void OnTimer()
       if(g_sigs[i].status == "running" && !GlobalVariableCheck(GvDone(g_sigs[i].id8))) { waiting++; if(g_sigs[i].ready == 0) sopWait++; }
    g_status = "connected - " + IntegerToString(ArraySize(g_sigs)) + " signals in feed - " + IntegerToString(waiting) + " waiting for entry" + (sopWait > 0 ? " (" + IntegerToString(sopWait) + " PR SOP: dashboard not ready)" : "") + " - " + IntegerToString(OpenSignalCount()) + " open - checked " + TimeToString(TimeLocal(), TIME_MINUTES | TIME_SECONDS);
    string lotTxt = InpFixedLot > 0 ? IntegerToString(InpLayers) + " x " + DoubleToString(InpFixedLot, 2) + " lot" : "risk " + DoubleToString(InpRiskPct, 2) + "%";
-   Comment("MEEGO AI EA 1.32 (" + g_sym + ", " + lotTxt + (TerminalInfoInteger(TERMINAL_TRADE_ALLOWED) && MQLInfoInteger(MQL_TRADE_ALLOWED) ? "" : ", ALGO TRADING IS OFF") + "): " + g_status);
+   Comment("MEEGO AI EA 1.33 (" + g_sym + ", " + lotTxt + (TerminalInfoInteger(TERMINAL_TRADE_ALLOWED) && MQLInfoInteger(MQL_TRADE_ALLOWED) ? "" : ", ALGO TRADING IS OFF") + "): " + g_status);
   }
 //+------------------------------------------------------------------+
