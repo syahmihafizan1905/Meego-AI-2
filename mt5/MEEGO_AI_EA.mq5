@@ -504,6 +504,22 @@ void DrawRay(string name, datetime t1, double price, color c, int width, ENUM_LI
    ObjectMove(0, name, 0, t1, price);
    ObjectMove(0, name, 1, t1 + 60, price);
   }
+// Text on the chart, above (support) or below (resistance) the line, at the signal
+void DrawLabel(string name, datetime t, double price, color c, string text, bool above)
+  {
+   if(ObjectFind(0, name) < 0)
+     {
+      ObjectCreate(0, name, OBJ_TEXT, 0, t, price);
+      ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+      ObjectSetInteger(0, name, OBJPROP_HIDDEN, true);
+      ObjectSetInteger(0, name, OBJPROP_FONTSIZE, 9);
+      ObjectSetString(0, name, OBJPROP_FONT, "Arial Bold");
+     }
+   ObjectSetInteger(0, name, OBJPROP_ANCHOR, above ? ANCHOR_LEFT_LOWER : ANCHOR_LEFT_UPPER);
+   ObjectSetInteger(0, name, OBJPROP_COLOR, c);
+   ObjectSetString(0, name, OBJPROP_TEXT, text);
+   ObjectMove(0, name, 0, t, price);
+  }
 // The zone box (SNR: the level line, blue = support, red = resistance) and the entry line stay while the zone is valid and the signal is running or its trade is open
 void DrawZones()
   {
@@ -519,8 +535,10 @@ void DrawZones()
          if(g_sigs[i].setup == "SNR" && g_sigs[i].level > 0)
            {
             bool sup = g_sigs[i].dir > 0;   // a broken resistance is support now (BUY), a broken support is resistance (SELL)
+            string nm = (sup ? "RBS " : "SBR ") + DoubleToString(g_sigs[i].level, 2);   // resistance became support / support became resistance
             DrawRay("MEEGO_ZL_" + g_sigs[i].id8, t1, g_sigs[i].level, sup ? clrDodgerBlue : clrRed, 3, STYLE_SOLID,
-                    "MEEGO SNR " + g_sigs[i].kind + (sup ? " support " : " resistance ") + DoubleToString(g_sigs[i].level, 2) + (sup ? " (broken resistance)" : " (broken support)"));
+                    "MEEGO SNR " + g_sigs[i].kind + " " + nm + (sup ? " (resistance became support)" : " (support became resistance)"));
+            DrawLabel("MEEGO_ZN_" + g_sigs[i].id8, t1, g_sigs[i].level, sup ? clrDodgerBlue : clrRed, nm, sup);
            }
          else
             DrawBox("MEEGO_ZR_" + g_sigs[i].id8, t1, g_sigs[i].zLo, g_sigs[i].zHi, c, t);
