@@ -259,6 +259,7 @@ async function cmdSignal(chatId, a, kind) {
     signalsOf(kind).then((l) => l.filter((s) => s.status === "running" && canSeeSignal(a, s)).sort((x, y) => y.time - x.time)),
     scanAnimation(chatId, kind),
   ]);
+  if (!list.length && a.admin && /^(Scalping|Intraday|Swing)$/.test(kind)) return sendMap(chatId, kind); // no setup yet: the zones the bot is waiting at
   if (!list.length) return send(chatId, TRIAL.includes(kind) && !a.admin ? `No ${kind.toLowerCase()} signal right now. Auto ${kind.toLowerCase()} signals are paused while we re-test the setup.${kind === "Scalping" ? " News signals still come here." : kind === "Intraday" ? " The 9:59 AM setup still comes here." : ""}` : kindOf(kind).none);
   const prices = {};
   for (const s of list.slice(0, 3)) await sendLive(chatId, s, kindOf(kind).title, await priceOf(s.sym, prices));
@@ -2274,6 +2275,79 @@ async function sendChart(chats, s) {
     }
     await new Promise((r) => setTimeout(r, 60));
   }
+}
+
+/* ---------- zone map picture: no setup yet -> the zones and SNR lines of that kind (admin only for now) ---------- */
+// Same map the EA draws (app_settings map_XAUUSD, saved every scan). Per kind: Scalping M15 zones + M15 lines, Intraday M15/H1 zones + M15/H1 lines,
+// Swing H1/H4 zones + H4/D1 lines. Chart: M15 (Swing H1), last 70 candles plus room on the right.
+const MAPK = { Scalping: { z: [15], l: [15], tf: "15min", m: 15 }, Intraday: { z: [15, 60], l: [15, 60], tf: "15min", m: 15 }, Swing: { z: [60, 240], l: [240, 1440], tf: "1h", m: 60 } };
+const MTF = (m) => (m >= 1440 ? "D1" : m >= 60 ? "H" + m / 60 : "M" + m);
+function mapChartSvg(candles, zones, levels, price, title, sub) {
+  const W = 1000, H = 600, L = 14, R = 112, T = 62, B = 46, n = candles.length, slots = n + 22;
+  const C = { bg: "#0f1115", grid: "#20242c", text: "#c9ced8", mut: "#7c8492", up: "#26a69a", dn: "#ef5350", red: "#ef5350", blue: "#2196f3" };
+  const vals = candles.flatMap((x) => [x.h, x.l]).concat([price]);
+  let hi = Math.max(...vals), lo = Math.min(...vals);
+  const span = hi - lo; hi += span * 0.35; lo -= span * 0.35; // room for nearby zones and lines
+  const inView = (a, b) => b >= lo && a <= hi;
+  const pw = W - L - R, ph = H - T - B, step = pw / slots, y = (v) => T + ((hi - v) / (hi - lo)) * ph, x = (i) => L + i * step + step / 2;
+  const f = (v) => Number(v).toFixed(2), esc2 = (s) => String(s).replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" })[c]);
+  const my = (t) => new Date(t + 8 * 3600000), hm = (t) => my(t).toISOString().slice(11, 16), dm = (t) => my(t).toISOString().slice(5, 10).split("-").reverse().join("/");
+  let s = `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" font-family="DejaVu Sans"><rect width="${W}" height="${H}" fill="${C.bg}"/>`, top = "";
+  const raw = (hi - lo) / 6, mag = Math.pow(10, Math.floor(Math.log10(raw))), gs = [1, 2, 5, 10].map((k) => k * mag).find((k) => k >= raw);
+  for (let v = Math.ceil(lo / gs) * gs; v <= hi; v += gs) s += `<line x1="${L}" x2="${W - R}" y1="${y(v)}" y2="${y(v)}" stroke="${C.grid}"/><text x="${W - R + 8}" y="${y(v) + 4}" font-size="12" fill="${C.mut}">${f(v)}</text>`;
+  const every = Math.max(1, Math.round(n / 6));
+  for (let i = 0; i < n; i += every) s += `<text x="${x(i)}" y="${H - B + 18}" font-size="12" fill="${C.mut}" text-anchor="middle">${hm(candles[i].t)}</text><text x="${x(i)}" y="${H - B + 33}" font-size="11" fill="${C.mut}" text-anchor="middle">${dm(candles[i].t)}</text>`;
+  for (const z of zones.filter((z) => inView(z.lo, z.hi))) {
+    let i0 = candles.findIndex((c) => c.t >= z.t); if (i0 < 0) i0 = n - 1; if (z.t < candles[0].t) i0 = 0;
+    const col = z.dir > 0 ? C.up : C.dn, zx = x(i0) - step / 2, zy = y(Math.min(hi, z.hi)), zh = Math.max(3, y(Math.max(lo, z.lo)) - zy);
+    s += `<rect x="${zx}" y="${zy}" width="${W - R - zx}" height="${zh}" fill="${col}" fill-opacity="0.18" stroke="${col}" stroke-opacity="0.6"/>`;
+    top += `<text x="${W - R - 6}" y="${z.dir > 0 ? zy + zh - 5 : zy + 14}" font-size="12" font-weight="bold" fill="${col}" text-anchor="end">${MTF(z.tf)} ${z.dir > 0 ? "DEMAND" : "SUPPLY"} ${f(z.lo)}-${f(z.hi)}</text>`;
+  }
+  const w = Math.max(1.5, step * 0.66);
+  for (let i = 0; i < n; i++) { const c = candles[i], col = c.c >= c.o ? C.up : C.dn; s += `<line x1="${x(i)}" x2="${x(i)}" y1="${y(c.h)}" y2="${y(c.l)}" stroke="${col}"/><rect x="${x(i) - w / 2}" y="${Math.min(y(c.o), y(c.c))}" width="${w}" height="${Math.max(1, Math.abs(y(c.o) - y(c.c)))}" fill="${col}"/>`; }
+  for (const l of levels.filter((l) => l.v >= lo && l.v <= hi)) {
+    const col = l.v > price ? C.red : C.blue, wd = l.tf >= 240 ? 2.2 : 1.4, dash = l.tf >= 60 ? "10 5" : "3 4";
+    s += `<line x1="${L}" x2="${W - R}" y1="${y(l.v)}" y2="${y(l.v)}" stroke="${col}" stroke-width="${wd}" stroke-dasharray="${dash}"/>`;
+    top += `<text x="${L + 4}" y="${y(l.v) - 4}" font-size="11" fill="${col}">${MTF(l.tf)} ${l.v > price ? "R" : "S"} ${f(l.v)} (${l.n}x)</text>`;
+  }
+  s += `<line x1="${L}" x2="${W - R}" y1="${y(price)}" y2="${y(price)}" stroke="#e6e8ee" stroke-width="1" stroke-opacity="0.6"/><rect x="${W - R + 2}" y="${y(price) - 10}" width="${R - 4}" height="20" rx="3" fill="#e6e8ee"/><text x="${W - R + 7}" y="${y(price) + 5}" font-size="12" font-weight="bold" fill="${C.bg}">NOW ${f(price)}</text>`;
+  s += top + `<text x="${L}" y="26" font-size="20" font-weight="bold" fill="#f5c542">${esc2(title)}</text><text x="${L}" y="48" font-size="13" fill="${C.text}">${esc2(sub)}</text><text x="${W - R}" y="26" font-size="13" fill="${C.mut}" text-anchor="end">MEEGO AI</text></svg>`;
+  return s;
+}
+async function sendMap(chatId, kind) {
+  const k = MAPK[kind], NL = String.fromCharCode(10);
+  let mp = null;
+  try { mp = JSON.parse((await settings())["map_XAUUSD"] || "null"); } catch { mp = null; }
+  if (!mp || Date.now() - mp.t > 30 * 60000) return send(chatId, `No ${kind.toLowerCase()} setup right now, and the zone map isn't ready (market closed or no fresh prices).`, { reply_markup: ADMIN_MENU });
+  const zones = mp.zones.filter((z) => k.z.includes(z[0])).map(([tf, dir, lo, hi, t]) => ({ tf, dir, lo, hi, t }));
+  const levels = mp.levels.filter((l) => k.l.includes(l[0])).map(([tf, v, n, t]) => ({ tf, v, n, t }));
+  const price = (await livePrice("XAUUSD").catch(() => null)) ?? mp.price, p = pip("XAUUSD"), d = (v) => Math.round(Math.abs(v - price) / p);
+  const dz = zones.filter((z) => z.dir > 0).sort((a, b) => b.hi - a.hi), sz = zones.filter((z) => z.dir < 0).sort((a, b) => a.lo - b.lo);
+  const up = levels.filter((l) => l.v > price).sort((a, b) => a.v - b.v).slice(0, 4), dn = levels.filter((l) => l.v < price).sort((a, b) => b.v - a.v).slice(0, 4);
+  const text = [
+    `🗺 <b>${kind.toUpperCase()} · ZONE MAP</b> (admin only)`,
+    `Belum ada setup ${kind.toLowerCase()}. Ni zone dan line yang bot tengah tunggu · XAUUSD <code>${px(price, "XAUUSD")}</code>`,
+    "",
+    "🟥 <b>Supply</b> (cari SELL bila harga naik ke sini)",
+    ...(sz.length ? sz.map((z) => `• ${MTF(z.tf)} <code>${px(z.lo, "XAUUSD")} – ${px(z.hi, "XAUUSD")}</code> · ${d(z.lo)} pips lagi`) : ["• tiada dekat"]),
+    "🟩 <b>Demand</b> (cari BUY bila harga turun ke sini)",
+    ...(dz.length ? dz.map((z) => `• ${MTF(z.tf)} <code>${px(z.lo, "XAUUSD")} – ${px(z.hi, "XAUUSD")}</code> · ${d(z.hi)} pips lagi`) : ["• tiada dekat"]),
+    "",
+    "🔴 <b>Resistance</b>: " + (up.length ? up.map((l) => `${MTF(l.tf)} <code>${px(l.v, "XAUUSD")}</code>`).join(" · ") : "tiada dekat"),
+    "🔵 <b>Support</b>: " + (dn.length ? dn.map((l) => `${MTF(l.tf)} <code>${px(l.v, "XAUUSD")}</code>`).join(" · ") : "tiada dekat"),
+    "",
+    "EA 1.32 tanda zone dan line ni dalam MT5. Signal keluar sendiri bila harga sampai dan setup lengkap.",
+  ].join(NL);
+  await send(chatId, text, { reply_markup: ADMIN_MENU });
+  const list = (await candles("XAUUSD", k.tf)).slice(-70);
+  if (list.length < 20) return;
+  const svg = mapChartSvg(list, zones, levels, price, `${kind.toUpperCase()} ZONE MAP XAUUSD`, `${MTF(k.m)} · zones ${k.z.map(MTF).join("/")} · SNR ${k.l.map(MTF).join("/")} · waiting for a setup`);
+  const fontBuffers = await resvgFonts();
+  const png = new Resvg(svg, { font: { fontBuffers, defaultFontFamily: "DejaVu Sans", loadSystemFonts: false }, fitTo: { mode: "width", value: 1000 } }).render().asPng();
+  const fd = new FormData();
+  fd.append("chat_id", String(chatId)); fd.append("caption", `🗺 ${kind} zone map`);
+  fd.append("photo", new Blob([png], { type: "image/png" }), "map.png");
+  await fetch(`https://api.telegram.org/bot${TOKEN}/sendPhoto`, { method: "POST", body: fd }).catch(() => null);
 }
 
 /* ---------- broadcasts (new signal, Hit TP/SL, daily reminders) ---------- */
