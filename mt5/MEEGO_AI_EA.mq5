@@ -57,6 +57,7 @@ struct Sig
    int    ready;           // 0 = the bot says wait (PR SOP dashboard not lined up yet)
    string setup;           // "SNR" = breakout + retest of a level, "" = supply / demand zone
    double level;           // SNR: the broken level
+   long   bt, lvFrom;      // SNR: breakout time and first touch of the level (ms UTC, 0 = unknown)
   };
 Sig      g_sigs[];
 datetime g_fetched = 0;   // last time the feed was read (local clock)
@@ -146,6 +147,8 @@ bool ParseSig(string line, Sig &s)
    s.ready   = nf > 22 ? (int)StringToInteger(f[22]) : 1;
    s.setup   = nf > 23 ? f[23] : "";
    s.level   = nf > 24 ? StringToDouble(f[24]) : 0;
+   s.bt      = nf > 25 ? StringToInteger(f[25]) : 0;
+   s.lvFrom  = nf > 26 ? StringToInteger(f[26]) : 0;
    if(s.zHi < s.zLo) { double z = s.zLo; s.zLo = s.zHi; s.zHi = z; }
    return(s.dir != 0 && s.entry > 0 && s.sl > 0 && s.tp1 > 0);
   }
@@ -487,12 +490,14 @@ void DrawBox(string name, datetime t1, double lo, double hi, color c, string tex
    ObjectMove(0, name, 1, t2, lo);
   }
 // Horizontal line from the signal to the right edge
-void DrawRay(string name, datetime t1, double price, color c, int width, ENUM_LINE_STYLE style, string text)
+void DrawRay(string name, datetime t1, double price, color c, int width, ENUM_LINE_STYLE style, string text, datetime t2 = 0)
   {
+   bool ray = (t2 == 0);
+   if(ray) t2 = t1 + 60;
    if(ObjectFind(0, name) < 0)
      {
-      ObjectCreate(0, name, OBJ_TREND, 0, t1, price, t1 + 60, price);
-      ObjectSetInteger(0, name, OBJPROP_RAY_RIGHT, true);
+      ObjectCreate(0, name, OBJ_TREND, 0, t1, price, t2, price);
+      ObjectSetInteger(0, name, OBJPROP_RAY_RIGHT, ray);
       ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
       ObjectSetInteger(0, name, OBJPROP_HIDDEN, true);
      }
@@ -502,7 +507,7 @@ void DrawRay(string name, datetime t1, double price, color c, int width, ENUM_LI
    ObjectSetString(0, name, OBJPROP_TEXT, text);
    ObjectSetString(0, name, OBJPROP_TOOLTIP, text);
    ObjectMove(0, name, 0, t1, price);
-   ObjectMove(0, name, 1, t1 + 60, price);
+   ObjectMove(0, name, 1, t2, price);
   }
 // Text on the chart, above (support) or below (resistance) the line, at the signal
 void DrawLabel(string name, datetime t, double price, color c, string text, bool above)
@@ -536,9 +541,17 @@ void DrawZones()
            {
             bool sup = g_sigs[i].dir > 0;   // a broken resistance is support now (BUY), a broken support is resistance (SELL)
             string nm = (sup ? "RBS " : "SBR ") + DoubleToString(g_sigs[i].level, 2);   // resistance became support / support became resistance
-            DrawRay("MEEGO_ZL_" + g_sigs[i].id8, t1, g_sigs[i].level, sup ? clrDodgerBlue : clrRed, 3, STYLE_SOLID,
-                    "MEEGO SNR " + g_sigs[i].kind + " " + nm + (sup ? " (resistance became support)" : " (support became resistance)"));
-            DrawLabel("MEEGO_ZN_" + g_sigs[i].id8, t1, g_sigs[i].level, sup ? clrDodgerBlue : clrRed, nm, sup);
+            // old role (resistance for RBS) from the first touch to the breakout, new role from the breakout on
+            datetime tb = g_sigs[i].bt > 0 ? (datetime)(g_sigs[i].bt / 1000 + off) : t1;
+            if(g_sigs[i].bt > 0 && g_sigs[i].lvFrom > 0 && g_sigs[i].lvFrom < g_sigs[i].bt)
+              {
+               DrawRay("MEEGO_ZO_" + g_sigs[i].id8, (datetime)(g_sigs[i].lvFrom / 1000 + off), g_sigs[i].level, sup ? clrRed : clrDodgerBlue, 3, STYLE_SOLID,
+                       "MEEGO SNR " + (sup ? "resistance " : "support ") + DoubleToString(g_sigs[i].level, 2) + " before the breakout", tb);
+               DrawLabel("MEEGO_ZP_" + g_sigs[i].id8, (datetime)(g_sigs[i].lvFrom / 1000 + off), g_sigs[i].level, sup ? clrRed : clrDodgerBlue, sup ? "RESISTANCE" : "SUPPORT", !sup);
+              }
+            DrawRay("MEEGO_ZL_" + g_sigs[i].id8, tb, g_sigs[i].level, sup ? clrDodgerBlue : clrRed, 3, STYLE_SOLID,
+                    "MEEGO SNR " + g_sigs[i].kind + " " + nm + (sup ? " (resistance broken, back to retest it)" : " (support broken, back to retest it)"));
+            DrawLabel("MEEGO_ZN_" + g_sigs[i].id8, tb, g_sigs[i].level, sup ? clrDodgerBlue : clrRed, nm + (sup ? " SUPPORT" : " RESISTANCE"), sup);
            }
          else
             DrawBox("MEEGO_ZR_" + g_sigs[i].id8, t1, g_sigs[i].zLo, g_sigs[i].zHi, c, t);

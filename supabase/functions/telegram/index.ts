@@ -1226,7 +1226,7 @@ function snrLevels(H, P = SNRB) {
   for (let i = 0; i < pts.length; ) {
     let j = i;
     while (j + 1 < pts.length && pts[j + 1].v - pts[i].v <= P.tol * a) j++;
-    if (j - i + 1 >= P.touches) { const g = pts.slice(i, j + 1); out.push({ v: g.reduce((s, q) => s + q.v, 0) / g.length, n: g.length, last: Math.max(...g.map((q) => q.t)) }); }
+    if (j - i + 1 >= P.touches) { const g = pts.slice(i, j + 1); out.push({ v: g.reduce((s, q) => s + q.v, 0) / g.length, n: g.length, last: Math.max(...g.map((q) => q.t)), first: Math.min(...g.map((q) => q.t)) }); }
     i = j + 1;
   }
   return { levels: out, a };
@@ -1259,7 +1259,7 @@ function snrBreak(H, M, used, k) {
       const ext = dir > 0 ? Math.min(...after.slice(r).map((x) => x.l)) : Math.max(...after.slice(r).map((x) => x.h));
       const sl = (dir > 0 ? Math.min(ext, lv.v) : Math.max(ext, lv.v)) - dir * P.buf * a, risk = Math.abs(L.c - sl), rp = risk / pip("XAUUSD");
       if (rp < P.min || rp > P.max) continue;
-      if (!best || lv.n > best.lv.n) best = { dir, key, entry: L.c, sl, lv, a, bt: M[b].t };
+      if (!best || lv.n > best.lv.n) best = { dir, key, entry: L.c, sl, lv, a, bt: M[b].t, rt: after[r].t };
     }
   }
   return best;
@@ -1275,7 +1275,7 @@ async function snrScan(sym, G, all, kind) {
   const lo = b.lv.v - SNRB.near * b.a, hi = b.lv.v + SNRB.near * b.a, d = digits(sym);
   // the broken level (now support for a BUY, resistance for a SELL) and the other levels, for the chart and the EA
   const lvls = snrLevels(G(k.lt), { ...SNRB, ...k }).levels.map((l) => [Number(l.v.toFixed(d)), l.n]);
-  const s = { dir: b.dir, entry: b.entry, sl: b.sl, zkey: b.key, zone: [Number(lo.toFixed(2)), Number(hi.toFixed(2))], order: "instant", setup: "SNR", life: k.life, level: Number(b.lv.v.toFixed(d)), levels: lvls,
+  const s = { dir: b.dir, entry: b.entry, sl: b.sl, zkey: b.key, zone: [Number(lo.toFixed(2)), Number(hi.toFixed(2))], order: "instant", setup: "SNR", life: k.life, level: Number(b.lv.v.toFixed(d)), levels: lvls, lvFrom: b.lv.first, bt: b.bt, rt: b.rt,
     note: `🤖 MEEGO AI · SNR breakout + retest · ${TFN(k.lt)} ${b.dir > 0 ? "resistance" : "support"} ${b.lv.v.toFixed(2)} (${b.lv.n} touches) broken on ${TFN(k.bt)}, price came back to retest it and holds → ${b.dir > 0 ? "RBS" : "SBR"}` };
   if (!(await reprice(s, sym))) return;
   const rp = Math.abs(s.entry - s.sl) / pip(sym);
@@ -1631,7 +1631,7 @@ async function eaFeed(key) {
   const n = (v) => (Number.isFinite(Number(v)) ? String(Number(v)) : "0");
   const rows = (data ?? []).map((r) => ({ id: r.id, ...r.data })).filter((x) => x && x.sym && (x.status === "running" || (x.closedAt || x.time) >= since) && canSeeSignal(a, x));
   const lines = rows.map((x) => ["S", x.id, x.kind, x.news || "", x.sym, x.dir, x.order || "instant", x.status, x.pending ? 1 : 0, n(x.entry), n(x.sl0 ?? x.sl),
-    ...(x.tps ? x.tps.map(n) : [n(x.tp), "0", "0"]), x.tpHit || 0, n(x.sl), Math.round(x.time || 0), x.expire ?? LIMIT.expire, Math.round(x.filled || 0), n(x.zone?.[0]), n(x.zone?.[1]), n(x.life ?? AUTO[x.kind]?.life), x.wait ? 0 : 1, x.setup || "", n(x.level ?? (x.setup === "SNR" && x.zone ? (x.zone[0] + x.zone[1]) / 2 : 0))].join("|"));
+    ...(x.tps ? x.tps.map(n) : [n(x.tp), "0", "0"]), x.tpHit || 0, n(x.sl), Math.round(x.time || 0), x.expire ?? LIMIT.expire, Math.round(x.filled || 0), n(x.zone?.[0]), n(x.zone?.[1]), n(x.life ?? AUTO[x.kind]?.life), x.wait ? 0 : 1, x.setup || "", n(x.level ?? (x.setup === "SNR" && x.zone ? (x.zone[0] + x.zone[1]) / 2 : 0)), Math.round(x.bt || 0), Math.round(x.lvFrom || 0)].join("|"));
   return txt([`OK|${Date.now()}|${a.admin ? "ADMIN" : a.tier}`, ...lines].join("\n"));
 }
 async function sendFile(chatId, name, content, caption) {
@@ -1959,7 +1959,8 @@ function chartSvg(o) {
   const vals = candles.flatMap((x) => [x.h, x.l]).concat([entry, sl], tps.length ? [tps[0]] : [], zone || []);
   let hi = Math.max(...vals), lo = Math.min(...vals); const pad = (hi - lo) * 0.06 || 1; hi += pad; lo -= pad;
   const RB = ribbon ? 14 : 0;
-  const pw = W - L - R, ph = H - T - B - RB, step = pw / Math.max(n, 1), y = (v) => T + ((hi - v) / (hi - lo)) * ph, x = (i) => L + i * step + step / 2;
+  // SNR: 16 empty slots on the right for the level's new role
+  const pw = W - L - R, ph = H - T - B - RB, step = pw / Math.max(n + (snr ? 16 : 0), 1), y = (v) => T + ((hi - v) / (hi - lo)) * ph, x = (i) => L + i * step + step / 2;
   const f = (v) => Number(v).toFixed(digits), esc = (s) => String(s).replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" })[c]);
   const my = (t) => new Date(t + 8 * 3600000), hm = (t) => my(t).toISOString().slice(11, 16), dm = (t) => my(t).toISOString().slice(5, 10).split("-").reverse().join("/");
   let s = `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" font-family="DejaVu Sans"><rect width="${W}" height="${H}" fill="${C.bg}"/>`;
@@ -1990,10 +1991,28 @@ function chartSvg(o) {
       s += `<line x1="${L}" x2="${W - R}" y1="${y(v)}" y2="${y(v)}" stroke="${col}" stroke-width="1.2" stroke-opacity="0.8" stroke-dasharray="10 5"/>`;
       zl += `<text x="${L + 4}" y="${y(v) - 4}" font-size="11" fill="${col}">${v > entry ? "RESISTANCE" : "SUPPORT"} ${f(v)} (${nT}x)</text>`;
     }
-    const col = dir > 0 ? BLUE : RED, kt = `${dir > 0 ? "RBS" : "SBR"} ${f(snr.key)} · ${dir > 0 ? "resistance broken, back to retest it" : "support broken, back to retest it"}`, tw = kt.length * 7.6;
-    s += `<line x1="${L}" x2="${W - R}" y1="${y(snr.key)}" y2="${y(snr.key)}" stroke="${col}" stroke-width="3"/>`;
-    const ty = dir > 0 ? y(snr.key) + 18 : y(snr.key) - 8;
-    zl += `<rect x="${L + 1}" y="${ty - 13}" width="${tw + 6}" height="18" rx="3" fill="${C.bg}" fill-opacity="0.85"/><text x="${L + 4}" y="${ty}" font-size="13" font-weight="bold" fill="${col}">${kt}</text>`;
+    // the broken level as a band: its old role (resistance for RBS) from the first touch to the breakout, its new role after it
+    const nm = dir > 0 ? "RBS" : "SBR", oldC = dir > 0 ? RED : BLUE, newC = dir > 0 ? BLUE : RED, oldN = dir > 0 ? "RESISTANCE" : "SUPPORT", newN = dir > 0 ? "SUPPORT" : "RESISTANCE";
+    const band = Array.isArray(snr.zone) ? snr.zone : [snr.key, snr.key], by = Math.min(y(Math.max(...band)), y(snr.key) - 3), bh = Math.max(6, y(Math.min(...band)) - by);
+    const at = (t) => (t ? candles.findLastIndex((c) => c.t <= t) : -1), bi = at(snr.bt), ri = at(snr.rt);
+    const fi = snr.from ? Math.max(0, candles.findIndex((c) => c.t >= snr.from)) : 0, x0 = x(fi < 0 ? 0 : fi) - step / 2, xb = bi >= 0 ? x(bi) : x0;
+    const lab = (tx, ty, txt, col, bold) => { const tw = txt.length * (bold ? 8 : 7.2); zl += `<rect x="${tx - 3}" y="${ty - 13}" width="${tw + 6}" height="18" rx="3" fill="${col}"/><text x="${tx}" y="${ty}" font-size="12" font-weight="bold" fill="#ffffff">${txt}</text>`; return tw; };
+    if (bi >= 0 && xb > x0 + 4) {
+      s += `<rect x="${x0}" y="${by}" width="${xb - x0}" height="${bh}" fill="${oldC}" fill-opacity="0.35" stroke="${oldC}" stroke-opacity="0.9"/>`;
+      lab(Math.min(x0 + 4, xb - 90), dir > 0 ? by - 6 : by + bh + 17, oldN, oldC);
+    }
+    s += `<rect x="${xb}" y="${by}" width="${W - R - xb}" height="${bh}" fill="${newC}" fill-opacity="0.35" stroke="${newC}" stroke-opacity="0.9"/>`;
+    const nt = `${nm} ${f(snr.key)} · ${newN}`;
+    lab(Math.max(xb + 4, W - R - nt.length * 8 - 10), dir > 0 ? by + bh + 17 : by - 6, nt, newC, true);
+    // breakout candle: an arrow and a label; retest candle: a circle on the level
+    if (bi >= 0) {
+      const c = candles[bi], ty = dir > 0 ? y(c.h) - 26 : y(c.l) + 34;
+      zl += `<path d="M${x(bi)} ${dir > 0 ? y(c.h) - 4 : y(c.l) + 4} L${x(bi)} ${dir > 0 ? y(c.h) - 16 : y(c.l) + 16}" stroke="#f5c542" stroke-width="2"/><text x="${x(bi)}" y="${ty}" font-size="12" font-weight="bold" fill="#f5c542" text-anchor="middle">BREAKOUT</text>`;
+    }
+    if (ri >= 0) {
+      const c = candles[ri], cy = dir > 0 ? y(c.l) : y(c.h);
+      zl += `<circle cx="${x(ri)}" cy="${cy}" r="${Math.max(9, step)}" fill="none" stroke="#ffffff" stroke-width="2"/><text x="${x(ri)}" y="${dir > 0 ? cy + Math.max(9, step) + 15 : cy - Math.max(9, step) - 6}" font-size="12" font-weight="bold" fill="#ffffff" text-anchor="middle">RETEST</text>`;
+    }
   }
   // the base candle of the zone and the strong move away from it
   if (baseI >= 0) {
@@ -2057,7 +2076,7 @@ async function signalChart(s) {
   const label = s.test ? "EA TEST" : s.setup === "SNR" ? "SNR " + s.kind.toUpperCase() : s.nine ? "9:59 AM SETUP" : s.news === "pre" ? "NEWS" : s.news === "recovery" ? "RECOVERY" : s.kind.toUpperCase();
   const opts = {
     candles: list, dir: s.dir, entry: s.entry, sl: s.sl0 ?? s.sl, tps: s.tps || [s.tp], zone: Array.isArray(s.zone) && s.setup !== "SNR" ? s.zone : null, zoneFrom: zt, tf: min, digits: digits(s.sym),
-    snr: s.setup === "SNR" && Array.isArray(s.zone) ? { key: s.level ?? (s.zone[0] + s.zone[1]) / 2, levels: s.levels || [] } : null,
+    snr: s.setup === "SNR" && Array.isArray(s.zone) ? { key: s.level ?? (s.zone[0] + s.zone[1]) / 2, levels: s.levels || [], zone: s.zone, bt: s.bt, rt: s.rt, from: s.lvFrom } : null,
     title: `${label} ${word} ${s.sym}`, sub: `${min === 60 ? "H1" : "M15"} · ${my.toISOString().slice(0, 10).split("-").reverse().join("/")} ${my.toISOString().slice(11, 16)} MYT${why ? " · " + why.slice(0, 90) : ""}`,
   };
   const svg = chartSvg(opts);
