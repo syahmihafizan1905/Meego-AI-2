@@ -371,7 +371,7 @@ function historyStats(list, now = Date.now()) {
 }
 // Admin only: every strategy the bot uses and how (kept in step with the code: news, 9:59, S&D = KX/SM/TOUCH, SNR = SNRB/SNRK, EA 1.31)
 async function cmdStrategy(chatId) {
-  const k = (n) => SNRK[n], NL = String.fromCharCode(10);
+  const k = (n) => SNRK[n], NL = String.fromCharCode(10), tfs = (n) => SNRP[n].map((p) => `level ${TFN(p.lt)} → entry ${TFN(p.bt)}`).join(" atau ");
   await send(chatId, [
     "🧠 <b>STRATEGY MEEGO AI</b> (admin sahaja)",
     "Semua untuk gold XAUUSD. Bot scan sendiri setiap beberapa minit, guna candle yang dah tutup sahaja.",
@@ -423,9 +423,10 @@ async function cmdStrategy(chatId) {
     "• Retest = harga datang balik ke level dalam 3 candle terakhir.",
     "• MSnR rule: kalau ada candle tutup balik tembus level → RBS/SBR gagal, tiada signal.",
     "• Entry = candle terakhir tutup menjauhi level. SL di belakang level / wick retest.",
-    `• ⚡ Scalping: level ${TFN(k("Scalping").lt)}, break ${TFN(k("Scalping").bt)}, SL ${k("Scalping").min}–${k("Scalping").max} pips · backtest 6 bulan +32.6R (TP1 60%)`,
-    `• 📈 Intraday: level ${TFN(k("Intraday").lt)}, break ${TFN(k("Intraday").bt)}, SL ${k("Intraday").min}–${k("Intraday").max} pips · +9.3R (TP1 57%)`,
-    `• ⭐ Swing: level ${TFN(k("Swing").lt)}, break ${TFN(k("Swing").bt)}, SL ${k("Swing").min}–${k("Swing").max} pips · 17 bulan +5.5R (lemah sejak Mac)`,
+    `• ⚡ Scalping: ${tfs("Scalping")}, SL ${k("Scalping").min}–${k("Scalping").max} pips · M15/M5 +881, M12/M5 +844 pips (3 bulan)`,
+    `• 📈 Intraday: ${tfs("Intraday")}, SL ${k("Intraday").min}–${k("Intraday").max} pips · H1/M15 +706, M15/M5 +1328 pips (6 bulan)`,
+    `• ⭐ Swing: ${tfs("Swing")}, SL ${k("Swing").min}–${k("Swing").max} pips (D1 sampai 1500) · H4/H1 +215, D1/H1 +970 pips (17 bulan)`,
+    "• Satu breakout = satu signal sahaja (Scalping dulu, lepas tu Intraday).",
     "",
     "<b>🎯 TP &amp; pengurusan</b>",
     "• ⚡ Scalping: TP1 50–100, TP2 100–200, TP3 200–500 pips.",
@@ -1282,6 +1283,10 @@ function sndCandles(sym, m1, m15, h1) {
   const first = g.length ? g[0].t : 0;
   const join = (old, min) => { const fresh = done(group(g, min), min).filter((x) => x.t >= first), o = done(old.slice(0, -1), min), last = o.length ? o[o.length - 1].t : 0; return o.concat(fresh.filter((x) => x.t > last)).slice(-400); };
   const H1 = join(h1, 60), by = { 5: done(group(g, 5), 5).filter((x) => x.t >= first).slice(-400), 15: join(m15, 15), 60: H1, 240: done(group(done(h1.slice(0, -1), 60).concat(H1.filter((x) => !h1.slice(0, -1).some((y) => y.t === x.t))), 240), 240).slice(-400) };
+  // M12 from the M1 candles; D1 from the H1 candles, days starting 22:00 UTC (the gold session)
+  by[12] = done(group(g, 12), 12).filter((x) => x.t >= first).slice(-400);
+  const hAll = done(h1.slice(0, -1), 60).concat(H1.filter((x) => !h1.slice(0, -1).some((y) => y.t === x.t))), sh = 2 * 3600000;
+  by[1440] = group(hAll.map((x) => ({ ...x, t: x.t + sh })), 1440).map((x) => ({ ...x, t: x.t - sh })).slice(0, -1); // the running day is not finished
   return (min) => by[min];
 }
 function sndSetup(kind, G, price, used) {
@@ -1383,22 +1388,39 @@ function snrBreak(H, M, used, k) {
   }
   return best;
 }
-const TFN = (m) => (m >= 240 ? "H4" : m >= 60 ? "H1" : "M" + m);
+const TFN = (m) => (m >= 1440 ? "D1" : m >= 240 ? "H4" : m >= 60 ? "H1" : "M" + m);
+// Timeframe pairs scanned per kind, best first (27 Nov 2026 backtests, MT5 gold, bot engine with the MSnR rule):
+//   Scalping M15/M5 +881 pips and M12/M5 +844 pips in 3 months (M3/M1 entries and M10/M6 levels lost or were unstable)
+//   Intraday H1/M15 +706 pips and M15/M5 +1328 pips in 6 months (M20/M30 levels and H1/M5 lost)
+//   Swing H4/H1 +215 pips and D1/H1 (stop up to 1500 pips, 10 days) +970 pips in 17 months (H2/H3 levels lost, W1 never fired)
+const SNRP = {
+  Scalping: [{ lt: 15, bt: 5 }, { lt: 12, bt: 5 }],
+  Intraday: [{ lt: 60, bt: 15 }, { lt: 15, bt: 5 }],
+  Swing: [{ lt: 240, bt: 60 }, { lt: 1440, bt: 60, max: 1500, life: 240 }],
+};
 async function snrScan(sym, G, all, kind) {
   const k = SNRK[kind], mine = all.filter((s) => s.setup === "SNR" && s.kind === kind && s.sym === sym && !s.test);
   if (mine.filter((s) => s.status === "running").length >= k.open) return;
   if (Date.now() - Math.max(0, ...mine.map((s) => s.closedAt || s.time)) < k.cool * 3600000) return;
   if (mine.filter((s) => s.time >= Date.now() - 86400000).length >= k.day) return;
-  const b = snrBreak(G(k.lt), G(k.bt), new Set(mine.map((x) => x.zkey).filter(Boolean)), k);
+  // one breakout = one signal, whichever kind finds it first
+  const used = new Set(all.filter((s) => s.setup === "SNR" && s.sym === sym).map((x) => x.zkey).filter(Boolean));
+  let b = null, kk = k;
+  for (const pr of SNRP[kind]) {
+    const q = { ...k, ...pr }, L = G(q.lt), B = G(q.bt);
+    if (!L || !B) continue;
+    b = snrBreak(L, B, used, q);
+    if (b) { kk = q; break; }
+  }
   if (!b) return;
   const lo = b.lv.v - SNRB.near * b.a, hi = b.lv.v + SNRB.near * b.a, d = digits(sym);
   // the broken level (now support for a BUY, resistance for a SELL) and the other levels, for the chart and the EA
-  const lvls = snrLevels(G(k.lt), { ...SNRB, ...k }).levels.map((l) => [Number(l.v.toFixed(d)), l.n]);
-  const s = { dir: b.dir, entry: b.entry, sl: b.sl, zkey: b.key, zone: [Number(lo.toFixed(2)), Number(hi.toFixed(2))], order: "instant", setup: "SNR", life: k.life, level: Number(b.lv.v.toFixed(d)), levels: lvls, lvFrom: b.lv.first, bt: b.bt, rt: b.rt,
-    note: `🤖 MEEGO AI · SNR breakout + retest · ${TFN(k.lt)} ${b.dir > 0 ? "resistance" : "support"} ${b.lv.v.toFixed(2)} (${b.lv.n} touches) broken on ${TFN(k.bt)}, price came back to retest it and holds → ${b.dir > 0 ? "RBS" : "SBR"}` };
+  const lvls = snrLevels(G(kk.lt), { ...SNRB, ...kk }).levels.map((l) => [Number(l.v.toFixed(d)), l.n]);
+  const s = { dir: b.dir, entry: b.entry, sl: b.sl, zkey: b.key, zone: [Number(lo.toFixed(2)), Number(hi.toFixed(2))], order: "instant", setup: "SNR", life: kk.life, level: Number(b.lv.v.toFixed(d)), levels: lvls, lvFrom: b.lv.first, bt: b.bt, rt: b.rt,
+    note: `🤖 MEEGO AI · SNR breakout + retest · ${TFN(kk.lt)} ${b.dir > 0 ? "resistance" : "support"} ${b.lv.v.toFixed(2)} (${b.lv.n} touches) broken on ${TFN(kk.bt)}, price came back to retest it and holds → ${b.dir > 0 ? "RBS" : "SBR"}` };
   if (!(await reprice(s, sym))) return;
   const rp = Math.abs(s.entry - s.sl) / pip(sym);
-  if (rp < k.min || rp > k.max) return;
+  if (rp < kk.min || rp > kk.max) return;
   for (const f of ["entry", "sl"]) s[f] = Number(s[f].toFixed(d));
   Object.assign(s, tpPlan(sym, s.dir, s.entry, s.sl, kind === "Swing" ? SWING_TP : kind === "Intraday" ? INTRADAY_TP : TP_PLAN));
   await db.from("signals").insert({ id: crypto.randomUUID(), data: { kind, sym, ...s, status: "running", auto: true, trial: true, time: Date.now(), closedAt: null } });
@@ -1462,7 +1484,7 @@ async function autoScan() {
       Object.assign(s, tpPlan(sym, s.dir, s.entry, s.sl, own && kind === "Swing" ? SWING_TP : snd && kind === "Intraday" ? INTRADAY_TP : TP_PLAN));
       await db.from("signals").insert({ id: crypto.randomUUID(), data: { kind, sym, ...s, status: "running", auto: true, ...(TRIAL.includes(kind) ? { trial: true } : {}), time: Date.now(), closedAt: null } });
     }
-    if (snd) for (const kind of ["Swing", "Intraday", "Scalping"]) await snrScan(sym, sndG, all, kind).catch((e) => console.error("SNR breakout failed", kind, e));
+    if (snd) for (const kind of ["Swing", "Scalping", "Intraday"]) await snrScan(sym, sndG, all, kind).catch((e) => console.error("SNR breakout failed", kind, e));
   }
 }
 
