@@ -1273,7 +1273,9 @@ async function snrScan(sym, G, all, kind) {
   const b = snrBreak(G(k.lt), G(k.bt), new Set(mine.map((x) => x.zkey).filter(Boolean)), k);
   if (!b) return;
   const lo = b.lv.v - SNRB.near * b.a, hi = b.lv.v + SNRB.near * b.a, d = digits(sym);
-  const s = { dir: b.dir, entry: b.entry, sl: b.sl, zkey: b.key, zone: [Number(lo.toFixed(2)), Number(hi.toFixed(2))], order: "instant", setup: "SNR", life: k.life,
+  // the broken level (now support for a BUY, resistance for a SELL) and the other levels, for the chart and the EA
+  const lvls = snrLevels(G(k.lt), { ...SNRB, ...k }).levels.map((l) => [Number(l.v.toFixed(d)), l.n]);
+  const s = { dir: b.dir, entry: b.entry, sl: b.sl, zkey: b.key, zone: [Number(lo.toFixed(2)), Number(hi.toFixed(2))], order: "instant", setup: "SNR", life: k.life, level: Number(b.lv.v.toFixed(d)), levels: lvls,
     note: `🤖 MEEGO AI · SNR breakout + retest · ${TFN(k.lt)} ${b.dir > 0 ? "resistance" : "support"} ${b.lv.v.toFixed(2)} (${b.lv.n} touches) broken on ${TFN(k.bt)}, retested and holding` };
   if (!(await reprice(s, sym))) return;
   const rp = Math.abs(s.entry - s.sl) / pip(sym);
@@ -1629,7 +1631,7 @@ async function eaFeed(key) {
   const n = (v) => (Number.isFinite(Number(v)) ? String(Number(v)) : "0");
   const rows = (data ?? []).map((r) => ({ id: r.id, ...r.data })).filter((x) => x && x.sym && (x.status === "running" || (x.closedAt || x.time) >= since) && canSeeSignal(a, x));
   const lines = rows.map((x) => ["S", x.id, x.kind, x.news || "", x.sym, x.dir, x.order || "instant", x.status, x.pending ? 1 : 0, n(x.entry), n(x.sl0 ?? x.sl),
-    ...(x.tps ? x.tps.map(n) : [n(x.tp), "0", "0"]), x.tpHit || 0, n(x.sl), Math.round(x.time || 0), x.expire ?? LIMIT.expire, Math.round(x.filled || 0), n(x.zone?.[0]), n(x.zone?.[1]), n(x.life ?? AUTO[x.kind]?.life), x.wait ? 0 : 1].join("|"));
+    ...(x.tps ? x.tps.map(n) : [n(x.tp), "0", "0"]), x.tpHit || 0, n(x.sl), Math.round(x.time || 0), x.expire ?? LIMIT.expire, Math.round(x.filled || 0), n(x.zone?.[0]), n(x.zone?.[1]), n(x.life ?? AUTO[x.kind]?.life), x.wait ? 0 : 1, x.setup || "", n(x.level ?? (x.setup === "SNR" && x.zone ? (x.zone[0] + x.zone[1]) / 2 : 0))].join("|"));
   return txt([`OK|${Date.now()}|${a.admin ? "ADMIN" : a.tier}`, ...lines].join("\n"));
 }
 async function sendFile(chatId, name, content, caption) {
@@ -1950,7 +1952,7 @@ async function cmdAdmin(chatId, a, text) {
 // Signal chart as SVG: candles, zone, entry, SL, TPs (Malaysia time)
 // Signal chart as SVG: candles, zone, entry, SL, TPs (Malaysia time)
 function chartSvg(o) {
-  const { candles, title, sub, dir, entry, sl, tps = [], zone = null, zoneFrom = 0, tf = 15, digits = 2, signalT = 0, marks = [], ribbon = null, dash = null, vline = null } = o;
+  const { candles, title, sub, dir, entry, sl, tps = [], zone = null, zoneFrom = 0, tf = 15, digits = 2, signalT = 0, marks = [], ribbon = null, dash = null, vline = null, snr = null } = o;
   const baseI = zoneFrom ? candles.findIndex((c) => c.t === zoneFrom) : -1;
   const W = 1000, H = 600, L = 14, R = 112, T = 62, B = 46, n = candles.length;
   const C = { bg: "#0f1115", grid: "#20242c", text: "#c9ced8", mut: "#7c8492", up: "#26a69a", dn: "#ef5350", zone: dir > 0 ? "#26a69a" : "#ef5350", entry: "#e6e8ee", sl: "#ef5350", tp: "#26a69a" };
@@ -1975,6 +1977,23 @@ function chartSvg(o) {
     s += `<rect x="${zx}" y="${zy}" width="${W - R - zx}" height="${zh}" fill="${C.zone}" fill-opacity="0.16" stroke="${C.zone}" stroke-opacity="0.7"/>`;
     const zt = `${dir > 0 ? "DEMAND ZONE" : "SUPPLY ZONE"} ${f(Math.min(...zone))} - ${f(Math.max(...zone))}`, tw = zt.length * 7.6, tx = Math.min(zx + 4, W - R - tw - 6), ty = dir > 0 ? zy + zh + 17 : zy - 7;
     zl = `<rect x="${tx - 3}" y="${ty - 13}" width="${tw + 6}" height="18" rx="3" fill="${C.bg}" fill-opacity="0.85"/><text x="${tx}" y="${ty}" font-size="13" fill="${C.zone}">${zt}</text>`;
+  }
+  // SNR: horizontal lines, red = resistance (above the price), blue = support (below); the broken level is thick, in its new role
+  if (snr) {
+    const RED = "#ef5350", BLUE = "#2196f3", seen = [];
+    // besides the broken level: the 2 nearest resistances above the entry and the 2 nearest supports below, at least 4% of the chart apart
+    const ok = (snr.levels || []).filter(([v]) => v >= lo && v <= hi && Math.abs(v - snr.key) > (hi - lo) * 0.04);
+    const up = ok.filter(([v]) => v > Math.max(entry, snr.key)).sort((p, q) => p[0] - q[0]), dn = ok.filter(([v]) => v < Math.min(entry, snr.key)).sort((p, q) => q[0] - p[0]);
+    const pick = (a) => a.reduce((out, l) => (out.length < 2 && out.every((o) => Math.abs(o[0] - l[0]) > (hi - lo) * 0.04) ? [...out, l] : out), []);
+    for (const [v, nT] of [...pick(up), ...pick(dn)]) {
+      const col = v > entry ? RED : BLUE;
+      s += `<line x1="${L}" x2="${W - R}" y1="${y(v)}" y2="${y(v)}" stroke="${col}" stroke-width="1.2" stroke-opacity="0.8" stroke-dasharray="10 5"/>`;
+      zl += `<text x="${L + 4}" y="${y(v) - 4}" font-size="11" fill="${col}">${v > entry ? "RESISTANCE" : "SUPPORT"} ${f(v)} (${nT}x)</text>`;
+    }
+    const col = dir > 0 ? BLUE : RED, kt = `${dir > 0 ? "SUPPORT" : "RESISTANCE"} ${f(snr.key)} · broken ${dir > 0 ? "resistance" : "support"}`, tw = kt.length * 7.6;
+    s += `<line x1="${L}" x2="${W - R}" y1="${y(snr.key)}" y2="${y(snr.key)}" stroke="${col}" stroke-width="3"/>`;
+    const ty = dir > 0 ? y(snr.key) + 18 : y(snr.key) - 8;
+    zl += `<rect x="${L + 1}" y="${ty - 13}" width="${tw + 6}" height="18" rx="3" fill="${C.bg}" fill-opacity="0.85"/><text x="${L + 4}" y="${ty}" font-size="13" font-weight="bold" fill="${col}">${kt}</text>`;
   }
   // the base candle of the zone and the strong move away from it
   if (baseI >= 0) {
@@ -2037,7 +2056,8 @@ async function signalChart(s) {
   const why = String(s.note || "").replace(/^🤖 MEEGO AI · /, "").replace(/^(Demand|Supply) zone \S+ [\d.]+ - [\d.]+ · /, "");
   const label = s.test ? "EA TEST" : s.setup === "SNR" ? "SNR " + s.kind.toUpperCase() : s.nine ? "9:59 AM SETUP" : s.news === "pre" ? "NEWS" : s.news === "recovery" ? "RECOVERY" : s.kind.toUpperCase();
   const opts = {
-    candles: list, dir: s.dir, entry: s.entry, sl: s.sl0 ?? s.sl, tps: s.tps || [s.tp], zone: Array.isArray(s.zone) ? s.zone : null, zoneFrom: zt, tf: min, digits: digits(s.sym),
+    candles: list, dir: s.dir, entry: s.entry, sl: s.sl0 ?? s.sl, tps: s.tps || [s.tp], zone: Array.isArray(s.zone) && s.setup !== "SNR" ? s.zone : null, zoneFrom: zt, tf: min, digits: digits(s.sym),
+    snr: s.setup === "SNR" && Array.isArray(s.zone) ? { key: s.level ?? (s.zone[0] + s.zone[1]) / 2, levels: s.levels || [] } : null,
     title: `${label} ${word} ${s.sym}`, sub: `${min === 60 ? "H1" : "M15"} · ${my.toISOString().slice(0, 10).split("-").reverse().join("/")} ${my.toISOString().slice(11, 16)} MYT${why ? " · " + why.slice(0, 90) : ""}`,
   };
   const svg = chartSvg(opts);

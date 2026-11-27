@@ -55,6 +55,8 @@ struct Sig
    long   time, filled;   // milliseconds (UTC)
    double zLo, zHi, lifeH; // zone (0 = no zone) and how many hours the trade may stay open
    int    ready;           // 0 = the bot says wait (PR SOP dashboard not lined up yet)
+   string setup;           // "SNR" = breakout + retest of a level, "" = supply / demand zone
+   double level;           // SNR: the broken level
   };
 Sig      g_sigs[];
 datetime g_fetched = 0;   // last time the feed was read (local clock)
@@ -142,6 +144,8 @@ bool ParseSig(string line, Sig &s)
    s.zHi     = nf > 20 ? StringToDouble(f[20]) : 0;
    s.lifeH   = nf > 21 ? StringToDouble(f[21]) : 0;
    s.ready   = nf > 22 ? (int)StringToInteger(f[22]) : 1;
+   s.setup   = nf > 23 ? f[23] : "";
+   s.level   = nf > 24 ? StringToDouble(f[24]) : 0;
    if(s.zHi < s.zLo) { double z = s.zLo; s.zLo = s.zHi; s.zHi = z; }
    return(s.dir != 0 && s.entry > 0 && s.sl > 0 && s.tp1 > 0);
   }
@@ -482,7 +486,25 @@ void DrawBox(string name, datetime t1, double lo, double hi, color c, string tex
    ObjectMove(0, name, 0, t1, hi);
    ObjectMove(0, name, 1, t2, lo);
   }
-// The zone box stays while the zone is valid and the signal is running or its trade is open
+// Horizontal line from the signal to the right edge
+void DrawRay(string name, datetime t1, double price, color c, int width, ENUM_LINE_STYLE style, string text)
+  {
+   if(ObjectFind(0, name) < 0)
+     {
+      ObjectCreate(0, name, OBJ_TREND, 0, t1, price, t1 + 60, price);
+      ObjectSetInteger(0, name, OBJPROP_RAY_RIGHT, true);
+      ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+      ObjectSetInteger(0, name, OBJPROP_HIDDEN, true);
+     }
+   ObjectSetInteger(0, name, OBJPROP_COLOR, c);
+   ObjectSetInteger(0, name, OBJPROP_WIDTH, width);
+   ObjectSetInteger(0, name, OBJPROP_STYLE, style);
+   ObjectSetString(0, name, OBJPROP_TEXT, text);
+   ObjectSetString(0, name, OBJPROP_TOOLTIP, text);
+   ObjectMove(0, name, 0, t1, price);
+   ObjectMove(0, name, 1, t1 + 60, price);
+  }
+// The zone box (SNR: the level line, blue = support, red = resistance) and the entry line stay while the zone is valid and the signal is running or its trade is open
 void DrawZones()
   {
    string keep = "";
@@ -493,7 +515,16 @@ void DrawZones()
          color  c = g_sigs[i].dir > 0 ? clrMediumSeaGreen : clrTomato;
          string t = "MEEGO " + g_sigs[i].kind + (g_sigs[i].dir > 0 ? " demand" : " supply") + " zone " + DoubleToString(g_sigs[i].zLo, 2) + " - " + DoubleToString(g_sigs[i].zHi, 2);
          long   off = (long)MathRound(((double)TimeTradeServer() - (double)TimeGMT()) / 1800.0) * 1800;   // server clock - UTC
-         DrawBox("MEEGO_ZR_" + g_sigs[i].id8, (datetime)(g_sigs[i].time / 1000 + off), g_sigs[i].zLo, g_sigs[i].zHi, c, t);
+         datetime t1 = (datetime)(g_sigs[i].time / 1000 + off);
+         if(g_sigs[i].setup == "SNR" && g_sigs[i].level > 0)
+           {
+            bool sup = g_sigs[i].dir > 0;   // a broken resistance is support now (BUY), a broken support is resistance (SELL)
+            DrawRay("MEEGO_ZL_" + g_sigs[i].id8, t1, g_sigs[i].level, sup ? clrDodgerBlue : clrRed, 3, STYLE_SOLID,
+                    "MEEGO SNR " + g_sigs[i].kind + (sup ? " support " : " resistance ") + DoubleToString(g_sigs[i].level, 2) + (sup ? " (broken resistance)" : " (broken support)"));
+           }
+         else
+            DrawBox("MEEGO_ZR_" + g_sigs[i].id8, t1, g_sigs[i].zLo, g_sigs[i].zHi, c, t);
+         DrawRay("MEEGO_ZE_" + g_sigs[i].id8, t1, g_sigs[i].entry, clrWhite, 1, STYLE_DOT, "MEEGO " + g_sigs[i].kind + " entry " + DoubleToString(g_sigs[i].entry, 2));
          keep += g_sigs[i].id8 + ",";
         }
    for(int i = ObjectsTotal(0) - 1; i >= 0; i--)
