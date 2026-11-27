@@ -405,9 +405,9 @@ async function cmdStrategy(chatId) {
     "• Backtest 17 bulan: 172 trade, TP1 56%, +31.3R. Cara video (candle 8–9 pagi) rugi −55R.",
     "",
     "<b>4b. 🕗 8 AM break + retest</b> (baru, 27 Nov)",
-    "• Tanda high &amp; low candle H1 8–9 pagi. 9 pagi–12 tengah hari: candle M5 tutup tembus salah satu = break.",
-    "• Limit order di level tu tunggu harga datang balik (retest). TP 100 pips, SL 60 pips. Batal kalau tak kena sebelum 12 tengah hari.",
-    "• Backtest 17 bulan: 102 trade, menang 44%, +1080 pips. Entry terus masa break: −4240 pips.",
+    "• Tanda high &amp; low candle H1 8–9 pagi. 9–10 pagi: candle M5 tutup tembus salah satu = break.",
+    "• Limit order di level tu tunggu harga datang balik (retest). TP 100 pips, SL 60 pips. Batal kalau tak kena sebelum 10 pagi.",
+    "• Backtest 17 bulan: 60 trade, menang 43%, +560 pips (6 bulan: +960 pips). Entry terus masa break: rugi.",
     "",
     "<b>5. S&amp;D zone (Supply &amp; Demand)</b>",
     "• Zone = candle base kecil, lepas tu harga lari kuat (≥ 1.3× ATR dalam 1–3 candle). Zone mesti belum ditembus (close).",
@@ -1146,11 +1146,13 @@ async function nineSetup(now = Date.now()) {
     status: "running", auto: true, time: Date.now(), closedAt: null } });
 }
 /* ---------- 8 AM break + retest (Malaysia), admin-only trial ---------- */
-// Mark the high and low of the 8-9 AM H1 candle. From 9 AM to 12 PM: the first M5 candle that CLOSES beyond one of them is the break;
-// then a limit order waits at that level for price to come back (retest). TP 100 pips, SL 60 pips, limit cancelled at 12 PM, trade closed after 12 h.
-// MT5 gold, 3 pips spread: 17 months 102 trades, 44% win, +18R (+1080 pips); last 6 months (M5) 111 trades, 44% win, +19.7R (+1180 pips).
+// Mark the high and low of the 8-9 AM H1 candle. From 9 AM to 10 AM (the admin wants every entry in the 9 o'clock hour): the first M5 candle
+// that CLOSES beyond one of them is the break; then a limit order waits at that level for price to come back (retest). TP 100 pips, SL 60 pips,
+// limit cancelled at 10 AM, trade closed after 12 h.
+// MT5 gold, 3 pips spread, entries 9-10 AM only: 17 months 60 trades, 43% win, +9.3R (+560 pips); last 6 months (M5) 88 trades, 44% win, +16R (+960 pips).
+//   (window to 12 PM: +1080 / +1180 pips)
 // Entering on the break itself (no retest) lost -4240 pips: most morning breaks are fake.
-const EIGHT = { tp: 100, sl: 60, zone: 20, until: 4, life: 12 }; // until: hours after 00:00 UTC (12 PM Malaysia)
+const EIGHT = { tp: 100, sl: 60, zone: 20, until: 2, life: 12 }; // until: hours after 00:00 UTC (2 = 10 AM Malaysia)
 async function eightSetup(now = Date.now()) {
   const d = new Date(now), day = d.getUTCDay();
   if (day < 1 || day > 5) return;
@@ -1164,7 +1166,7 @@ async function eightSetup(now = Date.now()) {
   const chats = await audience("Intraday", true); // admin only while on trial
   if (cfg.eight_early !== key) {
     await db.from("app_settings").upsert({ key: "eight_early", value: key });
-    await broadcast(chats, `🧪 🕗 <b>8 AM BREAK + RETEST TEST</b> (admin only)\nCandle jam 8 (H1): High <code>${f(hi)}</code> · Low <code>${f(lo)}</code> (${Math.round((hi - lo) / p)} pips)\nTunggu candle M5 tutup tembus salah satu, lepas tu limit order di level tu (retest). Sampai 12 tengah hari.`);
+    await broadcast(chats, `🧪 🕗 <b>8 AM BREAK + RETEST TEST</b> (admin only)\nCandle jam 8 (H1): High <code>${f(hi)}</code> · Low <code>${f(lo)}</code> (${Math.round((hi - lo) / p)} pips)\nTunggu candle M5 tutup tembus salah satu, lepas tu limit order di level tu (retest). Entry hanya 9–10 pagi.`);
   }
   const m5 = group(m1.filter((x) => x.t >= start), 5).filter((x) => x.t + 300000 <= now); // finished M5 candles only
   let dir = 0, lv = 0;
@@ -1175,7 +1177,7 @@ async function eightSetup(now = Date.now()) {
   if (!dir) {
     if (now > d0 + EIGHT.until * 3600000 - 120000) {
       await db.from("app_settings").upsert({ key: "eight_done", value: key });
-      await broadcast(chats, "🧪 🕗 <b>8 AM BREAK + RETEST TEST</b>\nTiada break sampai 12 tengah hari. Tiada setup hari ni.");
+      await broadcast(chats, "🧪 🕗 <b>8 AM BREAK + RETEST TEST</b>\nTiada break sebelum 10 pagi. Tiada setup hari ni.");
     }
     return;
   }
@@ -1185,7 +1187,7 @@ async function eightSetup(now = Date.now()) {
   await db.from("signals").insert({ id: crypto.randomUUID(), data: {
     kind: "Intraday", sym: "XAUUSD", dir, entry, sl, tps: [tp, tp, tp], tp, sl0: sl, tpHit: 0, zone, order: "limit", pending: true,
     expire: Math.max(0.1, (d0 + EIGHT.until * 3600000 - now) / 3600000), setup: "BRK8", trial: true, auto: true, life: EIGHT.life,
-    note: `🤖 MEEGO AI · 8 AM break + retest: candle jam 8 ${dir > 0 ? "high" : "low"} ${f(lv)} ditembus (M5 close), limit di level tu tunggu retest · TP 100 · SL 60 · batal 12 tengah hari`,
+    note: `🤖 MEEGO AI · 8 AM break + retest: candle jam 8 ${dir > 0 ? "high" : "low"} ${f(lv)} ditembus (M5 close), limit di level tu tunggu retest · TP 100 · SL 60 · batal 10 pagi kalau tak kena`,
     status: "running", time: Date.now(), closedAt: null } });
 }
 /* ---------- S&D setup for Scalping, Intraday and Swing (gold), the admin's rules ---------- */
