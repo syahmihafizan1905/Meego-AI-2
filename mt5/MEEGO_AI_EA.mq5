@@ -4,7 +4,7 @@
 //|  Get your key by sending /ea to the bot.                          |
 //+------------------------------------------------------------------+
 #property copyright "MEEGO AI"
-#property version   "1.31"
+#property version   "1.32"
 #property description "Copies MEEGO AI gold signals into MT5: draws the zone, enters while price is in it, TP1/TP2/TP3,"
 #property description "locks profit (+50 pips: SL +20, +100 pips: closes half, SL +50), removes a zone once it is no longer valid."
 #property description "Tools > Options > Expert Advisors > Allow WebRequest for the MEEGO URL first."
@@ -37,6 +37,8 @@ input double InpMinSLPips     = 20;        // Don't enter when the SL is closer 
 input bool   InpZoneLimit     = true;      // Price outside the zone: place limit orders at the zone
 input bool   InpDrawZone      = true;      // Draw the zone as a shaded box
 input int    InpZoneShade     = 30;        // Box strength (10 = faint, 100 = solid)
+input bool   InpMapZones      = true;      // Draw the bot's current S&D zones (M15, H1, H4)
+input bool   InpMapLevels     = true;      // Draw the bot's current SNR lines (M15, H1, H4, D1): red above price, blue below
 input int    InpPollSec       = 30;        // Check for signals every N seconds
 input long   InpMagic         = 771905;    // Magic number
 input int    InpSlippage      = 50;        // Max slippage (points)
@@ -60,6 +62,10 @@ struct Sig
    long   bt, lvFrom;      // SNR: breakout time and first touch of the level (ms UTC, 0 = unknown)
   };
 Sig      g_sigs[];
+struct MapZ { int tf, dir; double lo, hi; long t; };
+struct MapL { int tf, n; double v; long t; };
+MapZ     g_mz[];
+MapL     g_ml[];
 datetime g_fetched = 0;   // last time the feed was read (local clock)
 ulong    g_work    = 0;
 #define  PIP 0.1
@@ -108,7 +114,7 @@ int OnInit()
    OnTimer();
    return(INIT_SUCCEEDED);
   }
-void OnDeinit(const int reason) { EventKillTimer(); Comment(""); ObjectsDeleteAll(0, "MEEGO_Z"); }
+void OnDeinit(const int reason) { EventKillTimer(); Comment(""); ObjectsDeleteAll(0, "MEEGO_Z"); ObjectsDeleteAll(0, "MEEGO_M_"); }
 void OnTick()
   {
    if(g_sym == "" || GetTickCount64() - g_work < 1000) return;   // at most once a second
@@ -566,6 +572,43 @@ void DrawZones()
    ChartRedraw();
   }
 
+string TfName(int m) { return(m >= 1440 ? "D1" : m >= 60 ? "H" + IntegerToString(m / 60) : "M" + IntegerToString(m)); }
+// The bot's zone map: S&D zones as faint boxes, SNR levels as dotted lines (red above price = resistance, blue below = support)
+void DrawMap()
+  {
+   ObjectsDeleteAll(0, "MEEGO_M_");
+   if(_Symbol != g_sym) return;
+   long   off = (long)MathRound(((double)TimeTradeServer() - (double)TimeGMT()) / 1800.0) * 1800;
+   double bid = SymbolInfoDouble(g_sym, SYMBOL_BID);
+   color  bg  = (color)ChartGetInteger(0, CHART_COLOR_BACKGROUND);
+   double k   = MathMax(10, MathMin(100, InpZoneShade)) / 100.0 * 0.6;
+   if(InpMapZones)
+      for(int i = 0; i < ArraySize(g_mz); i++)
+        {
+         string nm = "MEEGO_M_Z" + IntegerToString(i), t = "S&D " + TfName(g_mz[i].tf) + (g_mz[i].dir > 0 ? " demand " : " supply ") + DoubleToString(g_mz[i].lo, 2) + " - " + DoubleToString(g_mz[i].hi, 2);
+         datetime t1 = (datetime)(g_mz[i].t / 1000 + off), t2 = TimeCurrent() + 15 * PeriodSeconds();
+         ObjectCreate(0, nm, OBJ_RECTANGLE, 0, t1, g_mz[i].hi, t2, g_mz[i].lo);
+         ObjectSetInteger(0, nm, OBJPROP_FILL, true);
+         ObjectSetInteger(0, nm, OBJPROP_BACK, true);
+         ObjectSetInteger(0, nm, OBJPROP_SELECTABLE, false);
+         ObjectSetInteger(0, nm, OBJPROP_HIDDEN, true);
+         ObjectSetInteger(0, nm, OBJPROP_COLOR, Mix(g_mz[i].dir > 0 ? clrMediumSeaGreen : clrTomato, bg, k));
+         ObjectSetString(0, nm, OBJPROP_TOOLTIP, t);
+         DrawLabel("MEEGO_M_T" + IntegerToString(i), t1, g_mz[i].dir > 0 ? g_mz[i].lo : g_mz[i].hi, g_mz[i].dir > 0 ? clrMediumSeaGreen : clrTomato, TfName(g_mz[i].tf) + (g_mz[i].dir > 0 ? " DEMAND" : " SUPPLY"), g_mz[i].dir < 0);
+        }
+   if(InpMapLevels)
+      for(int i = 0; i < ArraySize(g_ml); i++)
+        {
+         bool   res = (bid > 0 && g_ml[i].v > bid);
+         color  c = res ? clrRed : clrDodgerBlue;
+         string nm = "MEEGO_M_L" + IntegerToString(i), t = "SNR " + TfName(g_ml[i].tf) + (res ? " resistance " : " support ") + DoubleToString(g_ml[i].v, 2) + " (" + IntegerToString(g_ml[i].n) + "x)";
+         datetime t1 = (datetime)(g_ml[i].t / 1000 + off);
+         DrawRay(nm, t1, g_ml[i].v, c, g_ml[i].tf >= 240 ? 2 : 1, g_ml[i].tf >= 60 ? STYLE_DASH : STYLE_DOT, t);
+         DrawLabel("MEEGO_M_N" + IntegerToString(i), t1, g_ml[i].v, c, TfName(g_ml[i].tf) + " " + (res ? "R " : "S ") + DoubleToString(g_ml[i].v, 2), !res);
+        }
+   ChartRedraw();
+  }
+
 // May a zone signal be entered now? 1 = yes, 0 = wait, -1 = never (the move is over)
 int ZoneState(Sig &s)
   {
@@ -726,10 +769,29 @@ void OnTimer()
       return;
      }
    ArrayResize(g_sigs, 0);
+   ArrayResize(g_mz, 0);
+   ArrayResize(g_ml, 0);
    for(int i = 1; i < n; i++)
      {
       string line = lines[i];
       StringTrimRight(line);
+      if(StringFind(line, "Z|") == 0 || StringFind(line, "L|") == 0)
+        {
+         string f[];
+         int    nf = StringSplit(line, '|', f);
+         if(f[0] == "Z" && nf >= 6)
+           {
+            int k = ArraySize(g_mz); ArrayResize(g_mz, k + 1);
+            g_mz[k].tf = (int)StringToInteger(f[1]); g_mz[k].dir = (int)StringToInteger(f[2]);
+            g_mz[k].lo = StringToDouble(f[3]); g_mz[k].hi = StringToDouble(f[4]); g_mz[k].t = StringToInteger(f[5]);
+           }
+         if(f[0] == "L" && nf >= 5)
+           {
+            int k = ArraySize(g_ml); ArrayResize(g_ml, k + 1);
+            g_ml[k].tf = (int)StringToInteger(f[1]); g_ml[k].v = StringToDouble(f[2]); g_ml[k].n = (int)StringToInteger(f[3]); g_ml[k].t = StringToInteger(f[4]);
+           }
+         continue;
+        }
       Sig s;
       if(!ParseSig(line, s) || !Wanted(s)) continue;
       int k = ArraySize(g_sigs);
@@ -740,12 +802,13 @@ void OnTimer()
    g_fetched = TimeLocal();
    Work();
    DrawZones();
+   DrawMap();
    int waiting = 0;
    int sopWait = 0;
    for(int i = 0; i < ArraySize(g_sigs); i++)
       if(g_sigs[i].status == "running" && !GlobalVariableCheck(GvDone(g_sigs[i].id8))) { waiting++; if(g_sigs[i].ready == 0) sopWait++; }
    g_status = "connected - " + IntegerToString(ArraySize(g_sigs)) + " signals in feed - " + IntegerToString(waiting) + " waiting for entry" + (sopWait > 0 ? " (" + IntegerToString(sopWait) + " PR SOP: dashboard not ready)" : "") + " - " + IntegerToString(OpenSignalCount()) + " open - checked " + TimeToString(TimeLocal(), TIME_MINUTES | TIME_SECONDS);
    string lotTxt = InpFixedLot > 0 ? IntegerToString(InpLayers) + " x " + DoubleToString(InpFixedLot, 2) + " lot" : "risk " + DoubleToString(InpRiskPct, 2) + "%";
-   Comment("MEEGO AI EA 1.31 (" + g_sym + ", " + lotTxt + (TerminalInfoInteger(TERMINAL_TRADE_ALLOWED) && MQLInfoInteger(MQL_TRADE_ALLOWED) ? "" : ", ALGO TRADING IS OFF") + "): " + g_status);
+   Comment("MEEGO AI EA 1.32 (" + g_sym + ", " + lotTxt + (TerminalInfoInteger(TERMINAL_TRADE_ALLOWED) && MQLInfoInteger(MQL_TRADE_ALLOWED) ? "" : ", ALGO TRADING IS OFF") + "): " + g_status);
   }
 //+------------------------------------------------------------------+

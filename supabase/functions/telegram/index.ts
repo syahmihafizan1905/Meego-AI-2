@@ -1425,6 +1425,33 @@ async function snrScan(sym, G, all, kind) {
   Object.assign(s, tpPlan(sym, s.dir, s.entry, s.sl, kind === "Swing" ? SWING_TP : kind === "Intraday" ? INTRADAY_TP : TP_PLAN));
   await db.from("signals").insert({ id: crypto.randomUUID(), data: { kind, sym, ...s, status: "running", auto: true, trial: true, time: Date.now(), closedAt: null } });
 }
+/* ---------- Zone map for the EA: the current S&D zones and SNR levels (gold), saved every scan ---------- */
+// S&D: fresh unbroken zones (the bot's own rules, smZones) on M15, H1 and H4, the 3 nearest on each side of price per timeframe.
+// SNR: levels with 2+ touches (snrLevels) on M15, H1, H4 and D1, the 3 nearest above and below price per timeframe.
+// Kept in app_settings "map_<SYM>" as JSON; eaFeed sends it as Z| and L| lines, the EA (1.32+) draws them.
+const MAP = { zoneTf: [15, 60, 240], levelTf: [15, 60, 240, 1440], each: 3, far: 8 };
+async function mapSave(sym, G) {
+  const L = G(5), price = L && L.length ? L[L.length - 1].c : null;
+  if (!price) return;
+  const d = digits(sym), r = (v) => Number(v.toFixed(d)), zones = [], levels = [];
+  for (const tf of MAP.zoneTf) {
+    const c = G(tf); if (!c || c.length < 60) continue;
+    const a = atr(c);
+    for (const dir of [1, -1]) {
+      const z = smZones(c, dir).filter((q) => (dir > 0 ? q.top < price : q.bot > price) && Math.abs((dir > 0 ? q.top : q.bot) - price) <= MAP.far * a)
+        .sort((x, y) => Math.abs((dir > 0 ? x.top : x.bot) - price) - Math.abs((dir > 0 ? y.top : y.bot) - price))
+        .reduce((out, q) => (out.length < MAP.each && !out.some((o) => q.bot <= o.top && q.top >= o.bot) ? [...out, q] : out), []); // overlapping zones: keep the nearest
+      for (const q of z) zones.push([tf, dir, r(q.bot), r(q.top), q.t, q.f ? 1 : 0]);
+    }
+  }
+  for (const tf of MAP.levelTf) {
+    const c = G(tf); if (!c || c.length < 60) continue;
+    const lv = snrLevels(c).levels;
+    const up = lv.filter((l) => l.v > price).sort((x, y) => x.v - y.v).slice(0, MAP.each), dn = lv.filter((l) => l.v < price).sort((x, y) => y.v - x.v).slice(0, MAP.each);
+    for (const l of up.concat(dn)) levels.push([tf, r(l.v), l.n, l.first || l.last]);
+  }
+  await db.from("app_settings").upsert({ key: "map_" + sym, value: JSON.stringify({ t: Date.now(), price: r(price), zones, levels }) });
+}
 // Last saved copy of the candles (no API call); asks for new ones when it is over 20 minutes old
 async function savedCandles(sym, interval) {
   const { data } = await db.from("price_cache").select("data,fetched_at").eq("key", `${sym.slice(0, 3)}/${sym.slice(3)}|${interval}`).maybeSingle();
@@ -1485,6 +1512,7 @@ async function autoScan() {
       await db.from("signals").insert({ id: crypto.randomUUID(), data: { kind, sym, ...s, status: "running", auto: true, ...(TRIAL.includes(kind) ? { trial: true } : {}), time: Date.now(), closedAt: null } });
     }
     if (snd) for (const kind of ["Swing", "Scalping", "Intraday"]) await snrScan(sym, sndG, all, kind).catch((e) => console.error("SNR breakout failed", kind, e));
+    if (snd) await mapSave(sym, sndG).catch((e) => console.error("zone map failed", e));
   }
 }
 
@@ -1773,7 +1801,11 @@ async function eaFeed(key) {
   const rows = (data ?? []).map((r) => ({ id: r.id, ...r.data })).filter((x) => x && x.sym && (x.status === "running" || (x.closedAt || x.time) >= since) && canSeeSignal(a, x));
   const lines = rows.map((x) => ["S", x.id, x.kind, x.news || "", x.sym, x.dir, x.order || "instant", x.status, x.pending ? 1 : 0, n(x.entry), n(x.sl0 ?? x.sl),
     ...(x.tps ? x.tps.map(n) : [n(x.tp), "0", "0"]), x.tpHit || 0, n(x.sl), Math.round(x.time || 0), x.expire ?? LIMIT.expire, Math.round(x.filled || 0), n(x.zone?.[0]), n(x.zone?.[1]), n(x.life ?? AUTO[x.kind]?.life), x.wait ? 0 : 1, x.setup || "", n(x.level ?? (x.setup === "SNR" && x.zone ? (x.zone[0] + x.zone[1]) / 2 : 0)), Math.round(x.bt || 0), Math.round(x.lvFrom || 0)].join("|"));
-  return txt([`OK|${Date.now()}|${a.admin ? "ADMIN" : a.tier}`, ...lines].join("\n"));
+  // the zone map (S&D zones and SNR levels) for the EA to draw: Z|tf|dir|bottom|top|start ms|touched, L|tf|price|touches|start ms
+  let mp = null;
+  try { mp = JSON.parse((await settings())["map_XAUUSD"] || "null"); } catch { mp = null; }
+  const extra = mp && Date.now() - mp.t < 30 * 60000 ? [...mp.zones.map((z) => ["Z", ...z].join("|")), ...mp.levels.map((l) => ["L", ...l].join("|"))] : [];
+  return txt([`OK|${Date.now()}|${a.admin ? "ADMIN" : a.tier}`, ...lines, ...extra].join("\n"));
 }
 async function sendFile(chatId, name, content, caption) {
   const fd = new FormData();
