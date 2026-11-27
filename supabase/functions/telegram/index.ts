@@ -1211,10 +1211,12 @@ async function scalpTouch(sym, G, price, used) {
 // Level: 2+ swing points (level timeframe) within tol x ATR. Break: a strong candle (break timeframe) closes through a level price had been respecting.
 // Retest: price comes back to the level within `win` candles without closing back through it; the last candle confirms (closes away from the level).
 // Posted with setup "SNR" (admin only, trial) and their own limits per kind. Backtests, MT5 gold, 3 pips spread, the kind's own TPs, SL to entry after TP1:
-//   Scalping (M15 levels, M5 break), 6 months: 176 signals, TP1 57%, +23.4R (Jun-Aug +7.9R, Sep-Nov +16.5R)
-//   Intraday (H1 levels, M15 break), 6 months: 56 signals, TP1 59%, +11.8R (Jun-Aug +9.2R, Sep-Nov +2.6R)
-//   Swing (H4 levels, H1 break), 17 months: 36 signals, TP1 44%, +5.7R (weak: Mar-Nov 2026 +0.3R)
-const SNRB = { look: 160, piv: 3, tol: 0.3, touches: 2, clean: 24, body: 0.5, beyond: 0.1, win: 16, near: 0.2, back: 0.15, far: 0.6, buf: 0.25 };
+//   With the MSnR rule (no close back through the level after the breakout), 27 Nov 2026 data:
+//   Scalping (M15 levels, M5 break), 6 months: 149 signals, TP1 60%, +32.6R (every month Jun-Nov positive; +22.8R without the rule)
+//   Intraday (H1 levels, M15 break), 6 months: 47 signals, TP1 57%, +9.3R (+10.5R without)
+//   Swing (H4 levels, H1 break), 17 months: 33 signals, TP1 45%, +5.5R (+5.7R without; weak since Mar 2026)
+//   Full MSnR levels (every A/V close level) were tested too and were worse: Scalping +7.4R, Intraday +7.9R.
+const SNRB = { look: 160, piv: 3, tol: 0.3, touches: 2, clean: 24, body: 0.5, beyond: 0.1, win: 16, near: 0.2, back: 0, far: 0.6, buf: 0.25 };
 // lt: level timeframe, bt: break timeframe (minutes); min/max: stop in pips; open/cool(h)/day: limits; life: hours
 const SNRK = {
   Scalping: { lt: 15, bt: 5, clean: 36, min: 20, max: 100, open: 1, cool: 0.5, day: 5, life: 3 },
@@ -1251,7 +1253,7 @@ function snrBreak(H, M, used, k) {
       const key = "B" + M[b].t + dir;
       if (used.has(key)) continue;
       const after = M.slice(b + 1);
-      if (after.some((x) => (x.c - lv.v) * dir < -P.back * a)) continue; // closed back through: failed breakout
+      if (after.some((x) => (x.c - lv.v) * dir < -P.back * a)) continue; // MSnR: a candle closed back through it = failed RBS/SBR (QM), no trade
       // the retest: came back to the level after the break (in the last 3 candles), and the last candle closes away from it
       const r = after.findIndex((x) => (dir > 0 ? x.l : x.h) * dir <= (lv.v + dir * P.near * a) * dir);
       if (r < 0 || after.length - r > 3) continue;
@@ -1959,8 +1961,8 @@ function chartSvg(o) {
   const vals = candles.flatMap((x) => [x.h, x.l]).concat([entry, sl], tps.length ? [tps[0]] : [], zone || []);
   let hi = Math.max(...vals), lo = Math.min(...vals); const pad = (hi - lo) * 0.06 || 1; hi += pad; lo -= pad;
   const RB = ribbon ? 14 : 0;
-  // SNR: 16 empty slots on the right for the level's new role
-  const pw = W - L - R, ph = H - T - B - RB, step = pw / Math.max(n + (snr ? 16 : 0), 1), y = (v) => T + ((hi - v) / (hi - lo)) * ph, x = (i) => L + i * step + step / 2;
+  // SNR: 30 empty slots on the right for the level's new role
+  const pw = W - L - R, ph = H - T - B - RB, step = pw / Math.max(n + (snr ? 30 : 0), 1), y = (v) => T + ((hi - v) / (hi - lo)) * ph, x = (i) => L + i * step + step / 2;
   const f = (v) => Number(v).toFixed(digits), esc = (s) => String(s).replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" })[c]);
   const my = (t) => new Date(t + 8 * 3600000), hm = (t) => my(t).toISOString().slice(11, 16), dm = (t) => my(t).toISOString().slice(5, 10).split("-").reverse().join("/");
   let s = `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" font-family="DejaVu Sans"><rect width="${W}" height="${H}" fill="${C.bg}"/>`;
@@ -2003,7 +2005,7 @@ function chartSvg(o) {
     }
     s += `<rect x="${xb}" y="${by}" width="${W - R - xb}" height="${bh}" fill="${newC}" fill-opacity="0.35" stroke="${newC}" stroke-opacity="0.9"/>`;
     const nt = `${nm} ${f(snr.key)} · ${newN}`;
-    lab(Math.max(xb + 4, W - R - nt.length * 8 - 10), dir > 0 ? by + bh + 17 : by - 6, nt, newC, true);
+    lab(Math.max(xb + 4, x(n - 1) + step * 2), dir > 0 ? by + bh + 17 : by - 6, nt, newC, true);   // in the empty space after the last candle
     // breakout candle: an arrow and a label; retest candle: a circle on the level
     if (bi >= 0) {
       const c = candles[bi], ty = dir > 0 ? y(c.h) - 26 : y(c.l) + 34;
