@@ -404,6 +404,11 @@ async function cmdStrategy(chatId) {
     "• Entry terus. SL 150 pips, TP 150 / 300 / 450 pips, tutup selepas 12 jam.",
     "• Backtest 17 bulan: 172 trade, TP1 56%, +31.3R. Cara video (candle 8–9 pagi) rugi −55R.",
     "",
+    "<b>4b. 🕗 8 AM break + retest</b> (baru, 27 Nov)",
+    "• Tanda high &amp; low candle H1 8–9 pagi. 9 pagi–12 tengah hari: candle M5 tutup tembus salah satu = break.",
+    "• Limit order di level tu tunggu harga datang balik (retest). TP 100 pips, SL 60 pips. Batal kalau tak kena sebelum 12 tengah hari.",
+    "• Backtest 17 bulan: 102 trade, menang 44%, +1080 pips. Entry terus masa break: −4240 pips.",
+    "",
     "<b>5. S&amp;D zone (Supply &amp; Demand)</b>",
     "• Zone = candle base kecil, lepas tu harga lari kuat (≥ 1.3× ATR dalam 1–3 candle). Zone mesti belum ditembus (close).",
     "• Tak boleh lawan trend kuat (struktur HH/HL + EMA50).",
@@ -451,7 +456,7 @@ async function cmdHistory(chatId, a) {
     const t = s.closedAt || s.time, day = myDay(t, { weekday: "long", day: "numeric", month: "short", year: "numeric" }), p = sigPips(s);
     if (day !== lastDay) rows.push(...(rows.length ? [""] : []), `🗓 <b>${day}</b>`);
     lastDay = day;
-    rows.push(`${isWin(s) ? "✅" : p < 0 ? "❌" : "➖"}${s.tps ? ` TP${s.tpHit || 0}` : ""} ${new Date(t + 8 * 3600000).toISOString().slice(11, 16)} ${s.dir > 0 ? "BUY" : "SELL"} ${esc(s.sym)} · ${esc(s.setup === "SNR" ? "SNR " + s.kind : s.kind)} <b>${p > 0 ? "+" : ""}${p}</b> pips`);
+    rows.push(`${isWin(s) ? "✅" : p < 0 ? "❌" : "➖"}${s.tps ? ` TP${s.tpHit || 0}` : ""} ${new Date(t + 8 * 3600000).toISOString().slice(11, 16)} ${s.dir > 0 ? "BUY" : "SELL"} ${esc(s.sym)} · ${esc(s.setup === "SNR" ? "SNR " + s.kind : s.setup === "BRK8" ? "8 AM Break" : s.nine ? "9:59 AM" : s.kind)} <b>${p > 0 ? "+" : ""}${p}</b> pips`);
   }
   return send(chatId, [
     "📊 <b>MEEGO AI · Signal history</b> (Malaysia time)",
@@ -1139,6 +1144,49 @@ async function nineSetup(now = Date.now()) {
     kind: "Intraday", sym: "XAUUSD", dir, entry, sl, ...tpPlan("XAUUSD", dir, entry, sl, NINE_TP), order: "instant", nine: true, trial: true, life: NINE.life,
     note: `🤖 MEEGO AI · 9:59 AM setup: candle 9-10 AM ${dir > 0 ? "bullish" : "bearish"} ${pipsOf(move)} pips, searah trend H1 (MA50) · tutup selepas ${NINE.life} jam`,
     status: "running", auto: true, time: Date.now(), closedAt: null } });
+}
+/* ---------- 8 AM break + retest (Malaysia), admin-only trial ---------- */
+// Mark the high and low of the 8-9 AM H1 candle. From 9 AM to 12 PM: the first M5 candle that CLOSES beyond one of them is the break;
+// then a limit order waits at that level for price to come back (retest). TP 100 pips, SL 60 pips, limit cancelled at 12 PM, trade closed after 12 h.
+// MT5 gold, 3 pips spread: 17 months 102 trades, 44% win, +18R (+1080 pips); last 6 months (M5) 111 trades, 44% win, +19.7R (+1180 pips).
+// Entering on the break itself (no retest) lost -4240 pips: most morning breaks are fake.
+const EIGHT = { tp: 100, sl: 60, zone: 20, until: 4, life: 12 }; // until: hours after 00:00 UTC (12 PM Malaysia)
+async function eightSetup(now = Date.now()) {
+  const d = new Date(now), day = d.getUTCDay();
+  if (day < 1 || day > 5) return;
+  const d0 = Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate(), 0), start = d0 + 3600000; // 8 AM and 9 AM Malaysia
+  if (now < start + 60000 || now > d0 + EIGHT.until * 3600000) return;
+  const key = d.toISOString().slice(0, 10), cfg = await settings();
+  if (cfg.auto_scan === "off" || cfg.eight_done === key) return;
+  const m1 = await candles("XAUUSD", "1min"), c8 = m1.filter((x) => x.t >= d0 && x.t < start);
+  if (c8.length < 45) return; // prices missing: try again next minute
+  const hi = Math.max(...c8.map((x) => x.h)), lo = Math.min(...c8.map((x) => x.l)), dg = digits("XAUUSD"), p = pip("XAUUSD"), f = (v) => v.toFixed(dg);
+  const chats = await audience("Intraday", true); // admin only while on trial
+  if (cfg.eight_early !== key) {
+    await db.from("app_settings").upsert({ key: "eight_early", value: key });
+    await broadcast(chats, `🧪 🕗 <b>8 AM BREAK + RETEST TEST</b> (admin only)\nCandle jam 8 (H1): High <code>${f(hi)}</code> · Low <code>${f(lo)}</code> (${Math.round((hi - lo) / p)} pips)\nTunggu candle M5 tutup tembus salah satu, lepas tu limit order di level tu (retest). Sampai 12 tengah hari.`);
+  }
+  const m5 = group(m1.filter((x) => x.t >= start), 5).filter((x) => x.t + 300000 <= now); // finished M5 candles only
+  let dir = 0, lv = 0;
+  for (const x of m5) {
+    if (x.c > hi) { dir = 1; lv = hi; break; }
+    if (x.c < lo) { dir = -1; lv = lo; break; }
+  }
+  if (!dir) {
+    if (now > d0 + EIGHT.until * 3600000 - 120000) {
+      await db.from("app_settings").upsert({ key: "eight_done", value: key });
+      await broadcast(chats, "🧪 🕗 <b>8 AM BREAK + RETEST TEST</b>\nTiada break sampai 12 tengah hari. Tiada setup hari ni.");
+    }
+    return;
+  }
+  await db.from("app_settings").upsert({ key: "eight_done", value: key });
+  const entry = Number(f(lv)), sl = Number(f(lv - dir * EIGHT.sl * p)), tp = Number(f(lv + dir * EIGHT.tp * p));
+  const zone = dir > 0 ? [Number(f(lv - EIGHT.zone * p)), entry] : [entry, Number(f(lv + EIGHT.zone * p))];
+  await db.from("signals").insert({ id: crypto.randomUUID(), data: {
+    kind: "Intraday", sym: "XAUUSD", dir, entry, sl, tps: [tp, tp, tp], tp, sl0: sl, tpHit: 0, zone, order: "limit", pending: true,
+    expire: Math.max(0.1, (d0 + EIGHT.until * 3600000 - now) / 3600000), setup: "BRK8", trial: true, auto: true, life: EIGHT.life,
+    note: `🤖 MEEGO AI · 8 AM break + retest: candle jam 8 ${dir > 0 ? "high" : "low"} ${f(lv)} ditembus (M5 close), limit di level tu tunggu retest · TP 100 · SL 60 · batal 12 tengah hari`,
+    status: "running", time: Date.now(), closedAt: null } });
 }
 /* ---------- S&D setup for Scalping, Intraday and Swing (gold), the admin's rules ---------- */
 // Must have: a valid unbroken S&D zone, not against a strong trend, room of 1.5R to the next swing, one entry confirmation (engulfing, rejection or CHoCH).
@@ -2142,7 +2190,7 @@ async function signalChart(s) {
   if (list.length < 20) return null;
   const word = s.dir > 0 ? "BUY" : "SELL", my = new Date(s.time + 8 * 3600000), zt = Number((String(s.zkey || "").match(/^Z(\d{13})/) || [])[1] || 0);
   const why = String(s.note || "").replace(/^🤖 MEEGO AI · /, "").replace(/^(Demand|Supply) zone \S+ [\d.]+ - [\d.]+ · /, "");
-  const label = s.test ? "EA TEST" : s.setup === "SNR" ? "SNR " + s.kind.toUpperCase() : s.nine ? "9:59 AM SETUP" : s.news === "pre" ? "NEWS" : s.news === "recovery" ? "RECOVERY" : s.kind.toUpperCase();
+  const label = s.test ? "EA TEST" : s.setup === "SNR" ? "SNR " + s.kind.toUpperCase() : s.setup === "BRK8" ? "8 AM BREAK" : s.nine ? "9:59 AM SETUP" : s.news === "pre" ? "NEWS" : s.news === "recovery" ? "RECOVERY" : s.kind.toUpperCase();
   const opts = {
     candles: list, dir: s.dir, entry: s.entry, sl: s.sl0 ?? s.sl, tps: s.tps || [s.tp], zone: Array.isArray(s.zone) && s.setup !== "SNR" ? s.zone : null, zoneFrom: zt, tf: min, digits: digits(s.sym),
     snr: s.setup === "SNR" && Array.isArray(s.zone) ? { key: s.level ?? (s.zone[0] + s.zone[1]) / 2, levels: s.levels || [], zone: s.zone, bt: s.bt, rt: s.rt, from: s.lvFrom } : null,
@@ -2187,7 +2235,7 @@ async function onDbEvent(ev) {
     const chats = await audience(s.kind, !!s.trial);
     if (ev.op === "INSERT" && s.status === "running") {
       const sig = { id: ev.record.id, ...s };
-      const title = s.kind === "SOP" ? `🧪 PR SOP ${s.wait ? "· WAIT (EA waits)" : "· ENTRY NOW"}` : s.test ? "🧪 EA TEST (not a real setup)" : s.setup === "SNR" ? `🧪 SNR BREAKOUT ${s.kind.toUpperCase()} TEST (admin only)` : s.nine && s.trial ? "🧪 9:59 AM SETUP TEST (admin only)" : s.trial ? `🧪 ${s.kind.toUpperCase()} TEST (admin only)` : s.nine ? "🕘 9:59 AM SETUP" : s.news === "pre" ? "📰 NEWS SIGNAL" : s.news === "recovery" ? "🔁 RECOVERY SETUP (after news spike)" : kindOf(s.kind).fresh;
+      const title = s.kind === "SOP" ? `🧪 PR SOP ${s.wait ? "· WAIT (EA waits)" : "· ENTRY NOW"}` : s.test ? "🧪 EA TEST (not a real setup)" : s.setup === "SNR" ? `🧪 SNR BREAKOUT ${s.kind.toUpperCase()} TEST (admin only)` : s.nine && s.trial ? "🧪 9:59 AM SETUP TEST (admin only)" : s.setup === "BRK8" ? "🧪 8 AM BREAK + RETEST TEST (admin only)" : s.trial ? `🧪 ${s.kind.toUpperCase()} TEST (admin only)` : s.nine ? "🕘 9:59 AM SETUP" : s.news === "pre" ? "📰 NEWS SIGNAL" : s.news === "recovery" ? "🔁 RECOVERY SETUP (after news spike)" : kindOf(s.kind).fresh;
       for (const c of chats) { await sendLive(c, sig, title); await new Promise((r) => setTimeout(r, 60)); }
       await sendChart(chats, sig).catch((e) => console.error("signal chart failed", e));
       return;
@@ -2225,6 +2273,7 @@ async function onDbEvent(ev) {
   }
   if (ev.event === "news") {
     await nineSetup().catch((e) => console.error("9:59 setup failed", e));
+    await eightSetup().catch((e) => console.error("8 AM break setup failed", e));
     return newsAlert().catch((e) => console.error("news alert failed", e));
   }
   if (ev.event === "scan") {
