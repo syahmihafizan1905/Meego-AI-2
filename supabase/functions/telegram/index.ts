@@ -1386,6 +1386,11 @@ function snrBreak(H, M, used, k) {
       // the retest: came back to the level after the break (in the last 3 candles), and the last candle closes away from it
       const r = after.findIndex((x) => (dir > 0 ? x.l : x.h) * dir <= (lv.v + dir * P.near * a) * dir);
       if (r < 0 || after.length - r > 3) continue;
+      // price first ran away from the level (at least `away` x ATR, `gap` candles after the break) and then came back to it
+      if (P.away || P.gap) {
+        const run = M.slice(b, be + 1).concat(after.slice(0, r)), far = Math.max(...run.map((x) => (dir > 0 ? x.h - lv.v : lv.v - x.l)));
+        if (far < (P.away || 0) * a || r < (P.gap || 0)) continue;
+      }
       if ((L.c - L.o) * dir <= 0 || (L.c - lv.v) * dir <= 0 || (L.c - lv.v) * dir > P.far * a) continue;
       const ext = dir > 0 ? Math.min(...after.slice(r).map((x) => x.l)) : Math.max(...after.slice(r).map((x) => x.h));
       const sl = (dir > 0 ? Math.min(ext, lv.v) : Math.max(ext, lv.v)) - dir * P.buf * a, risk = Math.abs(L.c - sl), rp = risk / pip("XAUUSD");
@@ -2189,11 +2194,13 @@ function chartSvg(o) {
     const at = (t) => (t ? candles.findLastIndex((c) => c.t <= t) : -1), bi = at(snr.bt), ri = at(snr.rt);
     const fi = snr.from ? Math.max(0, candles.findIndex((c) => c.t >= snr.from)) : 0, x0 = x(fi < 0 ? 0 : fi) - step / 2, xb = bi >= 0 ? x(bi) : x0;
     const lab = (tx, ty, txt, col, bold) => { const tw = txt.length * (bold ? 8 : 7.2); zl += `<rect x="${tx - 3}" y="${ty - 13}" width="${tw + 6}" height="18" rx="3" fill="${col}"/><text x="${tx}" y="${ty}" font-size="12" font-weight="bold" fill="#ffffff">${txt}</text>`; return tw; };
+    // horizontal lines only (admin, 28 Nov 2026): the old role up to the breakout, the new role after it
+    const ly = y(snr.key);
     if (bi >= 0 && xb > x0 + 4) {
-      s += `<rect x="${x0}" y="${by}" width="${xb - x0}" height="${bh}" fill="${oldC}" fill-opacity="0.35" stroke="${oldC}" stroke-opacity="0.9"/>`;
+      s += `<line x1="${x0}" x2="${xb}" y1="${ly}" y2="${ly}" stroke="${oldC}" stroke-width="3"/>`;
       lab(Math.min(x0 + 4, xb - 90), dir > 0 ? by - 6 : by + bh + 17, oldN, oldC);
     }
-    s += `<rect x="${xb}" y="${by}" width="${W - R - xb}" height="${bh}" fill="${newC}" fill-opacity="0.35" stroke="${newC}" stroke-opacity="0.9"/>`;
+    s += `<line x1="${xb}" x2="${W - R}" y1="${ly}" y2="${ly}" stroke="${newC}" stroke-width="3"/>`;
     const nt = `${nm} ${f(snr.key)} · ${newN}`;
     lab(Math.max(xb + 4, x(n - 1) + step * 2), dir > 0 ? by + bh + 17 : by - 6, nt, newC, true);   // in the empty space after the last candle
     // breakout candle: an arrow and a label; retest candle: a circle on the level
