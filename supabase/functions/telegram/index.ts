@@ -1339,7 +1339,7 @@ async function scalpTouch(sym, G, price, used) {
 //   Intraday (H1 levels, M15 break), 6 months: 47 signals, TP1 57%, +9.3R (+10.5R without)
 //   Swing (H4 levels, H1 break), 17 months: 33 signals, TP1 45%, +5.5R (+5.7R without; weak since Mar 2026)
 //   Full MSnR levels (every A/V close level) were tested too and were worse: Scalping +7.4R, Intraday +7.9R.
-const SNRB = { look: 160, piv: 3, tol: 0.3, touches: 2, clean: 24, body: 0.5, beyond: 0.1, win: 16, near: 0.2, back: 0, far: 0.6, buf: 0.25 };
+const SNRB = { look: 160, piv: 3, tol: 0.3, touches: 2, clean: 24, body: 0.5, full: 0.7, beyond: 0.1, win: 16, near: 0.2, back: 0, far: 0.6, buf: 0.25 };
 // lt: level timeframe, bt: break timeframe (minutes); min/max: stop in pips; open/cool(h)/day: limits; life: hours
 const SNRK = {
   Scalping: { lt: 15, bt: 5, clean: 36, min: 20, max: 100, open: 1, cool: 0.5, day: 5, life: 3 },
@@ -1365,17 +1365,23 @@ function snrBreak(H, M, used, k) {
   for (const lv of levels) {
     for (const dir of [1, -1]) {
       if (strong === -dir) continue; // not against a strong trend on the level timeframe
-      // the break: a strong close through the level, within the last `win` candles, after the level held for `clean` candles
-      let b = -1;
+      // the break, within the last `win` candles, after the level held for `clean` candles (admin's rule, 28 Nov 2026: a full-body break):
+      // 1 candle: closes through the level with a full body (body >= `full` of its range), or
+      // 2 candles: one closes through it, the next one's whole body (open and close) is beyond the level
+      let b = -1, be = -1;
       for (let i = n - 2; i >= Math.max(P.clean, n - 1 - P.win); i--) {
         const x = M[i], body = Math.abs(x.c - x.o);
-        if ((x.c - lv.v) * dir > P.beyond * a && (M[i - 1].c - lv.v) * dir <= 0 && (x.c - x.o) * dir > 0 && body >= P.body * (x.h - x.l)) { b = i; break; }
+        if (!((x.c - lv.v) * dir > P.beyond * a && (M[i - 1].c - lv.v) * dir <= 0 && (x.c - x.o) * dir > 0)) continue;
+        if (!P.full) { if (body >= P.body * (x.h - x.l)) { b = i; be = i; break; } continue; } // the old rule (backtests)
+        if (body >= P.full * (x.h - x.l)) { b = i; be = i; break; }
+        const y = M[i + 1];
+        if (P.two !== 0 && i + 1 <= n - 2 && body >= (P.twoBody || 0) * (x.h - x.l) && ((dir > 0 ? Math.min(y.o, y.c) : Math.max(y.o, y.c)) - lv.v) * dir > 0) { b = i; be = i + 1; break; }
       }
       if (b < 0 || lv.last >= M[b].t) continue;
       if (M.slice(b - P.clean, b).some((x) => (x.c - lv.v) * dir > 0)) continue; // it was a real level before the break
       const key = "B" + M[b].t + dir;
       if (used.has(key)) continue;
-      const after = M.slice(b + 1);
+      const after = M.slice(be + 1);
       if (after.some((x) => (x.c - lv.v) * dir < -P.back * a)) continue; // MSnR: a candle closed back through it = failed RBS/SBR (QM), no trade
       // the retest: came back to the level after the break (in the last 3 candles), and the last candle closes away from it
       const r = after.findIndex((x) => (dir > 0 ? x.l : x.h) * dir <= (lv.v + dir * P.near * a) * dir);
